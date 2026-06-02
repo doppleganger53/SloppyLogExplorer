@@ -34,6 +34,64 @@ def write_sample(path: Path) -> None:
     )
 
 
+def write_coordinate_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS",
+                '2026-01-01,12:00:00,"39.0000,-75.0000,10"',
+                '2026-01-01,12:00:01,"39.0005,-75.0005,11"',
+                '2026-01-01,12:00:02,"39.0010,-75.0010,12"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_split_coordinate_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,Northing,Easting",
+                "2026-01-01,12:00:00,39.0000,-75.0000",
+                "2026-01-01,12:00:01,39.0005,-75.0005",
+                "2026-01-01,12:00:02,39.0010,-75.0010",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_cardinal_coordinate_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,Position",
+                '2026-01-01,12:00:00,"39.0000N 75.0000W"',
+                '2026-01-01,12:00:01,"39.0005 N, 75.0005 W"',
+                '2026-01-01,12:00:02,"N39.0010 W75.0010"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_no_gps_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,VFAS(V),Current(A),Throttle",
+                "2026-01-01,12:00:00,16.80,0.5,0",
+                "2026-01-01,12:00:01,16.55,10.0,20",
+                "2026-01-01,12:00:02,16.30,20.0,40",
+                "2026-01-01,12:00:03,16.05,30.0,60",
+                "2026-01-01,12:00:04,15.80,40.0,80",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
     path = tmp_path / "Panther" / "flight.csv"
     path.parent.mkdir()
@@ -46,6 +104,72 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
     assert log.info.has_gps is True
     assert "VFAS(V)" in log.parameter_columns
     assert log.info.duration_seconds == 8
+
+
+def test_load_log_detects_coordinate_string_gps_under_single_heading(tmp_path: Path) -> None:
+    path = tmp_path / "string_gps.csv"
+    write_coordinate_sample(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "GPS (lat)"
+    assert log.gps_columns.longitude_label == "GPS (lon)"
+    assert log.gps_columns.altitude_label == "GPS (alt)"
+
+    fig = build_gps_figure(log)
+    trace = fig.data[0]
+
+    assert list(trace.x[:2]) == pytest.approx([-75.0, -75.0005])
+    assert list(trace.y[:2]) == pytest.approx([39.0, 39.0005])
+    assert fig.layout.scene.xaxis.title.text == "GPS (lon)"
+    assert fig.layout.scene.yaxis.title.text == "GPS (lat)"
+    assert fig.layout.scene.zaxis.title.text == "GPS (alt)"
+
+
+def test_load_log_detects_split_coordinate_columns_with_arbitrary_headings(tmp_path: Path) -> None:
+    path = tmp_path / "split_gps.csv"
+    write_split_coordinate_sample(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude == "Northing"
+    assert log.gps_columns.longitude == "Easting"
+    assert log.gps_columns.latitude_label == "Northing"
+    assert log.gps_columns.longitude_label == "Easting"
+
+    gps = build_gps_figure(log)
+    trace = gps.data[0]
+
+    assert list(trace.x[:2]) == pytest.approx([-75.0, -75.0005])
+    assert list(trace.y[:2]) == pytest.approx([39.0, 39.0005])
+    assert gps.layout.scene.xaxis.title.text == "Easting"
+    assert gps.layout.scene.yaxis.title.text == "Northing"
+
+
+def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) -> None:
+    path = tmp_path / "cardinal_gps.csv"
+    write_cardinal_coordinate_sample(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert list(log.dataframe[log.gps_columns.latitude].head(2)) == pytest.approx([39.0, 39.0005])
+    assert list(log.dataframe[log.gps_columns.longitude].head(2)) == pytest.approx([-75.0, -75.0005])
+
+
+def test_load_log_does_not_invent_gps_from_regular_telemetry(tmp_path: Path) -> None:
+    path = tmp_path / "no_gps.csv"
+    write_no_gps_sample(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is False
+    assert log.gps_columns is None
 
 
 def test_internal_resistance_regression(tmp_path: Path) -> None:

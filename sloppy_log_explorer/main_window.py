@@ -63,6 +63,9 @@ class MainWindow(QMainWindow):
         self.compare_log: LoadedLog | None = None
         self.selected_index = 0
         self.dark_mode = True
+        self.telemetry_interaction_mode = "pan"
+        self.telemetry_time_mode = "absolute"
+        self.selected_parameter_columns: set[str] = set()
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
 
@@ -91,6 +94,8 @@ class MainWindow(QMainWindow):
         self.dark_action.setChecked(True)
         self.dark_action.triggered.connect(self.toggle_theme)
         view_menu.addAction(self.dark_action)
+        view_menu.addSeparator()
+        view_menu.addAction("Reset Telemetry View", self.reset_telemetry_view)
 
         tools_menu = self.menuBar().addMenu("Tools")
         tools_menu.addAction("Scan Sync Candidates", self.scan_sync)
@@ -139,10 +144,22 @@ class MainWindow(QMainWindow):
         self.column_filter.textChanged.connect(self.populate_columns)
         sidebar_layout.addWidget(self.column_filter)
 
+        selection_row = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        select_all.setToolTip("Select all parameters currently listed in the table.")
+        select_all.clicked.connect(lambda: self.set_visible_columns_checked(True))
+        select_none = QPushButton("Select None")
+        select_none.setToolTip("Clear all parameters currently listed in the table.")
+        select_none.clicked.connect(lambda: self.set_visible_columns_checked(False))
+        selection_row.addWidget(select_all)
+        selection_row.addWidget(select_none)
+        sidebar_layout.addLayout(selection_row)
+
         self.column_table = QTableWidget(0, 2)
         self.column_table.setHorizontalHeaderLabels(["Show", "Parameter"])
         self.column_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.column_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._configure_sortable_table(self.column_table)
         self.column_table.itemChanged.connect(self.column_changed)
         sidebar_layout.addWidget(self.column_table, 3)
 
@@ -181,6 +198,28 @@ class MainWindow(QMainWindow):
     def _build_graph_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Drag mode"))
+        self.telemetry_pan_button = QPushButton("Pan")
+        self.telemetry_pan_button.setCheckable(True)
+        self.telemetry_pan_button.setChecked(True)
+        self.telemetry_pan_button.clicked.connect(lambda: self.set_telemetry_interaction_mode("pan"))
+        self.telemetry_zoom_button = QPushButton("Zoom")
+        self.telemetry_zoom_button.setCheckable(True)
+        self.telemetry_zoom_button.clicked.connect(lambda: self.set_telemetry_interaction_mode("zoom"))
+        reset = QPushButton("Reset View")
+        reset.clicked.connect(self.reset_telemetry_view)
+        controls.addWidget(self.telemetry_pan_button)
+        controls.addWidget(self.telemetry_zoom_button)
+        controls.addWidget(reset)
+        controls.addSpacing(12)
+        controls.addWidget(QLabel("Time"))
+        self.telemetry_time_combo = QComboBox()
+        self.telemetry_time_combo.addItems(["Absolute", "Relative"])
+        self.telemetry_time_combo.currentTextChanged.connect(self.telemetry_time_changed)
+        controls.addWidget(self.telemetry_time_combo)
+        controls.addStretch()
+        layout.addLayout(controls)
         self.graph_view = TelemetryPlotWidget()
         self.graph_view.index_selected.connect(self.set_selected_index)
         self.graph_view.index_stepped.connect(self.step_selected_index)
@@ -258,11 +297,13 @@ class MainWindow(QMainWindow):
         self.battery_table = QTableWidget(0, 4)
         self.battery_table.setHorizontalHeaderLabels(["ID", "Name", "Cells", "Active"])
         self.battery_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._configure_sortable_table(self.battery_table)
         layout.addWidget(self.battery_table, 1)
 
         self.history_table = QTableWidget(0, 6)
         self.history_table.setHorizontalHeaderLabels(["Battery", "Date", "Pack mOhm", "Cell mOhm", "Health", "Log"])
         self.history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._configure_sortable_table(self.history_table)
         layout.addWidget(self.history_table, 2)
         self.tabs.addTab(tab, "Batteries")
         self.refresh_batteries()
@@ -288,6 +329,7 @@ class MainWindow(QMainWindow):
         self.sync_table = QTableWidget(0, 4)
         self.sync_table.setHorizontalHeaderLabels(["Reason", "Relative Path", "Source", "Target"])
         self.sync_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._configure_sortable_table(self.sync_table)
         layout.addWidget(self.sync_table)
         self.tabs.addTab(tab, "SD Sync")
 
@@ -307,6 +349,7 @@ class MainWindow(QMainWindow):
         self.alias_table = QTableWidget(0, 2)
         self.alias_table.setHorizontalHeaderLabels(["Hardware switch/file", "Radio alias/UI label"])
         self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._configure_sortable_table(self.alias_table)
         layout.addWidget(self.alias_table)
         self.tabs.addTab(tab, "Switch Aliases")
         self.populate_alias_profiles()
@@ -333,6 +376,7 @@ class MainWindow(QMainWindow):
         self.voice_table.setHorizontalHeaderLabels(["Text to be Spoken", "Target WAV Filename"])
         self.voice_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.voice_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._configure_sortable_table(self.voice_table)
         layout.addWidget(self.voice_table)
         self.tabs.addTab(tab, "Voice Pack")
 
@@ -345,6 +389,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(line_edit)
         layout.addWidget(button)
         return wrapper
+
+    @staticmethod
+    def _configure_sortable_table(table: QTableWidget) -> None:
+        header = table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        table.setSortingEnabled(True)
 
     def _apply_style(self) -> None:
         QApplication.instance().setStyle("Fusion")
@@ -459,6 +510,7 @@ class MainWindow(QMainWindow):
             self.current_log = load_log(path, self.library_root)
             self.selected_index = 0
             self.store.set_setting("last_log", str(path))
+            self.initialize_selected_parameters()
             self.populate_columns()
             self.populate_gps_color_combo()
             self.populate_analysis_combos()
@@ -470,14 +522,13 @@ class MainWindow(QMainWindow):
 
     def populate_columns(self, *_args) -> None:
         self.column_table.blockSignals(True)
+        self.column_table.setSortingEnabled(False)
         self.column_table.setRowCount(0)
         if self.current_log is None:
+            self.column_table.setSortingEnabled(True)
             self.column_table.blockSignals(False)
             return
         query = self.column_filter.text().strip().lower()
-        selected_defaults = set(self.store.get_setting("selected_columns", []))
-        if not selected_defaults:
-            selected_defaults = set(suggest_display_columns(self.current_log.parameter_columns))
         for col in self.current_log.parameter_columns:
             if query and query not in col.lower():
                 continue
@@ -485,24 +536,66 @@ class MainWindow(QMainWindow):
             self.column_table.insertRow(row)
             check = QTableWidgetItem()
             check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            check.setCheckState(Qt.CheckState.Checked if col in selected_defaults else Qt.CheckState.Unchecked)
+            check.setData(Qt.ItemDataRole.UserRole, col)
+            check.setCheckState(Qt.CheckState.Checked if col in self.selected_parameter_columns else Qt.CheckState.Unchecked)
             name = QTableWidgetItem(col)
             name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            name.setData(Qt.ItemDataRole.UserRole, col)
             self.column_table.setItem(row, 0, check)
             self.column_table.setItem(row, 1, name)
+        self.column_table.setSortingEnabled(True)
         self.column_table.blockSignals(False)
         self.update_summary()
 
     def selected_columns(self) -> list[str]:
-        cols: list[str] = []
-        for row in range(self.column_table.rowCount()):
-            check = self.column_table.item(row, 0)
-            name = self.column_table.item(row, 1)
-            if check and name and check.checkState() == Qt.CheckState.Checked:
-                cols.append(name.text())
-        return cols
+        if self.current_log is None:
+            return []
+        return [col for col in self.current_log.parameter_columns if col in self.selected_parameter_columns]
 
-    def column_changed(self, *_args) -> None:
+    def initialize_selected_parameters(self) -> None:
+        if self.current_log is None:
+            self.selected_parameter_columns = set()
+            return
+        available = set(self.current_log.parameter_columns)
+        stored = set(self.store.get_setting("selected_columns", []))
+        selected = stored & available
+        if not selected:
+            selected = set(suggest_display_columns(self.current_log.parameter_columns))
+        self.selected_parameter_columns = selected
+
+    def set_visible_columns_checked(self, checked: bool) -> None:
+        if self.current_log is None:
+            return
+        self.column_table.blockSignals(True)
+        try:
+            for row in range(self.column_table.rowCount()):
+                check = self.column_table.item(row, 0)
+                if check is None:
+                    continue
+                column = check.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(column, str):
+                    continue
+                if checked:
+                    self.selected_parameter_columns.add(column)
+                    check.setCheckState(Qt.CheckState.Checked)
+                else:
+                    self.selected_parameter_columns.discard(column)
+                    check.setCheckState(Qt.CheckState.Unchecked)
+        finally:
+            self.column_table.blockSignals(False)
+        self.commit_column_selection()
+
+    def column_changed(self, item: QTableWidgetItem | None = None) -> None:
+        if item is not None and item.column() == 0:
+            column = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(column, str):
+                if item.checkState() == Qt.CheckState.Checked:
+                    self.selected_parameter_columns.add(column)
+                else:
+                    self.selected_parameter_columns.discard(column)
+        self.commit_column_selection()
+
+    def commit_column_selection(self) -> None:
         cols = self.selected_columns()
         self.store.set_setting("selected_columns", cols)
         self.populate_gps_color_combo()
@@ -544,6 +637,8 @@ class MainWindow(QMainWindow):
             selected_index=self.selected_index,
             show_grid=self.grid_action.isChecked(),
             dark=self.dark_mode,
+            interaction_mode=self.telemetry_interaction_mode,
+            time_mode=self.telemetry_time_mode,
         )
 
     def refresh_gps(self, *_args) -> None:
@@ -608,6 +703,20 @@ class MainWindow(QMainWindow):
         self.dark_mode = self.dark_action.isChecked()
         self.refresh_plots()
 
+    def set_telemetry_interaction_mode(self, mode: str) -> None:
+        self.telemetry_interaction_mode = mode
+        self.telemetry_pan_button.setChecked(mode == "pan")
+        self.telemetry_zoom_button.setChecked(mode == "zoom")
+        self.graph_view.set_interaction_mode(mode)
+
+    def telemetry_time_changed(self, text: str) -> None:
+        self.telemetry_time_mode = "relative" if text == "Relative" else "absolute"
+        self.refresh_graph()
+
+    def reset_telemetry_view(self) -> None:
+        if hasattr(self, "graph_view"):
+            self.graph_view.reset_view()
+
     def load_flight_notes(self) -> None:
         if self.current_log is None:
             return
@@ -648,6 +757,7 @@ class MainWindow(QMainWindow):
     def refresh_batteries(self) -> None:
         batteries = self.store.list_batteries()
         self.battery_select.clear()
+        self.battery_table.setSortingEnabled(False)
         self.battery_table.setRowCount(0)
         for battery in batteries:
             self.battery_select.addItem(f"{battery['name']} ({battery['cells']}S)", battery["id"])
@@ -655,6 +765,8 @@ class MainWindow(QMainWindow):
             self.battery_table.insertRow(row)
             for col, key in enumerate(["id", "name", "cells", "active"]):
                 self.battery_table.setItem(row, col, QTableWidgetItem(str(battery[key])))
+        self.battery_table.setSortingEnabled(True)
+        self.history_table.setSortingEnabled(False)
         self.history_table.setRowCount(0)
         for history in self.store.list_battery_history():
             row = self.history_table.rowCount()
@@ -669,6 +781,7 @@ class MainWindow(QMainWindow):
             ]
             for col, value in enumerate(values):
                 self.history_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.history_table.setSortingEnabled(True)
 
     def populate_analysis_combos(self) -> None:
         self.voltage_combo.clear()
@@ -719,6 +832,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Sync paths", "Select both source and target directories.")
             return
         self.sync_candidates = discover_sync_candidates(source, target)
+        self.sync_table.setSortingEnabled(False)
         self.sync_table.setRowCount(0)
         for candidate in self.sync_candidates:
             row = self.sync_table.rowCount()
@@ -726,6 +840,7 @@ class MainWindow(QMainWindow):
             values = [candidate.reason, str(candidate.relative_path), str(candidate.source), str(candidate.target)]
             for col, value in enumerate(values):
                 self.sync_table.setItem(row, col, QTableWidgetItem(value))
+        self.sync_table.setSortingEnabled(True)
         self.status.showMessage(f"Found {len(self.sync_candidates)} sync candidates")
 
     def copy_sync_candidates(self) -> None:
@@ -750,12 +865,14 @@ class MainWindow(QMainWindow):
         aliases = self.store.load_aliases(profile)
         if not aliases:
             aliases = {switch: "" for switch in [f"S{i}" for i in range(1, 13)] + ["SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH"]}
+        self.alias_table.setSortingEnabled(False)
         self.alias_table.setRowCount(0)
         for hardware, alias in aliases.items():
             row = self.alias_table.rowCount()
             self.alias_table.insertRow(row)
             self.alias_table.setItem(row, 0, QTableWidgetItem(hardware))
             self.alias_table.setItem(row, 1, QTableWidgetItem(alias))
+        self.alias_table.setSortingEnabled(True)
 
     def save_alias_profile(self) -> None:
         profile = self.alias_profile.currentText().strip() or "Default"
@@ -770,10 +887,12 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Saved alias profile {profile}")
 
     def add_voice_item(self) -> None:
+        self.voice_table.setSortingEnabled(False)
         row = self.voice_table.rowCount()
         self.voice_table.insertRow(row)
         self.voice_table.setItem(row, 0, QTableWidgetItem(""))
         self.voice_table.setItem(row, 1, QTableWidgetItem(""))
+        self.voice_table.setSortingEnabled(True)
 
     def voice_items_from_table(self) -> list[VoiceItem]:
         items: list[VoiceItem] = []
@@ -789,12 +908,14 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.voice_items = load_voice_csv(path)
+        self.voice_table.setSortingEnabled(False)
         self.voice_table.setRowCount(0)
         for item in self.voice_items:
             row = self.voice_table.rowCount()
             self.voice_table.insertRow(row)
             self.voice_table.setItem(row, 0, QTableWidgetItem(item.text))
             self.voice_table.setItem(row, 1, QTableWidgetItem(item.filename))
+        self.voice_table.setSortingEnabled(True)
 
     def save_voice_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save voice CSV", "audio_list.csv", "CSV files (*.csv)")

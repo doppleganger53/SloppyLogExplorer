@@ -12,6 +12,9 @@ class GpsColumns:
     latitude: str
     longitude: str
     altitude: str | None = None
+    latitude_label: str | None = None
+    longitude_label: str | None = None
+    altitude_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class LoadedLog:
         hidden = set()
         if self.time is not None:
             hidden.update(c for c in self.dataframe.columns if "time" in c.lower() or "date" in c.lower())
+        hidden.update(c for c in self.dataframe.columns if c.startswith("__"))
         return [c for c in self.numeric_columns if c not in hidden]
 
 
