@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import pytest
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QHeaderView
 
 from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
+from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.plotting import build_gps_figure, build_telemetry_figure, figure_html
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
@@ -82,6 +86,88 @@ def test_sync_candidates_copy_newer_logs(tmp_path: Path) -> None:
 
     assert copied == 1
     assert (target / "flight.csv").exists()
+
+
+def test_load_log_infers_model_from_root_level_filename(tmp_path: Path) -> None:
+    path = tmp_path / "ERATIX-2025-09-28-18-38-14.csv"
+    write_sample(path)
+
+    log = load_log(path, tmp_path)
+
+    assert log.info.model == "ERATIX"
+
+
+def test_scan_library_uses_metadata_only_and_groups_root_level_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "frsky"
+    root.mkdir()
+    first = root / "ERATIX-2025-09-28-18-38-14.csv"
+    second = root / "5inch-2025-09-29-14-56-25.log"
+    ignored = root / "notes.txt"
+    write_sample(first)
+    write_sample(second)
+    ignored.write_text("ignore me", encoding="utf-8")
+
+    def fail_open(*_args, **_kwargs) -> None:
+        raise AssertionError("scan_library should not open file contents")
+
+    monkeypatch.setattr("builtins.open", fail_open)
+
+    logs = scan_library(root)
+
+    assert [log.name for log in logs] == [second.name, first.name]
+    assert [log.model for log in logs] == ["5inch", "ERATIX"]
+    assert all(log.size == log.path.stat().st_size for log in logs)
+    assert list(group_by_model(logs)) == ["5inch", "ERATIX"]
+
+
+def test_library_tree_defaults_collapsed_and_keeps_file_date_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    root = tmp_path / "frsky"
+    root.mkdir()
+
+    alpha_new = root / "Alpha-2026-01-02-10-00-00.csv"
+    alpha_old = root / "Alpha-2026-01-01-10-00-00.csv"
+    beta = root / "Beta-2026-01-03-10-00-00.csv"
+    write_sample(alpha_new)
+    write_sample(alpha_old)
+    write_sample(beta)
+    os.utime(alpha_new, (2000, 2000))
+    os.utime(alpha_old, (1000, 1000))
+    os.utime(beta, (1500, 1500))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_library(root)
+
+    header = window.library_tree.header()
+    assert window.library_tree.columnCount() == 4
+    assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Interactive
+    assert header.sectionResizeMode(1) == QHeaderView.ResizeMode.Interactive
+    assert header.sectionResizeMode(2) == QHeaderView.ResizeMode.Interactive
+    assert header.sectionResizeMode(3) == QHeaderView.ResizeMode.Interactive
+    assert header.sortIndicatorSection() == 2
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    top_level = [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())]
+    assert all(not item.isExpanded() for item in top_level)
+
+    alpha = next(item for item in top_level if item.text(0) == "Alpha")
+    assert alpha.text(2) == window._format_timestamp(2000)
+    assert alpha.text(3) == window._format_size(alpha_new.stat().st_size + alpha_old.stat().st_size)
+    assert alpha.child(0).text(0) == alpha_new.name
+    assert alpha.child(1).text(0) == alpha_old.name
+
+    window.library_header_clicked(0)
+    alpha = next(item for item in [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())] if item.text(0) == "Alpha")
+    assert alpha.child(0).text(0) == alpha_new.name
+    assert alpha.child(1).text(0) == alpha_old.name
+    window.close()
+    app.quit()
 
 
 def test_real_frsky_sensor_ranking_prefers_pack_voltage_and_current() -> None:

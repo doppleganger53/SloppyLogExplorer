@@ -15,6 +15,15 @@ class GpsColumns:
 
 
 @dataclass(frozen=True)
+class LibraryLogInfo:
+    path: Path
+    model: str
+    name: str
+    modified: float
+    size: int
+
+
+@dataclass(frozen=True)
 class LogFileInfo:
     path: Path
     model: str
@@ -73,4 +82,3 @@ class CursorValue:
     value: Any
     compare_value: Any | None
     delta: Any | None
-

@@ -101,6 +101,9 @@ def _model_from_path(path: Path, library_root: Path | None = None) -> str:
             rel = path.relative_to(library_root)
             if len(rel.parts) > 1:
                 return rel.parts[0]
+            stem = re.split(r"[-_ ]\d{4}", path.stem, maxsplit=1)[0].strip()
+            if stem:
+                return stem
         except ValueError:
             pass
     for parent in path.parents:

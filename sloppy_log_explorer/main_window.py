@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QUrl
@@ -40,7 +41,7 @@ from .analysis import (
     suggest_display_columns,
 )
 from .library import group_by_model, scan_library
-from .models import LoadedLog, LogFileInfo, SyncCandidate
+from .models import LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import load_log
 from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
@@ -49,13 +50,15 @@ from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_cs
 
 
 class MainWindow(QMainWindow):
+    library_sort_column = 2
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Sloppy Log Explorer")
         self.resize(1500, 940)
         self.store = AppStore()
         self.library_root: Path | None = None
-        self.library_logs: list[LogFileInfo] = []
+        self.library_logs: list[LibraryLogInfo] = []
         self.current_log: LoadedLog | None = None
         self.compare_log: LoadedLog | None = None
         self.selected_index = 0
@@ -119,7 +122,14 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.file_summary)
 
         self.library_tree = QTreeWidget()
-        self.library_tree.setHeaderLabels(["Model / Log", "Rows"])
+        self.library_tree.setHeaderLabels(["Model / Log", "Logs", "Latest", "Size"])
+        header = self.library_tree.header()
+        for column in range(4):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self.library_header_clicked)
+        self.library_tree.setSortingEnabled(False)
         self.library_tree.itemActivated.connect(self.library_item_activated)
         sidebar_layout.addWidget(QLabel("Log Library"))
         sidebar_layout.addWidget(self.library_tree, 2)
@@ -398,19 +408,51 @@ class MainWindow(QMainWindow):
     def populate_library_tree(self) -> None:
         self.library_tree.clear()
         for model, logs in group_by_model(self.library_logs).items():
-            parent = QTreeWidgetItem([model, str(len(logs))])
+            latest = max((log.modified for log in logs), default=0.0)
+            total_size = sum(log.size for log in logs)
+            parent = QTreeWidgetItem(
+                [
+                    model,
+                    str(len(logs)),
+                    self._format_timestamp(latest),
+                    self._format_size(total_size),
+                ]
+            )
             parent.setData(0, Qt.ItemDataRole.UserRole, None)
+            parent.setData(1, Qt.ItemDataRole.UserRole, len(logs))
+            parent.setData(2, Qt.ItemDataRole.UserRole, latest)
+            parent.setData(3, Qt.ItemDataRole.UserRole, total_size)
             self.library_tree.addTopLevelItem(parent)
             for log in logs:
-                item = QTreeWidgetItem([log.name, str(log.rows)])
+                item = QTreeWidgetItem(
+                    [
+                        log.name,
+                        "",
+                        self._format_timestamp(log.modified),
+                        self._format_size(log.size),
+                    ]
+                )
                 item.setData(0, Qt.ItemDataRole.UserRole, str(log.path))
+                item.setData(2, Qt.ItemDataRole.UserRole, log.modified)
+                item.setData(3, Qt.ItemDataRole.UserRole, log.size)
                 parent.addChild(item)
-        self.library_tree.expandAll()
+        self._sort_library_tree(self.library_sort_column, Qt.SortOrder.DescendingOrder)
+        self.library_tree.collapseAll()
 
     def library_item_activated(self, item: QTreeWidgetItem) -> None:
         path = item.data(0, Qt.ItemDataRole.UserRole)
         if path:
             self.load_log(Path(path))
+
+    def library_header_clicked(self, column: int) -> None:
+        header = self.library_tree.header()
+        current_column = header.sortIndicatorSection()
+        current_order = header.sortIndicatorOrder()
+        if current_column == column:
+            order = Qt.SortOrder.AscendingOrder if current_order == Qt.SortOrder.DescendingOrder else Qt.SortOrder.DescendingOrder
+        else:
+            order = Qt.SortOrder.DescendingOrder if column in {1, 2, 3} else Qt.SortOrder.AscendingOrder
+        self._sort_library_tree(column, order)
 
     def load_log(self, path: Path) -> None:
         try:
@@ -776,6 +818,50 @@ class MainWindow(QMainWindow):
             "About Sloppy Log Explorer",
             "Sloppy Log Explorer\n\nGPL-3.0-or-later telemetry log explorer for Ethos and OpenTX CSV logs.\nDerived from Ethos_LogView concepts with attribution in NOTICE.md.",
         )
+
+    def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
+        items: list[QTreeWidgetItem] = []
+        while self.library_tree.topLevelItemCount():
+            items.append(self.library_tree.takeTopLevelItem(0))
+
+        reverse = order == Qt.SortOrder.DescendingOrder
+        items.sort(key=lambda item: self._library_sort_key(item, column), reverse=reverse)
+
+        self.library_tree.setUpdatesEnabled(False)
+        try:
+            for index, item in enumerate(items):
+                self.library_tree.insertTopLevelItem(index, item)
+        finally:
+            self.library_tree.setUpdatesEnabled(True)
+
+        self.library_tree.header().setSortIndicator(column, order)
+
+    def _library_sort_key(self, item: QTreeWidgetItem, column: int) -> tuple[object, str]:
+        label = str(item.text(0)).casefold()
+        if column == 1:
+            primary: object = int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
+        elif column == 2:
+            primary = float(item.data(2, Qt.ItemDataRole.UserRole) or 0.0)
+        elif column == 3:
+            primary = int(item.data(3, Qt.ItemDataRole.UserRole) or 0)
+        else:
+            primary = label
+        return (primary, label)
+
+    @staticmethod
+    def _format_timestamp(timestamp: float) -> str:
+        if not timestamp:
+            return ""
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024.0 or unit == units[-1]:
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024.0
 
     def closeEvent(self, event) -> None:
         self.store.close()
