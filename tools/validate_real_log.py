@@ -64,9 +64,17 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
         raise AssertionError("GPS map HTML is missing Cesium or OpenStreetMap")
     if log.info.has_gps:
         required_map_tokens = [
+            "leaflet@1.9.4",
+            'id="leafletContainer"',
+            "L.tileLayer(osmTileUrl",
+            "preferLeafletRenderer = /QtWebEngine/i.test",
+            'transientStatus("2D map ready", "ok", 1200)',
+            'switchToLeaflet("Cesium readiness timed out")',
             "baseLayer: new Cesium.ImageryLayer(osmProvider)",
             'name: "Flight path underlay"',
             "Cesium.Cartesian3.fromDegreesArray(pathPositions)",
+            "L.polyline(pathLatLngs",
+            "L.polyline([[left.lat, left.lon], [right.lat, right.lon]]",
             "flightData.segments.forEach((segment, index) => {",
             "clampToGround: true",
         ]

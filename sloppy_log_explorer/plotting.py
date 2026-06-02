@@ -440,13 +440,15 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     window.CESIUM_BASE_URL = "{CESIUM_BASE_URL}/";
   </script>
   <link href="{CESIUM_BASE_URL}/Widgets/widgets.css" rel="stylesheet">
   <script src="{CESIUM_BASE_URL}/Cesium.js"></script>
   <style>
-    html, body, #cesiumContainer {{
+    html, body {{
       width: 100%;
       height: 100%;
       margin: 0;
@@ -454,6 +456,35 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       overflow: hidden;
       background: {background};
       font-family: Arial, sans-serif;
+    }}
+    body {{
+      position: relative;
+    }}
+    #cesiumContainer,
+    #leafletContainer {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }}
+    #leafletContainer[hidden] {{
+      display: none;
+    }}
+    .leaflet-container {{
+      background: {background};
+      font: inherit;
+    }}
+    .leaflet-tooltip.gpsMarkerTooltip {{
+      background: rgba(17, 24, 39, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      color: #f9fafb;
+      box-shadow: none;
+      font: 12px Arial, sans-serif;
+      padding: 2px 8px;
+    }}
+    .leaflet-tooltip.gpsMarkerTooltip::before {{
+      border-top-color: rgba(17, 24, 39, 0.92);
+      border-bottom-color: rgba(17, 24, 39, 0.92);
     }}
     #legend {{
       position: absolute;
@@ -534,6 +565,7 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
 </head>
 <body>
   <div id="cesiumContainer"></div>
+  <div id="leafletContainer" hidden></div>
   <div id="legend" hidden>
     <div id="legendTitle"></div>
     <div id="gradientBar"></div>
@@ -547,31 +579,28 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
   <div id="osmAttribution">
     Tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
   </div>
-  <script>
-    const flightData = {data_json};
-    const osmProvider = new Cesium.OpenStreetMapImageryProvider({{
-      url: flightData.osmUrl,
-      fileExtension: "png"
-    }});
-
-    const viewer = new Cesium.Viewer("cesiumContainer", {{
-      animation: false,
-      baseLayer: new Cesium.ImageryLayer(osmProvider),
-      baseLayerPicker: false,
-      fullscreenButton: false,
-      geocoder: false,
-      infoBox: false,
-      navigationHelpButton: true,
-      sceneMode: Cesium.SceneMode.SCENE3D,
-      sceneModePicker: true,
-      selectionIndicator: false,
-      shouldAnimate: false,
-      timeline: false,
-      terrainProvider: new Cesium.EllipsoidTerrainProvider()
-    }});
-
+    <script>
+        const flightData = {data_json};
+        const osmTileUrl = flightData.osmUrl.endsWith("/")
+      ? flightData.osmUrl + "{{z}}/{{x}}/{{y}}.png"
+      : flightData.osmUrl + "/{{z}}/{{x}}/{{y}}.png";
+    const cesiumContainer = document.getElementById("cesiumContainer");
+    const leafletContainer = document.getElementById("leafletContainer");
+    const legendContainer = document.getElementById("legend");
+    const legendTitle = document.getElementById("legendTitle");
+    const gradientBar = document.getElementById("gradientBar");
+    const legendMin = document.getElementById("legendMin");
+    const legendMid = document.getElementById("legendMid");
+    const legendMax = document.getElementById("legendMax");
     const statusOverlay = document.getElementById("statusOverlay");
     let statusHideTimer = null;
+    let cesiumViewer = null;
+    let leafletMap = null;
+    let readinessTimer = null;
+    let cesiumReady = false;
+    let activeMode = "cesium";
+    const preferLeafletRenderer = /QtWebEngine/i.test(navigator.userAgent || "");
+
     function setStatus(message, kind) {{
       if (!statusOverlay) return;
       if (statusHideTimer) {{
@@ -588,6 +617,7 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       statusOverlay.dataset.kind = kind || "info";
       statusOverlay.textContent = message;
     }}
+
     function transientStatus(message, kind, timeoutMs) {{
       setStatus(message, kind);
       if ((kind || "info") === "error") {{
@@ -600,107 +630,324 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       }}, timeoutMs || 1800);
     }}
 
-    osmProvider.errorEvent.addEventListener((tileError) => {{
-      const details = tileError && (tileError.message || (tileError.error && tileError.error.message));
-      setStatus("OSM tile error" + (details ? ": " + details : ""), "error");
-    }});
-
-    viewer.scene.globe.depthTestAgainstTerrain = false;
-    viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
-    viewer.scene.globe.tileLoadProgressEvent.addEventListener((remaining) => {{
-      if (remaining > 0) {{
-        transientStatus("Loading map tiles... " + remaining, "info", 900);
-      }} else {{
-        transientStatus("Map ready", "ok", 1200);
-      }}
-    }});
-    viewer.scene.renderError.addEventListener((scene, error) => {{
-      const details = error && error.message ? error.message : String(error);
-      setStatus("Render error: " + details, "error");
-    }});
-
-    const pathPositions = [];
-    flightData.points.forEach((point) => {{
-      pathPositions.push(point.lon, point.lat);
-    }});
-    viewer.entities.add({{
-      name: "Flight path underlay",
-      polyline: {{
-        positions: Cesium.Cartesian3.fromDegreesArray(pathPositions),
-        width: 10,
-        clampToGround: true,
-        material: Cesium.Color.WHITE.withAlpha(0.82)
-      }}
-    }});
-
-    flightData.segments.forEach((segment, index) => {{
-      const positions = Cesium.Cartesian3.fromDegreesArray([
-        segment.positions[0],
-        segment.positions[1],
-        segment.positions[3],
-        segment.positions[4]
-      ]);
-      viewer.entities.add({{
-        name: `Flight segment ${{index + 1}}`,
-        description: `Rows ${{segment.startRow}}-${{segment.endRow}}`,
-        polyline: {{
-          positions,
-          width: 6,
-          clampToGround: true,
-          material: Cesium.Color.fromCssColorString(segment.color).withAlpha(0.96)
-        }}
-      }});
-    }});
-
-    function marker(point, label, color) {{
-      viewer.entities.add({{
-        name: label,
-        position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt),
-        point: {{
-          pixelSize: 12,
-          color: Cesium.Color.fromCssColorString(color),
-          outlineColor: Cesium.Color.WHITE,
-          outlineWidth: 2,
-          disableDepthTestDistance: Number.POSITIVE_INFINITY
-        }},
-        label: {{
-          text: label,
-          font: "13px Arial",
-          fillColor: Cesium.Color.WHITE,
-          outlineColor: Cesium.Color.BLACK,
-          outlineWidth: 3,
-          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-          pixelOffset: new Cesium.Cartesian2(0, -24),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY
-        }}
-      }});
-    }}
-
-    marker(flightData.points[0], "Start", "#27ae60");
-    marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
-
-    if (flightData.legend && flightData.legend.enabled) {{
+    function renderLegend() {{
       const legend = flightData.legend;
-      document.getElementById("legend").hidden = false;
-      document.getElementById("legendTitle").textContent = `Color by ${{legend.label}}`;
-      document.getElementById("gradientBar").style.background =
-        `linear-gradient(90deg, ${{legend.lowColor}}, ${{legend.highColor}})`;
-      document.getElementById("legendMin").textContent = legend.minLabel;
-      document.getElementById("legendMid").textContent = legend.midLabel || "";
-      document.getElementById("legendMax").textContent = legend.maxLabel;
+      if (!legend || !legend.enabled) {{
+        legendContainer.hidden = true;
+        return;
+      }}
+      legendContainer.hidden = false;
+      legendTitle.textContent = `Color by ${{legend.label}}`;
+      gradientBar.style.background = `linear-gradient(90deg, ${{legend.lowColor}}, ${{legend.highColor}})`;
+      legendMin.textContent = legend.minLabel;
+      legendMid.textContent = legend.midLabel || "";
+      legendMax.textContent = legend.maxLabel;
     }}
 
-    const allPositions = flightData.points.map((point) =>
-      Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt)
-    );
-    const sphere = Cesium.BoundingSphere.fromPoints(allPositions);
-    const range = Math.max(sphere.radius * 3.2, 500.0);
-    viewer.camera.flyToBoundingSphere(sphere, {{
-      duration: 0,
-      offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), range)
-    }});
-    transientStatus("Map ready", "ok", 1200);
-    viewer.scene.requestRender();
+    function destroyCesiumViewer() {{
+      if (!cesiumViewer) {{
+        return;
+      }}
+      try {{
+        cesiumViewer.destroy();
+      }} catch (error) {{
+        console.warn("Failed to destroy Cesium viewer", error);
+      }}
+      cesiumViewer = null;
+    }}
+
+    function clearReadinessTimer() {{
+      if (readinessTimer) {{
+        clearTimeout(readinessTimer);
+        readinessTimer = null;
+      }}
+    }}
+
+    function markCesiumReady() {{
+      if (cesiumReady || activeMode !== "cesium") {{
+        return;
+      }}
+      cesiumReady = true;
+      clearReadinessTimer();
+      transientStatus("Map ready", "ok", 1200);
+    }}
+
+    function buildLeafletMap() {{
+      if (!window.L) {{
+        throw new Error("Leaflet library failed to load");
+      }}
+      leafletContainer.hidden = false;
+      cesiumContainer.hidden = true;
+      const map = L.map("leafletContainer", {{
+        attributionControl: false,
+        zoomControl: true,
+        preferCanvas: true
+      }});
+      const tileLayer = L.tileLayer(osmTileUrl, {{
+        maxZoom: 19,
+        tileSize: 256,
+        updateWhenIdle: true
+      }});
+      tileLayer.on("loading", () => {{
+        if (activeMode === "leaflet") {{
+          transientStatus("Loading map tiles...", "info", 900);
+        }}
+      }});
+      tileLayer.on("load", () => {{
+        if (activeMode === "leaflet") {{
+          transientStatus("Map ready", "ok", 1200);
+        }}
+      }});
+      tileLayer.on("tileerror", (event) => {{
+        const details = event && event.error && (event.error.message || String(event.error));
+        setStatus("OSM tile error" + (details ? ": " + details : ""), "error");
+      }});
+      tileLayer.addTo(map);
+
+      const pathLatLngs = flightData.points.map((point) => [point.lat, point.lon]);
+      L.polyline(pathLatLngs, {{
+        color: "#ffffff",
+        weight: 10,
+        opacity: 0.82,
+        lineCap: "round",
+        lineJoin: "round"
+      }}).addTo(map);
+
+      flightData.segments.forEach((segment, index) => {{
+        const left = flightData.points[index];
+        const right = flightData.points[index + 1];
+        if (!left || !right) {{
+          return;
+        }}
+        L.polyline([[left.lat, left.lon], [right.lat, right.lon]], {{
+          color: segment.color,
+          weight: 6,
+          opacity: 0.96,
+          lineCap: "round",
+          lineJoin: "round"
+        }}).addTo(map);
+      }});
+
+      function marker(point, label, color) {{
+        return L.circleMarker([point.lat, point.lon], {{
+          radius: 7,
+          color: "#ffffff",
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 1,
+          opacity: 1
+        }}).addTo(map).bindTooltip(label, {{
+          permanent: true,
+          direction: "top",
+          offset: [0, -12],
+          className: "gpsMarkerTooltip"
+        }});
+      }}
+
+      marker(flightData.points[0], "Start", "#27ae60");
+      marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
+      renderLegend();
+
+      const bounds = L.latLngBounds(pathLatLngs);
+      setTimeout(() => {{
+        map.invalidateSize();
+        if (bounds.isValid()) {{
+          map.fitBounds(bounds, {{
+            padding: [24, 24],
+            maxZoom: 17
+          }});
+        }}
+      }}, 0);
+      return map;
+    }}
+
+    function switchToLeaflet(reason) {{
+      if (activeMode === "leaflet") {{
+        return;
+      }}
+      activeMode = "leaflet";
+      clearReadinessTimer();
+      destroyCesiumViewer();
+      cesiumContainer.hidden = true;
+      leafletContainer.hidden = false;
+      setStatus(reason ? "Leaflet fallback: " + reason : "Leaflet fallback", "error");
+      try {{
+        if (!leafletMap) {{
+          leafletMap = buildLeafletMap();
+        }} else {{
+          setTimeout(() => {{
+            if (leafletMap) {{
+              leafletMap.invalidateSize();
+            }}
+          }}, 0);
+        }}
+      }} catch (error) {{
+        const details = error && error.message ? error.message : String(error);
+        setStatus("Leaflet render error: " + details, "error");
+      }}
+    }}
+
+    function initCesium() {{
+      try {{
+        const osmProvider = new Cesium.OpenStreetMapImageryProvider({{
+          url: flightData.osmUrl,
+          fileExtension: "png"
+        }});
+
+        const viewer = new Cesium.Viewer("cesiumContainer", {{
+          animation: false,
+          baseLayer: new Cesium.ImageryLayer(osmProvider),
+          baseLayerPicker: false,
+          fullscreenButton: false,
+          geocoder: false,
+          infoBox: false,
+          navigationHelpButton: true,
+          sceneMode: Cesium.SceneMode.SCENE3D,
+          sceneModePicker: true,
+          selectionIndicator: false,
+          shouldAnimate: false,
+          timeline: false,
+          terrainProvider: new Cesium.EllipsoidTerrainProvider()
+        }});
+        cesiumViewer = viewer;
+
+        viewer.scene.globe.depthTestAgainstTerrain = false;
+        viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
+
+        osmProvider.errorEvent.addEventListener((tileError) => {{
+          if (activeMode !== "cesium") {{
+            return;
+          }}
+          const details = tileError && (tileError.message || (tileError.error && tileError.error.message));
+          switchToLeaflet("OSM tile error" + (details ? ": " + details : ""));
+        }});
+
+        viewer.scene.globe.tileLoadProgressEvent.addEventListener((remaining) => {{
+          if (activeMode !== "cesium") {{
+            return;
+          }}
+          if (remaining > 0) {{
+            transientStatus("Loading map tiles... " + remaining, "info", 900);
+          }} else {{
+            markCesiumReady();
+          }}
+        }});
+
+        viewer.scene.renderError.addEventListener((scene, error) => {{
+          if (activeMode !== "cesium") {{
+            return;
+          }}
+          const details = error && error.message ? error.message : String(error);
+          switchToLeaflet("Render error: " + details);
+        }});
+
+        readinessTimer = setTimeout(() => {{
+          if (activeMode === "cesium" && !cesiumReady) {{
+            switchToLeaflet("Cesium readiness timed out");
+          }}
+        }}, 10000);
+
+        const pathPositions = [];
+        flightData.points.forEach((point) => {{
+          pathPositions.push(point.lon, point.lat);
+        }});
+        viewer.entities.add({{
+          name: "Flight path underlay",
+          polyline: {{
+            positions: Cesium.Cartesian3.fromDegreesArray(pathPositions),
+            width: 10,
+            clampToGround: true,
+            material: Cesium.Color.WHITE.withAlpha(0.82)
+          }}
+        }});
+
+        flightData.segments.forEach((segment, index) => {{
+          const positions = Cesium.Cartesian3.fromDegreesArray([
+            segment.positions[0],
+            segment.positions[1],
+            segment.positions[3],
+            segment.positions[4]
+          ]);
+          viewer.entities.add({{
+            name: `Flight segment ${{index + 1}}`,
+            description: `Rows ${{segment.startRow}}-${{segment.endRow}}`,
+            polyline: {{
+              positions,
+              width: 6,
+              clampToGround: true,
+              material: Cesium.Color.fromCssColorString(segment.color).withAlpha(0.96)
+            }}
+          }});
+        }});
+
+        function marker(point, label, color) {{
+          viewer.entities.add({{
+            name: label,
+            position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt),
+            point: {{
+              pixelSize: 12,
+              color: Cesium.Color.fromCssColorString(color),
+              outlineColor: Cesium.Color.WHITE,
+              outlineWidth: 2,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY
+            }},
+            label: {{
+              text: label,
+              font: "13px Arial",
+              fillColor: Cesium.Color.WHITE,
+              outlineColor: Cesium.Color.BLACK,
+              outlineWidth: 3,
+              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              pixelOffset: new Cesium.Cartesian2(0, -24),
+              disableDepthTestDistance: Number.POSITIVE_INFINITY
+            }}
+          }});
+        }}
+
+        marker(flightData.points[0], "Start", "#27ae60");
+        marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
+        renderLegend();
+
+        const allPositions = flightData.points.map((point) =>
+          Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt)
+        );
+        const sphere = Cesium.BoundingSphere.fromPoints(allPositions);
+        const range = Math.max(sphere.radius * 3.2, 500.0);
+        viewer.camera.flyToBoundingSphere(sphere, {{
+          duration: 0,
+          offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), range)
+        }});
+        viewer.scene.requestRender();
+        if (!cesiumReady) {{
+          transientStatus("Preparing map...", "info", 900);
+        }}
+      }} catch (error) {{
+        const details = error && error.message ? error.message : String(error);
+        switchToLeaflet("Cesium error: " + details);
+      }}
+    }}
+
+    if (preferLeafletRenderer) {{
+      activeMode = "leaflet";
+      try {{
+        leafletMap = buildLeafletMap();
+        transientStatus("2D map ready", "ok", 1200);
+      }} catch (error) {{
+        const details = error && error.message ? error.message : String(error);
+        activeMode = "cesium";
+        leafletContainer.hidden = true;
+        cesiumContainer.hidden = false;
+        if (!window.Cesium) {{
+          setStatus("Map render error: " + details, "error");
+        }} else {{
+          initCesium();
+        }}
+      }}
+    }} else if (!window.Cesium) {{
+      switchToLeaflet("Cesium script unavailable");
+    }} else {{
+      initCesium();
+    }}
   </script>
 </body>
 </html>

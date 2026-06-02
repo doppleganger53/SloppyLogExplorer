@@ -93,6 +93,10 @@ def write_no_gps_sample(path: Path) -> None:
     )
 
 
+def write_library_blob(path: Path, size: int) -> None:
+    path.write_text("x" * size, encoding="utf-8")
+
+
 def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
     path = tmp_path / "Panther" / "flight.csv"
     path.parent.mkdir()
@@ -174,6 +178,13 @@ def test_gps_map_html_uses_cesium_openstreetmap_without_api_keys(tmp_path: Path)
     assert "Cesium.OpenStreetMapImageryProvider" in html
     assert "tile.openstreetmap.org" in html
     assert "OpenStreetMap contributors" in html
+    assert "leaflet@1.9.4" in html
+    assert 'id="leafletContainer"' in html
+    assert "L.tileLayer(osmTileUrl" in html
+    assert "preferLeafletRenderer = /QtWebEngine/i.test" in html
+    assert 'transientStatus("2D map ready", "ok", 1200)' in html
+    assert 'switchToLeaflet("Cesium script unavailable")' in html
+    assert 'switchToLeaflet("Cesium readiness timed out")' in html
     assert "baseLayer: new Cesium.ImageryLayer(osmProvider)" in html
     assert "baseLayer: false" not in html
     assert "viewer.imageryLayers.removeAll()" not in html
@@ -205,6 +216,11 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "marker(flightData.points[0], \"Start\"" in html
     assert "marker(flightData.points[flightData.points.length - 1], \"End\"" in html
     assert "disableDepthTestDistance: Number.POSITIVE_INFINITY" in html
+    assert "const pathLatLngs = flightData.points.map((point) => [point.lat, point.lon]);" in html
+    assert "L.polyline(pathLatLngs" in html
+    assert "L.polyline([[left.lat, left.lon], [right.lat, right.lon]]" in html
+    assert "L.circleMarker([point.lat, point.lon]" in html
+    assert "map.fitBounds(bounds" in html
 
 
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
@@ -329,7 +345,7 @@ def test_scan_library_uses_metadata_only_and_groups_root_level_models(tmp_path: 
     assert list(group_by_model(logs)) == ["5inch", "ERATIX"]
 
 
-def test_library_tree_defaults_collapsed_and_keeps_file_date_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_library_tree_sorts_top_level_and_children_by_clicked_column_and_preserves_expansion_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_root = tmp_path / "appdata"
     monkeypatch.setenv("APPDATA", str(app_root))
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -339,19 +355,42 @@ def test_library_tree_defaults_collapsed_and_keeps_file_date_order(tmp_path: Pat
     root = tmp_path / "frsky"
     root.mkdir()
 
-    alpha_new = root / "Alpha-2026-01-02-10-00-00.csv"
-    alpha_old = root / "Alpha-2026-01-01-10-00-00.csv"
-    beta = root / "Beta-2026-01-03-10-00-00.csv"
-    write_sample(alpha_new)
-    write_sample(alpha_old)
-    write_sample(beta)
-    os.utime(alpha_new, (2000, 2000))
-    os.utime(alpha_old, (1000, 1000))
-    os.utime(beta, (1500, 1500))
+    alpha_a = root / "Alpha" / "alpha.csv"
+    alpha_b = root / "Alpha" / "omega.csv"
+    alpha_c = root / "Alpha" / "zeta.csv"
+    beta_a = root / "Beta" / "beta-a.csv"
+    beta_b = root / "Beta" / "beta-b.csv"
+    gamma = root / "Gamma" / "gamma.csv"
+    for path, size in [
+        (alpha_a, 300),
+        (alpha_b, 100),
+        (alpha_c, 200),
+        (beta_a, 100),
+        (beta_b, 200),
+        (gamma, 500),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_library_blob(path, size)
+    os.utime(alpha_a, (1000, 1000))
+    os.utime(alpha_b, (3000, 3000))
+    os.utime(alpha_c, (2000, 2000))
+    os.utime(beta_a, (4000, 4000))
+    os.utime(beta_b, (2500, 2500))
+    os.utime(gamma, (3500, 3500))
 
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     window.load_library(root)
+
+    def top_level_items() -> list:
+        return [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())]
+
+    def top_level_names() -> list[str]:
+        return [item.text(0) for item in top_level_items()]
+
+    def child_names(model: str) -> list[str]:
+        item = next(item for item in top_level_items() if item.text(0) == model)
+        return [item.child(index).text(0) for index in range(item.childCount())]
 
     header = window.library_tree.header()
     assert window.library_tree.columnCount() == 4
@@ -362,19 +401,38 @@ def test_library_tree_defaults_collapsed_and_keeps_file_date_order(tmp_path: Pat
     assert header.sortIndicatorSection() == 2
     assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
 
-    top_level = [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())]
-    assert all(not item.isExpanded() for item in top_level)
+    assert top_level_names() == ["Beta", "Gamma", "Alpha"]
+    assert all(not item.isExpanded() for item in top_level_items())
 
-    alpha = next(item for item in top_level if item.text(0) == "Alpha")
-    assert alpha.text(2) == window._format_timestamp(2000)
-    assert alpha.text(3) == window._format_size(alpha_new.stat().st_size + alpha_old.stat().st_size)
-    assert alpha.child(0).text(0) == alpha_new.name
-    assert alpha.child(1).text(0) == alpha_old.name
+    alpha = next(item for item in top_level_items() if item.text(0) == "Alpha")
+    beta = next(item for item in top_level_items() if item.text(0) == "Beta")
+    gamma = next(item for item in top_level_items() if item.text(0) == "Gamma")
+    assert alpha.text(2) == window._format_timestamp(3000)
+    assert alpha.text(3) == window._format_size(alpha_a.stat().st_size + alpha_b.stat().st_size + alpha_c.stat().st_size)
+    assert child_names("Alpha") == [alpha_b.name, alpha_c.name, alpha_a.name]
+    alpha.setExpanded(True)
+    gamma.setExpanded(True)
 
     window.library_header_clicked(0)
-    alpha = next(item for item in [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())] if item.text(0) == "Alpha")
-    assert alpha.child(0).text(0) == alpha_new.name
-    assert alpha.child(1).text(0) == alpha_old.name
+    assert top_level_names() == ["Alpha", "Beta", "Gamma"]
+    assert child_names("Alpha") == [alpha_a.name, alpha_b.name, alpha_c.name]
+    assert alpha.isExpanded()
+    assert not beta.isExpanded()
+    assert gamma.isExpanded()
+
+    window.library_header_clicked(3)
+    assert top_level_names() == ["Alpha", "Gamma", "Beta"]
+    assert child_names("Alpha") == [alpha_a.name, alpha_c.name, alpha_b.name]
+    assert alpha.isExpanded()
+    assert not beta.isExpanded()
+    assert gamma.isExpanded()
+
+    window.library_header_clicked(2)
+    assert top_level_names() == ["Beta", "Gamma", "Alpha"]
+    assert child_names("Alpha") == [alpha_b.name, alpha_c.name, alpha_a.name]
+    assert alpha.isExpanded()
+    assert not beta.isExpanded()
+    assert gamma.isExpanded()
     window.close()
     app.quit()
 

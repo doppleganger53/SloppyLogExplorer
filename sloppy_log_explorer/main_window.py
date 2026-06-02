@@ -1071,9 +1071,10 @@ class MainWindow(QMainWindow):
         )
 
     def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
-        items: list[QTreeWidgetItem] = []
+        items = [self.library_tree.topLevelItem(index) for index in range(self.library_tree.topLevelItemCount())]
+        expanded_state = {id(item): item.isExpanded() for item in items}
         while self.library_tree.topLevelItemCount():
-            items.append(self.library_tree.takeTopLevelItem(0))
+            self.library_tree.takeTopLevelItem(0)
 
         reverse = order == Qt.SortOrder.DescendingOrder
         items.sort(key=lambda item: self._library_sort_key(item, column), reverse=reverse)
@@ -1082,15 +1083,32 @@ class MainWindow(QMainWindow):
         try:
             for index, item in enumerate(items):
                 self.library_tree.insertTopLevelItem(index, item)
+                self._sort_library_children(item, column, order)
+            for item in items:
+                item.setExpanded(expanded_state.get(id(item), False))
         finally:
             self.library_tree.setUpdatesEnabled(True)
 
         self.library_tree.header().setSortIndicator(column, order)
 
-    def _library_sort_key(self, item: QTreeWidgetItem, column: int) -> tuple[object, str]:
+    def _sort_library_children(self, item: QTreeWidgetItem, column: int, order: Qt.SortOrder) -> None:
+        children = [item.child(index) for index in range(item.childCount())]
+        expanded_state = {id(child): child.isExpanded() for child in children}
+        while item.childCount():
+            item.takeChild(0)
+
+        reverse = order == Qt.SortOrder.DescendingOrder
+        children.sort(key=lambda child: self._library_sort_key(child, column, child_rows=True), reverse=reverse)
+        for index, child in enumerate(children):
+            item.insertChild(index, child)
+            self._sort_library_children(child, column, order)
+        for child in children:
+            child.setExpanded(expanded_state.get(id(child), False))
+
+    def _library_sort_key(self, item: QTreeWidgetItem, column: int, child_rows: bool = False) -> tuple[object, str]:
         label = str(item.text(0)).casefold()
         if column == 1:
-            primary: object = int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
+            primary = label if child_rows else int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
         elif column == 2:
             primary = float(item.data(2, Qt.ItemDataRole.UserRole) or 0.0)
         elif column == 3:
