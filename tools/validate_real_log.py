@@ -62,6 +62,21 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
     gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=selected[0]))
     if log.info.has_gps and ("cesium.viewer" not in gps_html.lower() or "tile.openstreetmap.org" not in gps_html.lower()):
         raise AssertionError("GPS map HTML is missing Cesium or OpenStreetMap")
+    if log.info.has_gps:
+        required_map_tokens = [
+            "baseLayer: new Cesium.ImageryLayer(osmProvider)",
+            'name: "Flight path underlay"',
+            "Cesium.Cartesian3.fromDegreesArray(pathPositions)",
+            "flightData.segments.forEach((segment, index) => {",
+            "clampToGround: true",
+        ]
+        missing = [token for token in required_map_tokens if token not in gps_html]
+        if missing:
+            raise AssertionError(f"GPS map HTML is missing visible map/path tokens: {missing}")
+        forbidden_map_tokens = ["baseLayer: false", "viewer.imageryLayers.removeAll()"]
+        present = [token for token in forbidden_map_tokens if token in gps_html]
+        if present:
+            raise AssertionError(f"GPS map HTML still contains blank-map-prone setup: {present}")
 
     voltage_columns = find_voltage_columns(log.parameter_columns)
     current_columns = find_current_columns(log.parameter_columns)

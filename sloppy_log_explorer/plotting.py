@@ -488,6 +488,36 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       justify-content: space-between;
       gap: 8px;
     }}
+    #statusOverlay {{
+      position: absolute;
+      left: 8px;
+      top: 8px;
+      z-index: 12;
+      min-width: 160px;
+      max-width: 320px;
+      font-size: 11px;
+      line-height: 1.3;
+      color: {panel_fg};
+      background: {panel_bg};
+      border: 1px solid {border};
+      border-radius: 5px;
+      padding: 6px 8px;
+      box-sizing: border-box;
+      pointer-events: none;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    #statusOverlay[data-kind="error"] {{
+      border-color: rgba(239,68,68,0.85);
+      color: #fecaca;
+      background: rgba(127,29,29,0.9);
+    }}
+    #statusOverlay[data-kind="ok"] {{
+      color: #dcfce7;
+      background: rgba(20,83,45,0.88);
+      border-color: rgba(74,222,128,0.65);
+    }}
     #osmAttribution {{
       position: absolute;
       right: 8px;
@@ -513,15 +543,20 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       <span id="legendMax"></span>
     </div>
   </div>
+  <div id="statusOverlay" hidden></div>
   <div id="osmAttribution">
     Tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
   </div>
   <script>
     const flightData = {data_json};
+    const osmProvider = new Cesium.OpenStreetMapImageryProvider({{
+      url: flightData.osmUrl,
+      fileExtension: "png"
+    }});
 
     const viewer = new Cesium.Viewer("cesiumContainer", {{
       animation: false,
-      baseLayer: false,
+      baseLayer: new Cesium.ImageryLayer(osmProvider),
       baseLayerPicker: false,
       fullscreenButton: false,
       geocoder: false,
@@ -535,23 +570,83 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       terrainProvider: new Cesium.EllipsoidTerrainProvider()
     }});
 
-    viewer.imageryLayers.removeAll();
-    viewer.imageryLayers.addImageryProvider(new Cesium.OpenStreetMapImageryProvider({{
-      url: flightData.osmUrl,
-      fileExtension: "png"
-    }}));
+    const statusOverlay = document.getElementById("statusOverlay");
+    let statusHideTimer = null;
+    function setStatus(message, kind) {{
+      if (!statusOverlay) return;
+      if (statusHideTimer) {{
+        clearTimeout(statusHideTimer);
+        statusHideTimer = null;
+      }}
+      if (!message) {{
+        statusOverlay.hidden = true;
+        statusOverlay.textContent = "";
+        statusOverlay.dataset.kind = "";
+        return;
+      }}
+      statusOverlay.hidden = false;
+      statusOverlay.dataset.kind = kind || "info";
+      statusOverlay.textContent = message;
+    }}
+    function transientStatus(message, kind, timeoutMs) {{
+      setStatus(message, kind);
+      if ((kind || "info") === "error") {{
+        return;
+      }}
+      statusHideTimer = setTimeout(() => {{
+        if (statusOverlay && statusOverlay.dataset.kind === (kind || "info")) {{
+          setStatus("", "");
+        }}
+      }}, timeoutMs || 1800);
+    }}
+
+    osmProvider.errorEvent.addEventListener((tileError) => {{
+      const details = tileError && (tileError.message || (tileError.error && tileError.error.message));
+      setStatus("OSM tile error" + (details ? ": " + details : ""), "error");
+    }});
+
     viewer.scene.globe.depthTestAgainstTerrain = false;
     viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
+    viewer.scene.globe.tileLoadProgressEvent.addEventListener((remaining) => {{
+      if (remaining > 0) {{
+        transientStatus("Loading map tiles... " + remaining, "info", 900);
+      }} else {{
+        transientStatus("Map ready", "ok", 1200);
+      }}
+    }});
+    viewer.scene.renderError.addEventListener((scene, error) => {{
+      const details = error && error.message ? error.message : String(error);
+      setStatus("Render error: " + details, "error");
+    }});
+
+    const pathPositions = [];
+    flightData.points.forEach((point) => {{
+      pathPositions.push(point.lon, point.lat);
+    }});
+    viewer.entities.add({{
+      name: "Flight path underlay",
+      polyline: {{
+        positions: Cesium.Cartesian3.fromDegreesArray(pathPositions),
+        width: 10,
+        clampToGround: true,
+        material: Cesium.Color.WHITE.withAlpha(0.82)
+      }}
+    }});
 
     flightData.segments.forEach((segment, index) => {{
-      const positions = Cesium.Cartesian3.fromDegreesArrayHeights(segment.positions);
+      const positions = Cesium.Cartesian3.fromDegreesArray([
+        segment.positions[0],
+        segment.positions[1],
+        segment.positions[3],
+        segment.positions[4]
+      ]);
       viewer.entities.add({{
         name: `Flight segment ${{index + 1}}`,
         description: `Rows ${{segment.startRow}}-${{segment.endRow}}`,
         polyline: {{
           positions,
-          width: 5,
-          clampToGround: false,
+          width: 6,
+          clampToGround: true,
           material: Cesium.Color.fromCssColorString(segment.color).withAlpha(0.96)
         }}
       }});
@@ -604,6 +699,7 @@ def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None
       duration: 0,
       offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), range)
     }});
+    transientStatus("Map ready", "ok", 1200);
     viewer.scene.requestRender();
   </script>
 </body>

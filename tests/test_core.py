@@ -174,9 +174,37 @@ def test_gps_map_html_uses_cesium_openstreetmap_without_api_keys(tmp_path: Path)
     assert "Cesium.OpenStreetMapImageryProvider" in html
     assert "tile.openstreetmap.org" in html
     assert "OpenStreetMap contributors" in html
+    assert "baseLayer: new Cesium.ImageryLayer(osmProvider)" in html
+    assert "baseLayer: false" not in html
+    assert "viewer.imageryLayers.removeAll()" not in html
     assert "Ion.defaultAccessToken" not in html
     assert "createWorldTerrain" not in html
     assert "createWorldImagery" not in html
+
+
+def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    payload = build_gps_map_payload(log, GpsGradientOptions(color_column="Current(A)"))
+    html = build_gps_map_html(log, GpsGradientOptions(color_column="Current(A)"))
+
+    assert payload["status"] == "ok"
+    assert len(payload["points"]) == 9
+    assert len(payload["segments"]) == len(payload["points"]) - 1
+    assert "const pathPositions = [];" in html
+    assert "pathPositions.push(point.lon, point.lat);" in html
+    assert 'name: "Flight path underlay"' in html
+    assert "Cesium.Cartesian3.fromDegreesArray(pathPositions)" in html
+    assert "Cesium.Color.WHITE.withAlpha(0.82)" in html
+    assert "flightData.segments.forEach((segment, index) => {" in html
+    assert 'name: `Flight segment ${index + 1}`' in html
+    assert "Cesium.Cartesian3.fromDegreesArray([" in html
+    assert "clampToGround: true" in html
+    assert "marker(flightData.points[0], \"Start\"" in html
+    assert "marker(flightData.points[flightData.points.length - 1], \"End\"" in html
+    assert "disableDepthTestDistance: Number.POSITIVE_INFINITY" in html
 
 
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
