@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import html
 import json
+import math
+import re
 
 import pandas as pd
 import plotly.graph_objects as go
 
-from .models import LoadedLog
+from .models import GpsGradientOptions, LoadedLog
 from .parser import relative_seconds
 
 COLORS = [
@@ -19,9 +22,71 @@ COLORS = [
     "#56ccf2",
 ]
 
+CESIUM_VERSION = "1.141"
+CESIUM_BASE_URL = f"https://cesium.com/downloads/cesiumjs/releases/{CESIUM_VERSION}/Build/Cesium"
+OSM_TILE_URL = "https://tile.openstreetmap.org/"
+DEFAULT_PATH_COLOR = "#55d977"
+MISSING_VALUE_COLOR = "#9ca3af"
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
 
 def _axis_name(index: int) -> str:
     return "y" if index == 0 else f"y{index + 1}"
+
+
+def _is_finite_number(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _clean_hex_color(value: str | None, fallback: str) -> str:
+    if value and HEX_COLOR_RE.match(value.strip()):
+        return value.strip().lower()
+    return fallback
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    clean = color.lstrip("#")
+    return int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16)
+
+
+def _interpolate_hex_color(start: str, end: str, amount: float) -> str:
+    amount = max(0.0, min(1.0, float(amount)))
+    start_rgb = _hex_to_rgb(start)
+    end_rgb = _hex_to_rgb(end)
+    rgb = tuple(round(start_rgb[idx] + (end_rgb[idx] - start_rgb[idx]) * amount) for idx in range(3))
+    return f"#{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+
+
+def _gradient_position(
+    value: float,
+    minimum: float,
+    maximum: float,
+    midpoint: float | None = None,
+    reverse: bool = False,
+) -> float:
+    if maximum <= minimum:
+        amount = 0.5
+    elif midpoint is not None and minimum < midpoint < maximum:
+        if value <= midpoint:
+            amount = 0.5 * ((value - minimum) / (midpoint - minimum))
+        else:
+            amount = 0.5 + 0.5 * ((value - midpoint) / (maximum - midpoint))
+    else:
+        amount = (value - minimum) / (maximum - minimum)
+    amount = max(0.0, min(1.0, amount))
+    return 1.0 - amount if reverse else amount
+
+
+def _format_legend_number(value: float | None) -> str:
+    if value is None or not _is_finite_number(value):
+        return ""
+    value = float(value)
+    if abs(value) >= 1000 or (abs(value) < 0.01 and value != 0):
+        return f"{value:.3g}"
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def build_telemetry_figure(
@@ -209,6 +274,341 @@ def build_gps_figure(log: LoadedLog | None, color_column: str | None = None, dar
         },
     )
     return fig
+
+
+def _empty_gps_payload(message: str) -> dict[str, object]:
+    return {
+        "status": "empty",
+        "message": message,
+        "points": [],
+        "segments": [],
+        "legend": {"enabled": False},
+        "osmUrl": OSM_TILE_URL,
+    }
+
+
+def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | None = None) -> dict[str, object]:
+    options = options or GpsGradientOptions()
+    if log is None:
+        return _empty_gps_payload("Open a log with GPS data to view the flight path.")
+
+    gps = log.gps_columns
+    if gps is None:
+        return _empty_gps_payload("No GPS latitude/longitude columns detected.")
+
+    df = log.dataframe
+    lat_values = pd.to_numeric(df[gps.latitude], errors="coerce")
+    lon_values = pd.to_numeric(df[gps.longitude], errors="coerce")
+    if gps.altitude and gps.altitude in df.columns:
+        alt_values = pd.to_numeric(df[gps.altitude], errors="coerce")
+        altitude_label = gps.altitude_label or gps.altitude
+    else:
+        alt_values = pd.Series([0.0] * len(df), index=df.index, dtype="float64")
+        altitude_label = "Altitude"
+
+    color_column = options.color_column if options.color_column in df.columns else None
+    color_values = pd.to_numeric(df[color_column], errors="coerce") if color_column else None
+    points: list[dict[str, object]] = []
+    for row_index in range(len(df)):
+        lat = lat_values.iloc[row_index]
+        lon = lon_values.iloc[row_index]
+        if not (_is_finite_number(lat) and _is_finite_number(lon)):
+            continue
+        lat = float(lat)
+        lon = float(lon)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        alt = alt_values.iloc[row_index]
+        point: dict[str, object] = {
+            "lat": lat,
+            "lon": lon,
+            "alt": float(alt) if _is_finite_number(alt) else 0.0,
+            "row": row_index + 1,
+        }
+        if color_values is not None:
+            value = color_values.iloc[row_index]
+            point["value"] = float(value) if _is_finite_number(value) else None
+        points.append(point)
+
+    if len(points) < 2:
+        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+
+    start_color = _clean_hex_color(options.start_color, GpsGradientOptions.start_color)
+    end_color = _clean_hex_color(options.end_color, GpsGradientOptions.end_color)
+    valid_values = [float(point["value"]) for point in points if point.get("value") is not None]
+    minimum: float | None = None
+    maximum: float | None = None
+    if color_column and valid_values:
+        if options.auto_range:
+            minimum = min(valid_values)
+            maximum = max(valid_values)
+        else:
+            minimum = float(options.range_min) if _is_finite_number(options.range_min) else min(valid_values)
+            maximum = float(options.range_max) if _is_finite_number(options.range_max) else max(valid_values)
+            if maximum < minimum:
+                minimum, maximum = maximum, minimum
+    midpoint = float(options.midpoint) if _is_finite_number(options.midpoint) else None
+
+    segments: list[dict[str, object]] = []
+    for left, right in zip(points, points[1:]):
+        segment_values = [float(point["value"]) for point in (left, right) if point.get("value") is not None]
+        segment_value = sum(segment_values) / len(segment_values) if segment_values else None
+        if minimum is not None and maximum is not None and segment_value is not None:
+            amount = _gradient_position(segment_value, minimum, maximum, midpoint=midpoint, reverse=options.reverse)
+            color = _interpolate_hex_color(start_color, end_color, amount)
+        elif color_column:
+            color = MISSING_VALUE_COLOR
+        else:
+            color = DEFAULT_PATH_COLOR
+        segments.append(
+            {
+                "positions": [
+                    float(left["lon"]),
+                    float(left["lat"]),
+                    float(left["alt"]),
+                    float(right["lon"]),
+                    float(right["lat"]),
+                    float(right["alt"]),
+                ],
+                "color": color,
+                "startRow": int(left["row"]),
+                "endRow": int(right["row"]),
+                "value": segment_value,
+            }
+        )
+
+    legend: dict[str, object] = {"enabled": False}
+    if color_column and minimum is not None and maximum is not None:
+        low_color = end_color if options.reverse else start_color
+        high_color = start_color if options.reverse else end_color
+        legend = {
+            "enabled": True,
+            "label": color_column,
+            "minimum": minimum,
+            "maximum": maximum,
+            "midpoint": midpoint if midpoint is not None and minimum < midpoint < maximum else None,
+            "minLabel": _format_legend_number(minimum),
+            "maxLabel": _format_legend_number(maximum),
+            "midLabel": _format_legend_number(midpoint) if midpoint is not None and minimum < midpoint < maximum else "",
+            "lowColor": low_color,
+            "highColor": high_color,
+        }
+
+    return {
+        "status": "ok",
+        "message": "",
+        "points": points,
+        "segments": segments,
+        "legend": legend,
+        "latitudeLabel": gps.latitude_label or gps.latitude,
+        "longitudeLabel": gps.longitude_label or gps.longitude,
+        "altitudeLabel": altitude_label,
+        "osmUrl": OSM_TILE_URL,
+    }
+
+
+def _gps_message_html(message: str, dark: bool) -> str:
+    background = "#1f242b" if dark else "#ffffff"
+    color = "#e5e7eb" if dark else "#1f2937"
+    border = "#3a414d" if dark else "#d1d5db"
+    return f"""
+<html>
+<body style="margin:0;background:{background};color:{color};font-family:Arial,sans-serif;">
+  <div style="height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;">
+    <div style="border:1px solid {border};border-radius:6px;padding:18px 22px;max-width:520px;">
+      {html.escape(message)}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None = None, dark: bool = True) -> str:
+    payload = build_gps_map_payload(log, options)
+    if payload.get("status") != "ok":
+        return _gps_message_html(str(payload.get("message") or "No GPS path to display."), dark)
+
+    background = "#1f242b" if dark else "#ffffff"
+    panel_bg = "rgba(21,24,29,0.88)" if dark else "rgba(255,255,255,0.92)"
+    panel_fg = "#e5e7eb" if dark else "#1f2937"
+    border = "rgba(255,255,255,0.18)" if dark else "rgba(0,0,0,0.18)"
+    data_json = json.dumps(payload, allow_nan=False)
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    window.CESIUM_BASE_URL = "{CESIUM_BASE_URL}/";
+  </script>
+  <link href="{CESIUM_BASE_URL}/Widgets/widgets.css" rel="stylesheet">
+  <script src="{CESIUM_BASE_URL}/Cesium.js"></script>
+  <style>
+    html, body, #cesiumContainer {{
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: {background};
+      font-family: Arial, sans-serif;
+    }}
+    #legend {{
+      position: absolute;
+      left: 12px;
+      bottom: 22px;
+      min-width: 260px;
+      max-width: 380px;
+      color: {panel_fg};
+      background: {panel_bg};
+      border: 1px solid {border};
+      border-radius: 6px;
+      padding: 10px 12px;
+      box-sizing: border-box;
+      font-size: 12px;
+      z-index: 10;
+    }}
+    #legendTitle {{
+      font-weight: 700;
+      margin-bottom: 7px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    #gradientBar {{
+      height: 12px;
+      border-radius: 4px;
+      border: 1px solid {border};
+      margin-bottom: 5px;
+    }}
+    #legendLabels {{
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+    }}
+    #osmAttribution {{
+      position: absolute;
+      right: 8px;
+      bottom: 2px;
+      z-index: 10;
+      font-size: 11px;
+      color: #111827;
+      background: rgba(255,255,255,0.84);
+      padding: 2px 4px;
+      border-radius: 3px;
+    }}
+    #osmAttribution a {{ color: #0645ad; }}
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div id="legend" hidden>
+    <div id="legendTitle"></div>
+    <div id="gradientBar"></div>
+    <div id="legendLabels">
+      <span id="legendMin"></span>
+      <span id="legendMid"></span>
+      <span id="legendMax"></span>
+    </div>
+  </div>
+  <div id="osmAttribution">
+    Tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
+  </div>
+  <script>
+    const flightData = {data_json};
+
+    const viewer = new Cesium.Viewer("cesiumContainer", {{
+      animation: false,
+      baseLayer: false,
+      baseLayerPicker: false,
+      fullscreenButton: false,
+      geocoder: false,
+      infoBox: false,
+      navigationHelpButton: true,
+      sceneMode: Cesium.SceneMode.SCENE3D,
+      sceneModePicker: true,
+      selectionIndicator: false,
+      shouldAnimate: false,
+      timeline: false,
+      terrainProvider: new Cesium.EllipsoidTerrainProvider()
+    }});
+
+    viewer.imageryLayers.removeAll();
+    viewer.imageryLayers.addImageryProvider(new Cesium.OpenStreetMapImageryProvider({{
+      url: flightData.osmUrl,
+      fileExtension: "png"
+    }}));
+    viewer.scene.globe.depthTestAgainstTerrain = false;
+    viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
+
+    flightData.segments.forEach((segment, index) => {{
+      const positions = Cesium.Cartesian3.fromDegreesArrayHeights(segment.positions);
+      viewer.entities.add({{
+        name: `Flight segment ${{index + 1}}`,
+        description: `Rows ${{segment.startRow}}-${{segment.endRow}}`,
+        polyline: {{
+          positions,
+          width: 5,
+          clampToGround: false,
+          material: Cesium.Color.fromCssColorString(segment.color).withAlpha(0.96)
+        }}
+      }});
+    }});
+
+    function marker(point, label, color) {{
+      viewer.entities.add({{
+        name: label,
+        position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt),
+        point: {{
+          pixelSize: 12,
+          color: Cesium.Color.fromCssColorString(color),
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }},
+        label: {{
+          text: label,
+          font: "13px Arial",
+          fillColor: Cesium.Color.WHITE,
+          outlineColor: Cesium.Color.BLACK,
+          outlineWidth: 3,
+          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+          pixelOffset: new Cesium.Cartesian2(0, -24),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }}
+      }});
+    }}
+
+    marker(flightData.points[0], "Start", "#27ae60");
+    marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
+
+    if (flightData.legend && flightData.legend.enabled) {{
+      const legend = flightData.legend;
+      document.getElementById("legend").hidden = false;
+      document.getElementById("legendTitle").textContent = `Color by ${{legend.label}}`;
+      document.getElementById("gradientBar").style.background =
+        `linear-gradient(90deg, ${{legend.lowColor}}, ${{legend.highColor}})`;
+      document.getElementById("legendMin").textContent = legend.minLabel;
+      document.getElementById("legendMid").textContent = legend.midLabel || "";
+      document.getElementById("legendMax").textContent = legend.maxLabel;
+    }}
+
+    const allPositions = flightData.points.map((point) =>
+      Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt)
+    );
+    const sphere = Cesium.BoundingSphere.fromPoints(allPositions);
+    const range = Math.max(sphere.radius * 3.2, 500.0);
+    viewer.camera.flyToBoundingSphere(sphere, {{
+      duration: 0,
+      offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), range)
+    }});
+    viewer.scene.requestRender();
+  </script>
+</body>
+</html>
+"""
 
 
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:

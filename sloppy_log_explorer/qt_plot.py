@@ -4,11 +4,13 @@ import os
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
-from .models import LoadedLog
-from .plotting import build_gps_figure, build_telemetry_figure, figure_html
+from .models import GpsGradientOptions, LoadedLog
+from .plotting import build_gps_map_html, build_telemetry_figure, figure_html
+from .storage import app_data_dir
 
 
 class _PlotBridge(QObject):
@@ -26,6 +28,26 @@ class _PlotBridge(QObject):
 
 def _use_web_engine() -> bool:
     return os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
+
+
+_WEB_PROFILE: QWebEngineProfile | None = None
+
+
+def _persistent_web_profile() -> QWebEngineProfile:
+    global _WEB_PROFILE
+    if _WEB_PROFILE is None:
+        root = app_data_dir() / "webengine"
+        cache = root / "cache"
+        storage = root / "storage"
+        cache.mkdir(parents=True, exist_ok=True)
+        storage.mkdir(parents=True, exist_ok=True)
+        profile = QWebEngineProfile("SloppyLogExplorer", None)
+        profile.setCachePath(str(cache))
+        profile.setPersistentStoragePath(str(storage))
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        profile.setHttpUserAgent("SloppyLogExplorer/0.1 QtWebEngine")
+        _WEB_PROFILE = profile
+    return _WEB_PROFILE
 
 
 class TelemetryPlotWidget(QWidget):
@@ -113,7 +135,7 @@ class GpsPathWidget(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.log: LoadedLog | None = None
-        self.color_column: str | None = None
+        self.options = GpsGradientOptions()
         self.dark = True
         self.setMinimumHeight(420)
         layout = QVBoxLayout(self)
@@ -121,14 +143,15 @@ class GpsPathWidget(QWidget):
         self._web_engine = _use_web_engine()
         if self._web_engine:
             self._view = QWebEngineView(self)
+            self._page = QWebEnginePage(_persistent_web_profile(), self._view)
+            self._view.setPage(self._page)
         else:
             self._view = QTextEdit(self)
             self._view.setReadOnly(True)
         layout.addWidget(self._view)
 
-    def set_path(self, log: LoadedLog | None, color_column: str | None = None, dark: bool = True) -> None:
+    def set_path(self, log: LoadedLog | None, options: GpsGradientOptions | None = None, dark: bool = True) -> None:
         self.log = log
-        self.color_column = color_column
+        self.options = options or GpsGradientOptions()
         self.dark = dark
-        fig = build_gps_figure(log, color_column=color_column, dark=dark)
-        self._view.setHtml(figure_html(fig, dark=dark))
+        self._view.setHtml(build_gps_map_html(log, options=self.options, dark=dark))

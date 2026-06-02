@@ -9,8 +9,9 @@ from PyQt6.QtWidgets import QApplication, QHeaderView
 
 from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
+from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
-from sloppy_log_explorer.plotting import build_gps_figure, build_telemetry_figure, figure_html
+from sloppy_log_explorer.plotting import build_gps_figure, build_gps_map_html, build_gps_map_payload, build_telemetry_figure, figure_html
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 
 
@@ -162,6 +163,61 @@ def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) ->
     assert list(log.dataframe[log.gps_columns.longitude].head(2)) == pytest.approx([-75.0, -75.0005])
 
 
+def test_gps_map_html_uses_cesium_openstreetmap_without_api_keys(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    html = build_gps_map_html(log, GpsGradientOptions(color_column="Current(A)"))
+
+    assert "Cesium.Viewer" in html
+    assert "Cesium.OpenStreetMapImageryProvider" in html
+    assert "tile.openstreetmap.org" in html
+    assert "OpenStreetMap contributors" in html
+    assert "Ion.defaultAccessToken" not in html
+    assert "createWorldTerrain" not in html
+    assert "createWorldImagery" not in html
+
+
+def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    payload = build_gps_map_payload(
+        log,
+        GpsGradientOptions(
+            color_column="Current(A)",
+            start_color="#000000",
+            end_color="#ffffff",
+            auto_range=False,
+            range_min=0,
+            range_max=80,
+        ),
+    )
+    reverse_payload = build_gps_map_payload(
+        log,
+        GpsGradientOptions(
+            color_column="Current(A)",
+            start_color="#000000",
+            end_color="#ffffff",
+            reverse=True,
+            auto_range=False,
+            range_min=0,
+            range_max=80,
+        ),
+    )
+
+    assert payload["status"] == "ok"
+    assert len(payload["points"]) == 9
+    assert len(payload["segments"]) == 8
+    assert payload["legend"]["enabled"] is True
+    assert payload["segments"][0]["color"] == "#111111"
+    assert payload["segments"][-1]["color"] == "#efefef"
+    assert reverse_payload["segments"][0]["color"] == "#eeeeee"
+    assert reverse_payload["segments"][-1]["color"] == "#101010"
+
+
 def test_load_log_does_not_invent_gps_from_regular_telemetry(tmp_path: Path) -> None:
     path = tmp_path / "no_gps.csv"
     write_no_gps_sample(path)
@@ -170,6 +226,7 @@ def test_load_log_does_not_invent_gps_from_regular_telemetry(tmp_path: Path) -> 
 
     assert log.info.has_gps is False
     assert log.gps_columns is None
+    assert "No GPS latitude/longitude columns detected" in build_gps_map_html(log)
 
 
 def test_internal_resistance_regression(tmp_path: Path) -> None:
@@ -294,6 +351,33 @@ def test_library_tree_defaults_collapsed_and_keeps_file_date_order(tmp_path: Pat
     app.quit()
 
 
+def test_gps_color_selector_uses_all_numeric_parameters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.selected_parameter_columns = {"VFAS(V)"}
+    window.populate_columns()
+    window.populate_gps_color_combo()
+
+    gps_choices = [window.gps_color_combo.itemText(index) for index in range(window.gps_color_combo.count())]
+
+    assert "VFAS(V)" in gps_choices
+    assert "Current(A)" in gps_choices
+    assert "Alt(m)" in gps_choices
+    assert "Current(A)" not in window.selected_columns()
+    window.close()
+    app.quit()
+
+
 def test_real_frsky_sensor_ranking_prefers_pack_voltage_and_current() -> None:
     columns = [
         "TxBat(V)",
@@ -355,9 +439,11 @@ def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
     fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"], selected_index=1)
     html = figure_html(fig, bridge=True)
     gps = build_gps_figure(log, color_column="VFAS(V)")
+    gps_map = build_gps_map_html(log, GpsGradientOptions(color_column="VFAS(V)"))
 
     assert len(fig.data) == 2
     assert fig.layout.yaxis.title.text == "VFAS(V)"
     assert fig.layout.yaxis2.title.text == "Current(A)"
     assert "QWebChannel" in html
     assert len(gps.data) == 1
+    assert "Cesium.Viewer" in gps_map

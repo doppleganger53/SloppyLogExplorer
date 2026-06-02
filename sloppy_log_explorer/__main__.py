@@ -11,8 +11,9 @@ from PyQt6.QtWidgets import QApplication
 
 from . import __version__
 from .main_window import MainWindow
+from .models import GpsGradientOptions
 from .parser import load_log
-from .plotting import build_telemetry_figure, figure_html
+from .plotting import build_gps_map_html, build_telemetry_figure, figure_html
 
 
 def _argument_value(flag: str) -> str | None:
@@ -49,6 +50,10 @@ def _validate_log(path: str) -> None:
         raise ValueError(f"No graph traces rendered for {path}")
     if "QWebChannel" not in rendered:
         raise ValueError("Rendered telemetry HTML is missing the Qt bridge")
+    if log.info.has_gps:
+        gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=columns[0]))
+        if "Cesium.Viewer" not in gps_html or "tile.openstreetmap.org" not in gps_html:
+            raise ValueError("Rendered GPS map HTML is missing Cesium or OpenStreetMap")
     message = (
         f"validated {log.info.name}: rows={log.info.rows} "
         f"columns={log.info.columns} traces={len(fig.data)} duration={log.info.duration_seconds:.2f}s"
@@ -129,3 +134,7 @@ def main() -> None:
         return
     window.show()
     raise SystemExit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

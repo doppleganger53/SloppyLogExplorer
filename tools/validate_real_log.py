@@ -15,8 +15,9 @@ from sloppy_log_explorer.analysis import (
     suggest_display_columns,
 )
 from sloppy_log_explorer.library import scan_library
+from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
-from sloppy_log_explorer.plotting import build_gps_figure, build_telemetry_figure, figure_html
+from sloppy_log_explorer.plotting import build_gps_map_html, build_telemetry_figure, figure_html
 
 
 def as_jsonable(value: Any) -> Any:
@@ -58,10 +59,9 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
     if not cursor:
         raise AssertionError("cursor values were empty")
 
-    gps_fig = build_gps_figure(log, color_column=selected[0])
-    gps_html = figure_html(gps_fig)
-    if "plotly" not in gps_html.lower():
-        raise AssertionError("GPS figure HTML was not generated")
+    gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=selected[0]))
+    if log.info.has_gps and ("cesium.viewer" not in gps_html.lower() or "tile.openstreetmap.org" not in gps_html.lower()):
+        raise AssertionError("GPS map HTML is missing Cesium or OpenStreetMap")
 
     voltage_columns = find_voltage_columns(log.parameter_columns)
     current_columns = find_current_columns(log.parameter_columns)

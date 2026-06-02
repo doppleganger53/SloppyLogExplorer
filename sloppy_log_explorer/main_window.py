@@ -5,12 +5,14 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QAction, QDesktopServices
+from PyQt6.QtGui import QAction, QColor, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -41,7 +43,7 @@ from .analysis import (
     suggest_display_columns,
 )
 from .library import group_by_model, scan_library
-from .models import LibraryLogInfo, LoadedLog, SyncCandidate
+from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import load_log
 from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
@@ -66,6 +68,8 @@ class MainWindow(QMainWindow):
         self.telemetry_interaction_mode = "pan"
         self.telemetry_time_mode = "absolute"
         self.selected_parameter_columns: set[str] = set()
+        self.gps_start_color = GpsGradientOptions.start_color
+        self.gps_end_color = GpsGradientOptions.end_color
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
 
@@ -237,13 +241,50 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Color by"))
         self.gps_color_combo = QComboBox()
-        self.gps_color_combo.currentTextChanged.connect(self.refresh_gps)
+        self.gps_color_combo.currentTextChanged.connect(self.gps_color_changed)
         row.addWidget(self.gps_color_combo)
+        row.addWidget(QLabel("Start"))
+        self.gps_start_color_button = QPushButton()
+        self.gps_start_color_button.clicked.connect(lambda: self.choose_gps_color("start"))
+        row.addWidget(self.gps_start_color_button)
+        row.addWidget(QLabel("End"))
+        self.gps_end_color_button = QPushButton()
+        self.gps_end_color_button.clicked.connect(lambda: self.choose_gps_color("end"))
+        row.addWidget(self.gps_end_color_button)
+        self.gps_reverse_check = QCheckBox("Reverse")
+        self.gps_reverse_check.toggled.connect(self.refresh_gps)
+        row.addWidget(self.gps_reverse_check)
         row.addStretch()
         layout.addLayout(row)
+
+        range_row = QHBoxLayout()
+        self.gps_auto_range_check = QCheckBox("Auto range")
+        self.gps_auto_range_check.setChecked(True)
+        self.gps_auto_range_check.toggled.connect(self.gps_auto_range_changed)
+        range_row.addWidget(self.gps_auto_range_check)
+        range_row.addWidget(QLabel("Min"))
+        self.gps_min_spin = self._gps_range_spinbox()
+        self.gps_min_spin.valueChanged.connect(self.refresh_gps)
+        range_row.addWidget(self.gps_min_spin)
+        range_row.addWidget(QLabel("Max"))
+        self.gps_max_spin = self._gps_range_spinbox()
+        self.gps_max_spin.valueChanged.connect(self.refresh_gps)
+        range_row.addWidget(self.gps_max_spin)
+        self.gps_midpoint_check = QCheckBox("Midpoint")
+        self.gps_midpoint_check.toggled.connect(self.gps_midpoint_changed)
+        range_row.addWidget(self.gps_midpoint_check)
+        self.gps_midpoint_spin = self._gps_range_spinbox()
+        self.gps_midpoint_spin.valueChanged.connect(self.refresh_gps)
+        range_row.addWidget(self.gps_midpoint_spin)
+        range_row.addStretch()
+        layout.addLayout(range_row)
+
         self.gps_view = GpsPathWidget()
         layout.addWidget(self.gps_view, 1)
         self.tabs.addTab(tab, "3D Flight Path")
+        self._update_gps_color_buttons()
+        self._update_gps_range_enabled()
+        self.gps_view.set_path(None, dark=self.dark_mode)
 
     def _build_flight_tab(self) -> None:
         tab = QWidget()
@@ -389,6 +430,97 @@ class MainWindow(QMainWindow):
         layout.addWidget(line_edit)
         layout.addWidget(button)
         return wrapper
+
+    @staticmethod
+    def _gps_range_spinbox() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setDecimals(3)
+        spin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        spin.setSingleStep(1.0)
+        spin.setMinimumWidth(120)
+        return spin
+
+    def _update_gps_color_buttons(self) -> None:
+        for button, color in (
+            (self.gps_start_color_button, self.gps_start_color),
+            (self.gps_end_color_button, self.gps_end_color),
+        ):
+            button.setText(color.upper())
+            button.setStyleSheet(f"background: {color}; color: white; border: 0; border-radius: 4px; padding: 7px 10px;")
+
+    def choose_gps_color(self, role: str) -> None:
+        current = self.gps_start_color if role == "start" else self.gps_end_color
+        color = QColorDialog.getColor(QColor(current), self, f"Choose {role} gradient color")
+        if not color.isValid():
+            return
+        if role == "start":
+            self.gps_start_color = color.name()
+        else:
+            self.gps_end_color = color.name()
+        self._update_gps_color_buttons()
+        self.refresh_gps()
+
+    def gps_color_changed(self, *_args) -> None:
+        self._populate_gps_range_defaults()
+        self._update_gps_range_enabled()
+        self.refresh_gps()
+
+    def gps_auto_range_changed(self, *_args) -> None:
+        self._populate_gps_range_defaults()
+        self._update_gps_range_enabled()
+        self.refresh_gps()
+
+    def gps_midpoint_changed(self, *_args) -> None:
+        self._populate_gps_range_defaults()
+        self._update_gps_range_enabled()
+        self.refresh_gps()
+
+    def _update_gps_range_enabled(self) -> None:
+        color_column = self.gps_color_combo.currentText()
+        has_color = bool(color_column and color_column != "(none)")
+        auto_range = self.gps_auto_range_check.isChecked()
+        self.gps_auto_range_check.setEnabled(has_color)
+        self.gps_min_spin.setEnabled(has_color and not auto_range)
+        self.gps_max_spin.setEnabled(has_color and not auto_range)
+        self.gps_midpoint_check.setEnabled(has_color)
+        self.gps_midpoint_spin.setEnabled(has_color and self.gps_midpoint_check.isChecked())
+
+    def _populate_gps_range_defaults(self) -> None:
+        if self.current_log is None:
+            return
+        color_column = self.gps_color_combo.currentText()
+        if not color_column or color_column == "(none)" or color_column not in self.current_log.dataframe.columns:
+            return
+        series = self.current_log.dataframe[color_column]
+        values = series.dropna()
+        if values.empty:
+            return
+        minimum = float(values.min())
+        maximum = float(values.max())
+        midpoint = minimum + (maximum - minimum) / 2.0
+        for spin, value in (
+            (self.gps_min_spin, minimum),
+            (self.gps_max_spin, maximum),
+            (self.gps_midpoint_spin, midpoint),
+        ):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+    def _gps_gradient_options(self) -> GpsGradientOptions:
+        color = self.gps_color_combo.currentText() or None
+        if color == "(none)":
+            color = None
+        return GpsGradientOptions(
+            color_column=color,
+            start_color=self.gps_start_color,
+            end_color=self.gps_end_color,
+            reverse=self.gps_reverse_check.isChecked(),
+            auto_range=self.gps_auto_range_check.isChecked(),
+            range_min=self.gps_min_spin.value(),
+            range_max=self.gps_max_spin.value(),
+            midpoint=self.gps_midpoint_spin.value() if self.gps_midpoint_check.isChecked() else None,
+        )
 
     @staticmethod
     def _configure_sortable_table(table: QTableWidget) -> None:
@@ -642,25 +774,23 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_gps(self, *_args) -> None:
-        if self.current_log is None:
-            return
-        color = self.gps_color_combo.currentText() or None
-        if color == "(none)":
-            color = None
-        self.gps_view.set_path(self.current_log, color_column=color, dark=self.dark_mode)
+        self.gps_view.set_path(self.current_log, options=self._gps_gradient_options(), dark=self.dark_mode)
 
     def populate_gps_color_combo(self) -> None:
         self.gps_color_combo.blockSignals(True)
         current = self.gps_color_combo.currentText()
         self.gps_color_combo.clear()
         self.gps_color_combo.addItem("(none)")
-        for col in self.selected_columns():
-            self.gps_color_combo.addItem(col)
+        if self.current_log is not None:
+            for col in self.current_log.parameter_columns:
+                self.gps_color_combo.addItem(col)
         if current:
             index = self.gps_color_combo.findText(current)
             if index >= 0:
                 self.gps_color_combo.setCurrentIndex(index)
         self.gps_color_combo.blockSignals(False)
+        self._populate_gps_range_defaults()
+        self._update_gps_range_enabled()
 
     def set_selected_index(self, index: int) -> None:
         if self.current_log is None:

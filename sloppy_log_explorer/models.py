@@ -18,6 +18,18 @@ class GpsColumns:
 
 
 @dataclass(frozen=True)
+class GpsGradientOptions:
+    color_column: str | None = None
+    start_color: str = "#2f80ed"
+    end_color: str = "#eb5757"
+    reverse: bool = False
+    auto_range: bool = True
+    range_min: float | None = None
+    range_max: float | None = None
+    midpoint: float | None = None
+
+
+@dataclass(frozen=True)
 class LibraryLogInfo:
     path: Path
     model: str
