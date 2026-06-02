@@ -6,6 +6,7 @@ import pytest
 
 from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values
 from sloppy_log_explorer.parser import load_log
+from sloppy_log_explorer.plotting import build_gps_figure, build_telemetry_figure, figure_html
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 
 
@@ -81,3 +82,42 @@ def test_sync_candidates_copy_newer_logs(tmp_path: Path) -> None:
 
     assert copied == 1
     assert (target / "flight.csv").exists()
+
+
+def test_ragged_frsky_rows_are_loaded(tmp_path: Path) -> None:
+    path = tmp_path / "frsky.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,RX,RX,VFAS(V),",
+                "2026-01-01,12:00:00,1,2,16.8,",
+                "2026-01-01,12:00:01,1,2,16.7,,",
+                "2026-01-01,12:00:02,1,2,16.6",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.info.rows == 3
+    assert "RX" in log.dataframe.columns
+    assert "RX.1" in log.dataframe.columns
+    assert "VFAS(V)" in log.parameter_columns
+    assert log.info.duration_seconds == 2
+
+
+def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"], selected_index=1)
+    html = figure_html(fig, bridge=True)
+    gps = build_gps_figure(log, color_column="VFAS(V)")
+
+    assert len(fig.data) == 2
+    assert fig.layout.yaxis.title.text == "VFAS(V)"
+    assert fig.layout.yaxis2.title.text == "Current(A)"
+    assert "QWebChannel" in html
+    assert len(gps.data) == 1

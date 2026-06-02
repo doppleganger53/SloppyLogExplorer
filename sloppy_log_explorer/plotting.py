@@ -79,14 +79,20 @@ def build_telemetry_figure(
     for idx, col in enumerate(columns):
         axis_key = "yaxis" if idx == 0 else f"yaxis{idx + 1}"
         axis = {
-            "title": col,
-            "titlefont": {"color": COLORS[idx % len(COLORS)]},
+            "title": {"text": col, "font": {"color": COLORS[idx % len(COLORS)]}},
             "tickfont": {"color": COLORS[idx % len(COLORS)]},
             "showgrid": show_grid and idx == 0,
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         }
         if idx > 0:
-            axis.update({"overlaying": "y", "side": "right", "position": min(0.98, 0.86 + idx * 0.045)})
+            axis.update(
+                {
+                    "anchor": "free",
+                    "overlaying": "y",
+                    "side": "right",
+                    "position": min(0.98, 0.86 + idx * 0.045),
+                }
+            )
         layout[axis_key] = axis
     fig.update_layout(**layout)
 
@@ -180,4 +186,3 @@ setTimeout(bindPlot, 200);
 </body>
 </html>
 """
-

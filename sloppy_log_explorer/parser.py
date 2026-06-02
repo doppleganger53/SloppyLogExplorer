@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import csv
 from pathlib import Path
 
 import pandas as pd
@@ -17,11 +18,54 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _deduplicate_columns(columns: list[str]) -> list[str]:
+    counts: dict[str, int] = {}
+    result: list[str] = []
+    for index, column in enumerate(columns):
+        name = str(column).strip()
+        if not name:
+            name = f"Unnamed: {index}"
+        if name in counts:
+            counts[name] += 1
+            result.append(f"{name}.{counts[name]}")
+        else:
+            counts[name] = 0
+            result.append(name)
+    return result
+
+
+def _read_ragged_csv(path: Path) -> pd.DataFrame:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(handle, dialect)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return pd.DataFrame()
+
+        width = len(header)
+        rows: list[list[str]] = []
+        for row in reader:
+            if not row:
+                continue
+            if len(row) < width:
+                row = row + [""] * (width - len(row))
+            elif len(row) > width:
+                row = row[:width]
+            rows.append(row)
+    return pd.DataFrame(rows, columns=_deduplicate_columns(header))
+
+
 def _read_csv(path: Path) -> pd.DataFrame:
     try:
-        return pd.read_csv(path)
+        return pd.read_csv(path, low_memory=False)
     except Exception:
-        return pd.read_csv(path, sep=None, engine="python")
+        return _read_ragged_csv(path)
 
 
 def _detect_time(df: pd.DataFrame) -> pd.Series | None:
