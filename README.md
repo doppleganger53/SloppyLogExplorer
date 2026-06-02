@@ -6,7 +6,7 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 
 - Browse a log library grouped by model.
 - Open individual Ethos/OpenTX CSV or log files.
-- Select telemetry parameters and view a multi-axis interactive Plotly graph.
+- Select telemetry parameters and view a native multi-series telemetry graph.
 - Click the graph or use left/right arrow keys in the graph to inspect telemetry values in the cursor panel.
 - Load a comparison flight and view matching parameter deltas.
 - View detected GPS latitude/longitude/altitude as a 3D flight path.

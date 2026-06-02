@@ -13,14 +13,94 @@ def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce")
 
 
+PREFERRED_DISPLAY_COLUMNS = [
+    "VFAS(V)",
+    "TRUE Current(A)",
+    "Current(A)",
+    "RxBatt(V)",
+    "BEC voltage(V)",
+    "VFR 2.4G(%)",
+    "Rx VFR(%)",
+    "VFR 900M(%)",
+    "RSSI 2.4G(dB)",
+    "RSSI 900M(dB)",
+    "Altitude(m)",
+]
+
+
+def _column_priority(column: str, patterns: list[tuple[str, int]], default: int = 100) -> int:
+    name = column.lower()
+    for pattern, score in patterns:
+        if pattern in name:
+            return score
+    return default
+
+
+def suggest_display_columns(columns: Iterable[str], limit: int = 5) -> list[str]:
+    available = list(columns)
+    selected: list[str] = []
+    for preferred in PREFERRED_DISPLAY_COLUMNS:
+        if preferred in available and preferred not in selected:
+            selected.append(preferred)
+    for column in available:
+        if len(selected) >= limit:
+            break
+        if column not in selected:
+            selected.append(column)
+    return selected[:limit]
+
+
 def find_voltage_columns(columns: Iterable[str]) -> list[str]:
-    needles = ("volt", "vfas", "rxbat", "rxbatt", "bec", "(v)")
-    return [col for col in columns if any(token in col.lower() for token in needles)]
+    excluded = ("current", "curr", "consum", "mah", "(a)", "temp", "status")
+    voltage_columns = []
+    for column in columns:
+        name = column.lower()
+        if any(token in name for token in excluded):
+            continue
+        if any(token in name for token in ("(v)", "volt", "vfas", "rxbat", "rxbatt", "bat1", "bat2", "adc")):
+            voltage_columns.append(column)
+
+    priorities = [
+        ("vfas", 0),
+        ("main voltage", 1),
+        ("esc voltage", 2),
+        ("bat1 voltage", 3),
+        ("bat2 voltage", 4),
+        ("1 cell", 5),
+        ("rxbat", 20),
+        ("rxbatt", 20),
+        ("bec voltage", 25),
+        ("txbat", 50),
+        ("adc", 60),
+        ("srv", 80),
+    ]
+    return sorted(voltage_columns, key=lambda column: (_column_priority(column, priorities), column.lower()))
 
 
 def find_current_columns(columns: Iterable[str]) -> list[str]:
-    needles = ("current", "curr", "(a)")
-    return [col for col in columns if any(token in col.lower() for token in needles)]
+    current_columns = []
+    for column in columns:
+        name = column.lower()
+        if any(token in name for token in ("current", "curr", "(a)")) and "consum" not in name:
+            current_columns.append(column)
+
+    def priority(column: str) -> tuple[int, str]:
+        name = column.lower().strip()
+        if "true current" in name:
+            score = 0
+        elif name in {"current(a)", "current (a)", "current"}:
+            score = 1
+        elif "bec current" in name:
+            score = 20
+        elif "srv" in name:
+            score = 40
+        elif "curr" in name:
+            score = 50
+        else:
+            score = 60
+        return score, name
+
+    return sorted(current_columns, key=priority)
 
 
 def guess_cell_count(voltage: pd.Series) -> int:
@@ -117,4 +197,3 @@ def basic_stats(df: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, flo
             "std": float(series.std()) if len(series) > 1 else 0.0,
         }
     return stats
-

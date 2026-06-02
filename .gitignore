@@ -12,8 +12,8 @@ dist/
 *.egg-info/
 htmlcov/
 .coverage
+validation_artifacts/
 *.log
 *.tmp
 *.wav
 *.zip
-

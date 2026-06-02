@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import html
-import os
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QAction, QDesktopServices
-from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -40,27 +37,15 @@ from .analysis import (
     cursor_values,
     find_current_columns,
     find_voltage_columns,
+    suggest_display_columns,
 )
 from .library import group_by_model, scan_library
 from .models import LoadedLog, LogFileInfo, SyncCandidate
 from .parser import load_log
-from .plotting import build_gps_figure, build_telemetry_figure, figure_html
+from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
 from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_csv
-
-
-class PlotBridge(QObject):
-    selected = pyqtSignal(int)
-    stepped = pyqtSignal(int)
-
-    @pyqtSlot(int)
-    def selectIndex(self, index: int) -> None:
-        self.selected.emit(index)
-
-    @pyqtSlot(int)
-    def stepIndex(self, delta: int) -> None:
-        self.stepped.emit(delta)
 
 
 class MainWindow(QMainWindow):
@@ -77,10 +62,6 @@ class MainWindow(QMainWindow):
         self.dark_mode = True
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
-
-        self.plot_bridge = PlotBridge()
-        self.plot_bridge.selected.connect(self.set_selected_index)
-        self.plot_bridge.stepped.connect(self.step_selected_index)
 
         self._build_actions()
         self._build_ui()
@@ -190,11 +171,9 @@ class MainWindow(QMainWindow):
     def _build_graph_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        self.graph_view = self._make_html_view()
-        if isinstance(self.graph_view, QWebEngineView):
-            channel = QWebChannel(self.graph_view.page())
-            channel.registerObject("plotBridge", self.plot_bridge)
-            self.graph_view.page().setWebChannel(channel)
+        self.graph_view = TelemetryPlotWidget()
+        self.graph_view.index_selected.connect(self.set_selected_index)
+        self.graph_view.index_stepped.connect(self.step_selected_index)
         layout.addWidget(self.graph_view, 5)
         self.info_panel = QTextEdit()
         self.info_panel.setReadOnly(True)
@@ -213,7 +192,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.gps_color_combo)
         row.addStretch()
         layout.addLayout(row)
-        self.gps_view = self._make_html_view()
+        self.gps_view = GpsPathWidget()
         layout.addWidget(self.gps_view, 1)
         self.tabs.addTab(tab, "3D Flight Path")
 
@@ -357,13 +336,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(button)
         return wrapper
 
-    def _make_html_view(self) -> QWidget:
-        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
-            view = QTextEdit()
-            view.setReadOnly(True)
-            return view
-        return QWebEngineView()
-
     def _apply_style(self) -> None:
         QApplication.instance().setStyle("Fusion")
         self.setStyleSheet(
@@ -392,15 +364,7 @@ class MainWindow(QMainWindow):
             self.load_log(Path(last_log))
 
     def _set_empty_graph(self) -> None:
-        self.graph_view.setHtml(
-            """
-            <html><body style="margin:0;background:#1f242b;color:#e5e7eb;font-family:Segoe UI,Arial;display:flex;height:100vh;align-items:center;justify-content:center">
-            <div style="max-width:620px;text-align:center">
-              <h1>Sloppy Log Explorer</h1>
-              <p>Open an Ethos or OpenTX CSV log, choose telemetry parameters, then inspect values, compare flights, view GPS paths, and track batteries.</p>
-            </div></body></html>
-            """
-        )
+        self.graph_view.set_plot(None, [])
 
     def open_log_dialog(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Open telemetry log", "", "Telemetry logs (*.csv *.log);;All files (*.*)")
@@ -471,7 +435,7 @@ class MainWindow(QMainWindow):
         query = self.column_filter.text().strip().lower()
         selected_defaults = set(self.store.get_setting("selected_columns", []))
         if not selected_defaults:
-            selected_defaults = set(self.current_log.parameter_columns[:3])
+            selected_defaults = set(suggest_display_columns(self.current_log.parameter_columns))
         for col in self.current_log.parameter_columns:
             if query and query not in col.lower():
                 continue
@@ -528,10 +492,10 @@ class MainWindow(QMainWindow):
             return
         cols = self.selected_columns()
         if not cols:
-            self.graph_view.setHtml("<html><body style='background:#1f242b;color:#e5e7eb;font-family:Segoe UI;padding:32px'>Select one or more telemetry parameters.</body></html>")
+            self.graph_view.set_plot(self.current_log, [])
             return
         compare = self.compare_log if self.compare_toggle.isChecked() else None
-        fig = build_telemetry_figure(
+        self.graph_view.set_plot(
             self.current_log,
             cols,
             compare=compare,
@@ -539,7 +503,6 @@ class MainWindow(QMainWindow):
             show_grid=self.grid_action.isChecked(),
             dark=self.dark_mode,
         )
-        self.graph_view.setHtml(figure_html(fig, bridge=True))
 
     def refresh_gps(self, *_args) -> None:
         if self.current_log is None:
@@ -547,8 +510,7 @@ class MainWindow(QMainWindow):
         color = self.gps_color_combo.currentText() or None
         if color == "(none)":
             color = None
-        fig = build_gps_figure(self.current_log, color_column=color, dark=self.dark_mode)
-        self.gps_view.setHtml(figure_html(fig, bridge=False))
+        self.gps_view.set_path(self.current_log, color_column=color, dark=self.dark_mode)
 
     def populate_gps_color_combo(self) -> None:
         self.gps_color_combo.blockSignals(True)

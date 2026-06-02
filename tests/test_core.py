@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values
+from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.plotting import build_gps_figure, build_telemetry_figure, figure_html
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
@@ -82,6 +82,36 @@ def test_sync_candidates_copy_newer_logs(tmp_path: Path) -> None:
 
     assert copied == 1
     assert (target / "flight.csv").exists()
+
+
+def test_real_frsky_sensor_ranking_prefers_pack_voltage_and_current() -> None:
+    columns = [
+        "TxBat(V)",
+        "1 cell(V)",
+        "TRUE Current(A)",
+        "Flight Consum.(mAh)",
+        "Wiring Temp(°F)",
+        "VFAS(V)",
+        "RxBatt(V)",
+        "BEC voltage(V)",
+        "BEC current(A)",
+        "SRV1 curr(A)",
+        "SRV1 volt(V)",
+        "Current(A)",
+        "VFR 2.4G(%)",
+        "RSSI 2.4G(dB)",
+    ]
+
+    assert find_voltage_columns(columns)[:3] == ["VFAS(V)", "1 cell(V)", "RxBatt(V)"]
+    assert "BEC current(A)" not in find_voltage_columns(columns)
+    assert find_current_columns(columns)[:2] == ["TRUE Current(A)", "Current(A)"]
+    assert suggest_display_columns(columns)[:5] == [
+        "VFAS(V)",
+        "TRUE Current(A)",
+        "Current(A)",
+        "RxBatt(V)",
+        "BEC voltage(V)",
+    ]
 
 
 def test_ragged_frsky_rows_are_loaded(tmp_path: Path) -> None:
