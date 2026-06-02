@@ -5,4 +5,5 @@ PyQt6-WebEngine>=6.6.0
 plotly>=5.0.0
 kaleido>=0.2.1
 pyttsx3>=2.90
+pyinstaller>=6.0.0
 pytest>=8.0.0

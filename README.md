@@ -33,6 +33,33 @@ python -m pip install -e .[dev]
 python -m pytest
 ```
 
+## Build A Windows Executable
+
+The recommended Windows distribution is PyInstaller's `onedir` output. It starts faster than a single-file executable and handles Qt WebEngine more reliably.
+
+```powershell
+.\build_windows.bat
+```
+
+The executable is written to:
+
+```text
+dist\SloppyLogExplorer\SloppyLogExplorer.exe
+```
+
+To build a single executable instead:
+
+```powershell
+.\build_windows.bat --onefile
+```
+
+Direct Python usage is also supported:
+
+```powershell
+python -m pip install -r requirements.txt
+python build.py --clean
+```
+
 ## Data And Storage
 
 Application state is stored under `%APPDATA%\SloppyLogExplorer` on Windows or `~/.sloppy_log_explorer` on other platforms. The app stores settings, flight notes, video links, battery history, and switch aliases in a local SQLite database.
@@ -44,4 +71,3 @@ Sloppy Log Explorer is licensed under GPL-3.0-or-later. See [LICENSE](LICENSE).
 This project is derived from and inspired by `Ethos_LogView`, which is GPLv3 licensed. See [NOTICE.md](NOTICE.md) for attribution and source details.
 
 Sloppy Log Explorer is not affiliated with, authorized, sponsored, or endorsed by FrSky Electronic Co., Ltd. FrSky and ETHOS are trademarks of their respective owner.
-

@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0.0"]
+build = ["pyinstaller>=6.0.0"]
 
 [project.scripts]
 sloppy-log-explorer = "sloppy_log_explorer.__main__:main"
