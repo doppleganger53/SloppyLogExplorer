@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import html
-import json
 import math
 import re
 
 import pandas as pd
 import plotly.graph_objects as go
 
+from .gps_map_renderer import OPENFREEMAP_STYLE_URL, build_gps_map_html as render_gps_map_html
 from .models import GpsGradientOptions, LoadedLog
 from .parser import relative_seconds
 
@@ -22,12 +21,11 @@ COLORS = [
     "#56ccf2",
 ]
 
-CESIUM_VERSION = "1.141"
-CESIUM_BASE_URL = f"https://cesium.com/downloads/cesiumjs/releases/{CESIUM_VERSION}/Build/Cesium"
-OSM_TILE_URL = "https://tile.openstreetmap.org/"
 DEFAULT_PATH_COLOR = "#55d977"
 MISSING_VALUE_COLOR = "#9ca3af"
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+MAX_GPS_JUMP_KM = 1000.0
+GPS_ORIGIN_EPSILON = 1e-9
 
 
 def _axis_name(index: int) -> str:
@@ -45,6 +43,95 @@ def _clean_hex_color(value: str | None, fallback: str) -> str:
     if value and HEX_COLOR_RE.match(value.strip()):
         return value.strip().lower()
     return fallback
+
+
+def _gps_distance_km(left_lat: float, left_lon: float, right_lat: float, right_lon: float) -> float:
+    earth_radius_km = 6371.0088
+    left_lat_rad = math.radians(left_lat)
+    right_lat_rad = math.radians(right_lat)
+    delta_lat = math.radians(right_lat - left_lat)
+    delta_lon = math.radians(right_lon - left_lon)
+    a = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(left_lat_rad) * math.cos(right_lat_rad) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return 2.0 * earth_radius_km * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _is_origin_placeholder(lat: float, lon: float) -> bool:
+    return abs(lat) <= GPS_ORIGIN_EPSILON and abs(lon) <= GPS_ORIGIN_EPSILON
+
+
+def _gps_jump_is_plausible(
+    left: dict[str, object],
+    right: dict[str, object],
+    left_time: object | None = None,
+    right_time: object | None = None,
+) -> bool:
+    try:
+        left_lat = float(left["lat"])
+        left_lon = float(left["lon"])
+        right_lat = float(right["lat"])
+        right_lon = float(right["lon"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    distance_km = _gps_distance_km(left_lat, left_lon, right_lat, right_lon)
+    if distance_km <= 0.0:
+        return True
+
+    return distance_km <= MAX_GPS_JUMP_KM
+
+
+GpsCandidate = tuple[dict[str, object], object]
+
+
+def _gps_candidates_are_plausible(left: GpsCandidate, right: GpsCandidate) -> bool:
+    return _gps_jump_is_plausible(left[0], right[0], left[1], right[1])
+
+
+def _drop_isolated_gps_outliers_once(candidates: list[GpsCandidate]) -> list[GpsCandidate]:
+    if len(candidates) < 3:
+        return candidates
+
+    filtered: list[GpsCandidate] = []
+    for index, candidate in enumerate(candidates):
+        previous_candidate = candidates[index - 1] if index > 0 else None
+        next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
+
+        if previous_candidate is None and next_candidate is not None and index + 2 < len(candidates):
+            second_next_candidate = candidates[index + 2]
+            if (
+                not _gps_candidates_are_plausible(candidate, next_candidate)
+                and _gps_candidates_are_plausible(next_candidate, second_next_candidate)
+            ):
+                continue
+        elif next_candidate is None and previous_candidate is not None and index >= 2:
+            second_previous_candidate = candidates[index - 2]
+            if (
+                not _gps_candidates_are_plausible(previous_candidate, candidate)
+                and _gps_candidates_are_plausible(second_previous_candidate, previous_candidate)
+            ):
+                continue
+        elif previous_candidate is not None and next_candidate is not None:
+            if (
+                not _gps_candidates_are_plausible(previous_candidate, candidate)
+                and not _gps_candidates_are_plausible(candidate, next_candidate)
+                and _gps_candidates_are_plausible(previous_candidate, next_candidate)
+            ):
+                continue
+
+        filtered.append(candidate)
+    return filtered
+
+
+def _drop_isolated_gps_outliers(candidates: list[GpsCandidate]) -> list[GpsCandidate]:
+    filtered = candidates
+    while True:
+        next_filtered = _drop_isolated_gps_outliers_once(filtered)
+        if len(next_filtered) == len(filtered):
+            return filtered
+        filtered = next_filtered
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -283,7 +370,7 @@ def _empty_gps_payload(message: str) -> dict[str, object]:
         "points": [],
         "segments": [],
         "legend": {"enabled": False},
-        "osmUrl": OSM_TILE_URL,
+        "mapStyleUrl": OPENFREEMAP_STYLE_URL,
     }
 
 
@@ -299,6 +386,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     df = log.dataframe
     lat_values = pd.to_numeric(df[gps.latitude], errors="coerce")
     lon_values = pd.to_numeric(df[gps.longitude], errors="coerce")
+    time_values = list(log.time) if log.time is not None else [None] * len(df)
     if gps.altitude and gps.altitude in df.columns:
         alt_values = pd.to_numeric(df[gps.altitude], errors="coerce")
         altitude_label = gps.altitude_label or gps.altitude
@@ -308,7 +396,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
 
     color_column = options.color_column if options.color_column in df.columns else None
     color_values = pd.to_numeric(df[color_column], errors="coerce") if color_column else None
-    points: list[dict[str, object]] = []
+    candidate_points: list[GpsCandidate] = []
     for row_index in range(len(df)):
         lat = lat_values.iloc[row_index]
         lon = lon_values.iloc[row_index]
@@ -317,6 +405,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         lat = float(lat)
         lon = float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        if _is_origin_placeholder(lat, lon):
             continue
         alt = alt_values.iloc[row_index]
         point: dict[str, object] = {
@@ -328,10 +418,31 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         if color_values is not None:
             value = color_values.iloc[row_index]
             point["value"] = float(value) if _is_finite_number(value) else None
-        points.append(point)
+        candidate_points.append((point, time_values[row_index] if row_index < len(time_values) else None))
 
-    if len(points) < 2:
+    if len(candidate_points) < 2:
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+
+    candidate_points = _drop_isolated_gps_outliers(candidate_points)
+    if len(candidate_points) < 2:
+        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+
+    path_parts: list[list[GpsCandidate]] = []
+    current_part: list[GpsCandidate] = [candidate_points[0]]
+    for point, point_time in candidate_points[1:]:
+        previous_point, previous_time = current_part[-1]
+        if _gps_jump_is_plausible(previous_point, point, previous_time, point_time):
+            current_part.append((point, point_time))
+        else:
+            path_parts.append(current_part)
+            current_part = [(point, point_time)]
+    path_parts.append(current_part)
+
+    rendered_parts = [part for part in path_parts if len(part) >= 2]
+    if not rendered_parts:
+        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+
+    points = [dict(point) for part in rendered_parts for point, _ in part]
 
     start_color = _clean_hex_color(options.start_color, GpsGradientOptions.start_color)
     end_color = _clean_hex_color(options.end_color, GpsGradientOptions.end_color)
@@ -350,32 +461,40 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     midpoint = float(options.midpoint) if _is_finite_number(options.midpoint) else None
 
     segments: list[dict[str, object]] = []
-    for left, right in zip(points, points[1:]):
-        segment_values = [float(point["value"]) for point in (left, right) if point.get("value") is not None]
-        segment_value = sum(segment_values) / len(segment_values) if segment_values else None
-        if minimum is not None and maximum is not None and segment_value is not None:
-            amount = _gradient_position(segment_value, minimum, maximum, midpoint=midpoint, reverse=options.reverse)
-            color = _interpolate_hex_color(start_color, end_color, amount)
-        elif color_column:
-            color = MISSING_VALUE_COLOR
-        else:
-            color = DEFAULT_PATH_COLOR
-        segments.append(
-            {
-                "positions": [
-                    float(left["lon"]),
-                    float(left["lat"]),
-                    float(left["alt"]),
-                    float(right["lon"]),
-                    float(right["lat"]),
-                    float(right["alt"]),
-                ],
-                "color": color,
-                "startRow": int(left["row"]),
-                "endRow": int(right["row"]),
-                "value": segment_value,
-            }
-        )
+    path_parts_json: list[list[dict[str, object]]] = []
+    for part in rendered_parts:
+        part_points = [dict(point) for point, _ in part]
+        path_parts_json.append(part_points)
+        for left, right in zip(part, part[1:]):
+            left_point, left_time = left
+            right_point, right_time = right
+            segment_values = [float(point["value"]) for point in (left_point, right_point) if point.get("value") is not None]
+            segment_value = sum(segment_values) / len(segment_values) if segment_values else None
+            if minimum is not None and maximum is not None and segment_value is not None:
+                amount = _gradient_position(segment_value, minimum, maximum, midpoint=midpoint, reverse=options.reverse)
+                color = _interpolate_hex_color(start_color, end_color, amount)
+            elif color_column:
+                color = MISSING_VALUE_COLOR
+            else:
+                color = DEFAULT_PATH_COLOR
+            segments.append(
+                {
+                    "left": dict(left_point),
+                    "right": dict(right_point),
+                    "positions": [
+                        float(left_point["lon"]),
+                        float(left_point["lat"]),
+                        float(left_point["alt"]),
+                        float(right_point["lon"]),
+                        float(right_point["lat"]),
+                        float(right_point["alt"]),
+                    ],
+                    "color": color,
+                    "startRow": int(left_point["row"]),
+                    "endRow": int(right_point["row"]),
+                    "value": segment_value,
+                }
+            )
 
     legend: dict[str, object] = {"enabled": False}
     if color_column and minimum is not None and maximum is not None:
@@ -398,560 +517,24 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "status": "ok",
         "message": "",
         "points": points,
+        "pathParts": path_parts_json,
         "segments": segments,
         "legend": legend,
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
         "altitudeLabel": altitude_label,
-        "osmUrl": OSM_TILE_URL,
+        "mapStyleUrl": OPENFREEMAP_STYLE_URL,
     }
 
 
-def _gps_message_html(message: str, dark: bool) -> str:
-    background = "#1f242b" if dark else "#ffffff"
-    color = "#e5e7eb" if dark else "#1f2937"
-    border = "#3a414d" if dark else "#d1d5db"
-    return f"""
-<html>
-<body style="margin:0;background:{background};color:{color};font-family:Arial,sans-serif;">
-  <div style="height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;">
-    <div style="border:1px solid {border};border-radius:6px;padding:18px 22px;max-width:520px;">
-      {html.escape(message)}
-    </div>
-  </div>
-</body>
-</html>
-"""
-
-
-def build_gps_map_html(log: LoadedLog | None, options: GpsGradientOptions | None = None, dark: bool = True) -> str:
+def build_gps_map_html(
+    log: LoadedLog | None,
+    options: GpsGradientOptions | None = None,
+    dark: bool = True,
+    mode: str = "3d",
+) -> str:
     payload = build_gps_map_payload(log, options)
-    if payload.get("status") != "ok":
-        return _gps_message_html(str(payload.get("message") or "No GPS path to display."), dark)
-
-    background = "#1f242b" if dark else "#ffffff"
-    panel_bg = "rgba(21,24,29,0.88)" if dark else "rgba(255,255,255,0.92)"
-    panel_fg = "#e5e7eb" if dark else "#1f2937"
-    border = "rgba(255,255,255,0.18)" if dark else "rgba(0,0,0,0.18)"
-    data_json = json.dumps(payload, allow_nan=False)
-    return f"""
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
-  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script>
-    window.CESIUM_BASE_URL = "{CESIUM_BASE_URL}/";
-  </script>
-  <link href="{CESIUM_BASE_URL}/Widgets/widgets.css" rel="stylesheet">
-  <script src="{CESIUM_BASE_URL}/Cesium.js"></script>
-  <style>
-    html, body {{
-      width: 100%;
-      height: 100%;
-      margin: 0;
-      padding: 0;
-      overflow: hidden;
-      background: {background};
-      font-family: Arial, sans-serif;
-    }}
-    body {{
-      position: relative;
-    }}
-    #cesiumContainer,
-    #leafletContainer {{
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-    }}
-    #leafletContainer[hidden] {{
-      display: none;
-    }}
-    .leaflet-container {{
-      background: {background};
-      font: inherit;
-    }}
-    .leaflet-tooltip.gpsMarkerTooltip {{
-      background: rgba(17, 24, 39, 0.92);
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      color: #f9fafb;
-      box-shadow: none;
-      font: 12px Arial, sans-serif;
-      padding: 2px 8px;
-    }}
-    .leaflet-tooltip.gpsMarkerTooltip::before {{
-      border-top-color: rgba(17, 24, 39, 0.92);
-      border-bottom-color: rgba(17, 24, 39, 0.92);
-    }}
-    #legend {{
-      position: absolute;
-      left: 12px;
-      bottom: 22px;
-      min-width: 260px;
-      max-width: 380px;
-      color: {panel_fg};
-      background: {panel_bg};
-      border: 1px solid {border};
-      border-radius: 6px;
-      padding: 10px 12px;
-      box-sizing: border-box;
-      font-size: 12px;
-      z-index: 10;
-    }}
-    #legendTitle {{
-      font-weight: 700;
-      margin-bottom: 7px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }}
-    #gradientBar {{
-      height: 12px;
-      border-radius: 4px;
-      border: 1px solid {border};
-      margin-bottom: 5px;
-    }}
-    #legendLabels {{
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-    }}
-    #statusOverlay {{
-      position: absolute;
-      left: 8px;
-      top: 8px;
-      z-index: 12;
-      min-width: 160px;
-      max-width: 320px;
-      font-size: 11px;
-      line-height: 1.3;
-      color: {panel_fg};
-      background: {panel_bg};
-      border: 1px solid {border};
-      border-radius: 5px;
-      padding: 6px 8px;
-      box-sizing: border-box;
-      pointer-events: none;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }}
-    #statusOverlay[data-kind="error"] {{
-      border-color: rgba(239,68,68,0.85);
-      color: #fecaca;
-      background: rgba(127,29,29,0.9);
-    }}
-    #statusOverlay[data-kind="ok"] {{
-      color: #dcfce7;
-      background: rgba(20,83,45,0.88);
-      border-color: rgba(74,222,128,0.65);
-    }}
-    #osmAttribution {{
-      position: absolute;
-      right: 8px;
-      bottom: 2px;
-      z-index: 10;
-      font-size: 11px;
-      color: #111827;
-      background: rgba(255,255,255,0.84);
-      padding: 2px 4px;
-      border-radius: 3px;
-    }}
-    #osmAttribution a {{ color: #0645ad; }}
-  </style>
-</head>
-<body>
-  <div id="cesiumContainer"></div>
-  <div id="leafletContainer" hidden></div>
-  <div id="legend" hidden>
-    <div id="legendTitle"></div>
-    <div id="gradientBar"></div>
-    <div id="legendLabels">
-      <span id="legendMin"></span>
-      <span id="legendMid"></span>
-      <span id="legendMax"></span>
-    </div>
-  </div>
-  <div id="statusOverlay" hidden></div>
-  <div id="osmAttribution">
-    Tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
-  </div>
-    <script>
-        const flightData = {data_json};
-        const osmTileUrl = flightData.osmUrl.endsWith("/")
-      ? flightData.osmUrl + "{{z}}/{{x}}/{{y}}.png"
-      : flightData.osmUrl + "/{{z}}/{{x}}/{{y}}.png";
-    const cesiumContainer = document.getElementById("cesiumContainer");
-    const leafletContainer = document.getElementById("leafletContainer");
-    const legendContainer = document.getElementById("legend");
-    const legendTitle = document.getElementById("legendTitle");
-    const gradientBar = document.getElementById("gradientBar");
-    const legendMin = document.getElementById("legendMin");
-    const legendMid = document.getElementById("legendMid");
-    const legendMax = document.getElementById("legendMax");
-    const statusOverlay = document.getElementById("statusOverlay");
-    let statusHideTimer = null;
-    let cesiumViewer = null;
-    let leafletMap = null;
-    let readinessTimer = null;
-    let cesiumReady = false;
-    let activeMode = "cesium";
-    const preferLeafletRenderer = /QtWebEngine/i.test(navigator.userAgent || "");
-
-    function setStatus(message, kind) {{
-      if (!statusOverlay) return;
-      if (statusHideTimer) {{
-        clearTimeout(statusHideTimer);
-        statusHideTimer = null;
-      }}
-      if (!message) {{
-        statusOverlay.hidden = true;
-        statusOverlay.textContent = "";
-        statusOverlay.dataset.kind = "";
-        return;
-      }}
-      statusOverlay.hidden = false;
-      statusOverlay.dataset.kind = kind || "info";
-      statusOverlay.textContent = message;
-    }}
-
-    function transientStatus(message, kind, timeoutMs) {{
-      setStatus(message, kind);
-      if ((kind || "info") === "error") {{
-        return;
-      }}
-      statusHideTimer = setTimeout(() => {{
-        if (statusOverlay && statusOverlay.dataset.kind === (kind || "info")) {{
-          setStatus("", "");
-        }}
-      }}, timeoutMs || 1800);
-    }}
-
-    function renderLegend() {{
-      const legend = flightData.legend;
-      if (!legend || !legend.enabled) {{
-        legendContainer.hidden = true;
-        return;
-      }}
-      legendContainer.hidden = false;
-      legendTitle.textContent = `Color by ${{legend.label}}`;
-      gradientBar.style.background = `linear-gradient(90deg, ${{legend.lowColor}}, ${{legend.highColor}})`;
-      legendMin.textContent = legend.minLabel;
-      legendMid.textContent = legend.midLabel || "";
-      legendMax.textContent = legend.maxLabel;
-    }}
-
-    function destroyCesiumViewer() {{
-      if (!cesiumViewer) {{
-        return;
-      }}
-      try {{
-        cesiumViewer.destroy();
-      }} catch (error) {{
-        console.warn("Failed to destroy Cesium viewer", error);
-      }}
-      cesiumViewer = null;
-    }}
-
-    function clearReadinessTimer() {{
-      if (readinessTimer) {{
-        clearTimeout(readinessTimer);
-        readinessTimer = null;
-      }}
-    }}
-
-    function markCesiumReady() {{
-      if (cesiumReady || activeMode !== "cesium") {{
-        return;
-      }}
-      cesiumReady = true;
-      clearReadinessTimer();
-      transientStatus("Map ready", "ok", 1200);
-    }}
-
-    function buildLeafletMap() {{
-      if (!window.L) {{
-        throw new Error("Leaflet library failed to load");
-      }}
-      leafletContainer.hidden = false;
-      cesiumContainer.hidden = true;
-      const map = L.map("leafletContainer", {{
-        attributionControl: false,
-        zoomControl: true,
-        preferCanvas: true
-      }});
-      const tileLayer = L.tileLayer(osmTileUrl, {{
-        maxZoom: 19,
-        tileSize: 256,
-        updateWhenIdle: true
-      }});
-      tileLayer.on("loading", () => {{
-        if (activeMode === "leaflet") {{
-          transientStatus("Loading map tiles...", "info", 900);
-        }}
-      }});
-      tileLayer.on("load", () => {{
-        if (activeMode === "leaflet") {{
-          transientStatus("Map ready", "ok", 1200);
-        }}
-      }});
-      tileLayer.on("tileerror", (event) => {{
-        const details = event && event.error && (event.error.message || String(event.error));
-        setStatus("OSM tile error" + (details ? ": " + details : ""), "error");
-      }});
-      tileLayer.addTo(map);
-
-      const pathLatLngs = flightData.points.map((point) => [point.lat, point.lon]);
-      L.polyline(pathLatLngs, {{
-        color: "#ffffff",
-        weight: 10,
-        opacity: 0.82,
-        lineCap: "round",
-        lineJoin: "round"
-      }}).addTo(map);
-
-      flightData.segments.forEach((segment, index) => {{
-        const left = flightData.points[index];
-        const right = flightData.points[index + 1];
-        if (!left || !right) {{
-          return;
-        }}
-        L.polyline([[left.lat, left.lon], [right.lat, right.lon]], {{
-          color: segment.color,
-          weight: 6,
-          opacity: 0.96,
-          lineCap: "round",
-          lineJoin: "round"
-        }}).addTo(map);
-      }});
-
-      function marker(point, label, color) {{
-        return L.circleMarker([point.lat, point.lon], {{
-          radius: 7,
-          color: "#ffffff",
-          weight: 2,
-          fillColor: color,
-          fillOpacity: 1,
-          opacity: 1
-        }}).addTo(map).bindTooltip(label, {{
-          permanent: true,
-          direction: "top",
-          offset: [0, -12],
-          className: "gpsMarkerTooltip"
-        }});
-      }}
-
-      marker(flightData.points[0], "Start", "#27ae60");
-      marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
-      renderLegend();
-
-      const bounds = L.latLngBounds(pathLatLngs);
-      setTimeout(() => {{
-        map.invalidateSize();
-        if (bounds.isValid()) {{
-          map.fitBounds(bounds, {{
-            padding: [24, 24],
-            maxZoom: 17
-          }});
-        }}
-      }}, 0);
-      return map;
-    }}
-
-    function switchToLeaflet(reason) {{
-      if (activeMode === "leaflet") {{
-        return;
-      }}
-      activeMode = "leaflet";
-      clearReadinessTimer();
-      destroyCesiumViewer();
-      cesiumContainer.hidden = true;
-      leafletContainer.hidden = false;
-      setStatus(reason ? "Leaflet fallback: " + reason : "Leaflet fallback", "error");
-      try {{
-        if (!leafletMap) {{
-          leafletMap = buildLeafletMap();
-        }} else {{
-          setTimeout(() => {{
-            if (leafletMap) {{
-              leafletMap.invalidateSize();
-            }}
-          }}, 0);
-        }}
-      }} catch (error) {{
-        const details = error && error.message ? error.message : String(error);
-        setStatus("Leaflet render error: " + details, "error");
-      }}
-    }}
-
-    function initCesium() {{
-      try {{
-        const osmProvider = new Cesium.OpenStreetMapImageryProvider({{
-          url: flightData.osmUrl,
-          fileExtension: "png"
-        }});
-
-        const viewer = new Cesium.Viewer("cesiumContainer", {{
-          animation: false,
-          baseLayer: new Cesium.ImageryLayer(osmProvider),
-          baseLayerPicker: false,
-          fullscreenButton: false,
-          geocoder: false,
-          infoBox: false,
-          navigationHelpButton: true,
-          sceneMode: Cesium.SceneMode.SCENE3D,
-          sceneModePicker: true,
-          selectionIndicator: false,
-          shouldAnimate: false,
-          timeline: false,
-          terrainProvider: new Cesium.EllipsoidTerrainProvider()
-        }});
-        cesiumViewer = viewer;
-
-        viewer.scene.globe.depthTestAgainstTerrain = false;
-        viewer.scene.screenSpaceCameraController.enableCollisionDetection = false;
-
-        osmProvider.errorEvent.addEventListener((tileError) => {{
-          if (activeMode !== "cesium") {{
-            return;
-          }}
-          const details = tileError && (tileError.message || (tileError.error && tileError.error.message));
-          switchToLeaflet("OSM tile error" + (details ? ": " + details : ""));
-        }});
-
-        viewer.scene.globe.tileLoadProgressEvent.addEventListener((remaining) => {{
-          if (activeMode !== "cesium") {{
-            return;
-          }}
-          if (remaining > 0) {{
-            transientStatus("Loading map tiles... " + remaining, "info", 900);
-          }} else {{
-            markCesiumReady();
-          }}
-        }});
-
-        viewer.scene.renderError.addEventListener((scene, error) => {{
-          if (activeMode !== "cesium") {{
-            return;
-          }}
-          const details = error && error.message ? error.message : String(error);
-          switchToLeaflet("Render error: " + details);
-        }});
-
-        readinessTimer = setTimeout(() => {{
-          if (activeMode === "cesium" && !cesiumReady) {{
-            switchToLeaflet("Cesium readiness timed out");
-          }}
-        }}, 10000);
-
-        const pathPositions = [];
-        flightData.points.forEach((point) => {{
-          pathPositions.push(point.lon, point.lat);
-        }});
-        viewer.entities.add({{
-          name: "Flight path underlay",
-          polyline: {{
-            positions: Cesium.Cartesian3.fromDegreesArray(pathPositions),
-            width: 10,
-            clampToGround: true,
-            material: Cesium.Color.WHITE.withAlpha(0.82)
-          }}
-        }});
-
-        flightData.segments.forEach((segment, index) => {{
-          const positions = Cesium.Cartesian3.fromDegreesArray([
-            segment.positions[0],
-            segment.positions[1],
-            segment.positions[3],
-            segment.positions[4]
-          ]);
-          viewer.entities.add({{
-            name: `Flight segment ${{index + 1}}`,
-            description: `Rows ${{segment.startRow}}-${{segment.endRow}}`,
-            polyline: {{
-              positions,
-              width: 6,
-              clampToGround: true,
-              material: Cesium.Color.fromCssColorString(segment.color).withAlpha(0.96)
-            }}
-          }});
-        }});
-
-        function marker(point, label, color) {{
-          viewer.entities.add({{
-            name: label,
-            position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt),
-            point: {{
-              pixelSize: 12,
-              color: Cesium.Color.fromCssColorString(color),
-              outlineColor: Cesium.Color.WHITE,
-              outlineWidth: 2,
-              disableDepthTestDistance: Number.POSITIVE_INFINITY
-            }},
-            label: {{
-              text: label,
-              font: "13px Arial",
-              fillColor: Cesium.Color.WHITE,
-              outlineColor: Cesium.Color.BLACK,
-              outlineWidth: 3,
-              style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-              pixelOffset: new Cesium.Cartesian2(0, -24),
-              disableDepthTestDistance: Number.POSITIVE_INFINITY
-            }}
-          }});
-        }}
-
-        marker(flightData.points[0], "Start", "#27ae60");
-        marker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
-        renderLegend();
-
-        const allPositions = flightData.points.map((point) =>
-          Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.alt)
-        );
-        const sphere = Cesium.BoundingSphere.fromPoints(allPositions);
-        const range = Math.max(sphere.radius * 3.2, 500.0);
-        viewer.camera.flyToBoundingSphere(sphere, {{
-          duration: 0,
-          offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-38), range)
-        }});
-        viewer.scene.requestRender();
-        if (!cesiumReady) {{
-          transientStatus("Preparing map...", "info", 900);
-        }}
-      }} catch (error) {{
-        const details = error && error.message ? error.message : String(error);
-        switchToLeaflet("Cesium error: " + details);
-      }}
-    }}
-
-    if (preferLeafletRenderer) {{
-      activeMode = "leaflet";
-      try {{
-        leafletMap = buildLeafletMap();
-        transientStatus("2D map ready", "ok", 1200);
-      }} catch (error) {{
-        const details = error && error.message ? error.message : String(error);
-        activeMode = "cesium";
-        leafletContainer.hidden = true;
-        cesiumContainer.hidden = false;
-        if (!window.Cesium) {{
-          setStatus("Map render error: " + details, "error");
-        }} else {{
-          initCesium();
-        }}
-      }}
-    }} else if (!window.Cesium) {{
-      switchToLeaflet("Cesium script unavailable");
-    }} else {{
-      initCesium();
-    }}
-  </script>
-</body>
-</html>
-"""
+    return render_gps_map_html(payload, dark=dark, mode=mode)
 
 
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
@@ -997,3 +580,4 @@ setTimeout(bindPlot, 200);
 </body>
 </html>
 """
+

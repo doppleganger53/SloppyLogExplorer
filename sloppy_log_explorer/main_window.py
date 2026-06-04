@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         self.selected_parameter_columns: set[str] = set()
         self.gps_start_color = GpsGradientOptions.start_color
         self.gps_end_color = GpsGradientOptions.end_color
+        self.gps_map_mode = "3d"
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
 
@@ -254,6 +255,17 @@ class MainWindow(QMainWindow):
         self.gps_reverse_check = QCheckBox("Reverse")
         self.gps_reverse_check.toggled.connect(self.refresh_gps)
         row.addWidget(self.gps_reverse_check)
+        row.addSpacing(8)
+        row.addWidget(QLabel("Map"))
+        self.gps_3d_button = QPushButton("3D")
+        self.gps_3d_button.setCheckable(True)
+        self.gps_3d_button.setChecked(True)
+        self.gps_3d_button.clicked.connect(lambda: self.set_gps_map_mode("3d"))
+        row.addWidget(self.gps_3d_button)
+        self.gps_2d_button = QPushButton("2D")
+        self.gps_2d_button.setCheckable(True)
+        self.gps_2d_button.clicked.connect(lambda: self.set_gps_map_mode("2d"))
+        row.addWidget(self.gps_2d_button)
         row.addStretch()
         layout.addLayout(row)
 
@@ -281,10 +293,10 @@ class MainWindow(QMainWindow):
 
         self.gps_view = GpsPathWidget()
         layout.addWidget(self.gps_view, 1)
-        self.tabs.addTab(tab, "3D Flight Path")
+        self.tabs.addTab(tab, "Flight Map")
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
-        self.gps_view.set_path(None, dark=self.dark_mode)
+        self.gps_view.set_path(None, dark=self.dark_mode, mode=self.gps_map_mode)
 
     def _build_flight_tab(self) -> None:
         tab = QWidget()
@@ -522,6 +534,13 @@ class MainWindow(QMainWindow):
             midpoint=self.gps_midpoint_spin.value() if self.gps_midpoint_check.isChecked() else None,
         )
 
+    def set_gps_map_mode(self, mode: str) -> None:
+        self.gps_map_mode = "2d" if mode == "2d" else "3d"
+        self.gps_3d_button.setChecked(self.gps_map_mode == "3d")
+        self.gps_2d_button.setChecked(self.gps_map_mode == "2d")
+        if hasattr(self, "gps_view"):
+            self.gps_view.set_mode(self.gps_map_mode)
+
     @staticmethod
     def _configure_sortable_table(table: QTableWidget) -> None:
         header = table.horizontalHeader()
@@ -537,6 +556,7 @@ class MainWindow(QMainWindow):
             QMenuBar, QMenu, QStatusBar { background: #181b20; color: #e5e7eb; }
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
             QPushButton:hover { background: #3f8df2; }
+            QPushButton:checked { background: #185fc7; border: 1px solid #87b7ff; padding: 6px 9px; }
             QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget {
                 background: #15181d; color: #e5e7eb; border: 1px solid #3a414d; border-radius: 4px;
             }
@@ -774,7 +794,12 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_gps(self, *_args) -> None:
-        self.gps_view.set_path(self.current_log, options=self._gps_gradient_options(), dark=self.dark_mode)
+        self.gps_view.set_path(
+            self.current_log,
+            options=self._gps_gradient_options(),
+            dark=self.dark_mode,
+            mode=self.gps_map_mode,
+        )
 
     def populate_gps_color_combo(self) -> None:
         self.gps_color_combo.blockSignals(True)

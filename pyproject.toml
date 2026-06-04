@@ -30,6 +30,9 @@ sloppy-log-explorer = "sloppy_log_explorer.__main__:main"
 [tool.setuptools.packages.find]
 include = ["sloppy_log_explorer*"]
 
+[tool.setuptools.package-data]
+sloppy_log_explorer = ["assets/maplibre/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+import json
+import tempfile
+from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
+from .gps_map_renderer import normalize_map_mode
 from .models import GpsGradientOptions, LoadedLog
 from .plotting import build_gps_map_html, build_telemetry_figure, figure_html
 from .storage import app_data_dir
@@ -48,6 +52,30 @@ def _persistent_web_profile() -> QWebEngineProfile:
         profile.setHttpUserAgent("SloppyLogExplorer/0.1 QtWebEngine")
         _WEB_PROFILE = profile
     return _WEB_PROFILE
+
+
+def _write_temp_html(html: str, prefix: str) -> Path:
+    html_dir = app_data_dir() / "rendered_html"
+    html_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        suffix=".html",
+        prefix=prefix,
+        dir=html_dir,
+        delete=False,
+    ) as handle:
+        handle.write(html)
+        return Path(handle.name)
+
+
+def _remove_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 class TelemetryPlotWidget(QWidget):
@@ -137,6 +165,8 @@ class GpsPathWidget(QWidget):
         self.log: LoadedLog | None = None
         self.options = GpsGradientOptions()
         self.dark = True
+        self.map_mode = "3d"
+        self._html_path: Path | None = None
         self.setMinimumHeight(420)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -144,14 +174,48 @@ class GpsPathWidget(QWidget):
         if self._web_engine:
             self._view = QWebEngineView(self)
             self._page = QWebEnginePage(_persistent_web_profile(), self._view)
+            self._page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             self._view.setPage(self._page)
         else:
             self._view = QTextEdit(self)
             self._view.setReadOnly(True)
         layout.addWidget(self._view)
 
-    def set_path(self, log: LoadedLog | None, options: GpsGradientOptions | None = None, dark: bool = True) -> None:
+    def set_path(
+        self,
+        log: LoadedLog | None,
+        options: GpsGradientOptions | None = None,
+        dark: bool = True,
+        mode: str | None = None,
+    ) -> None:
         self.log = log
         self.options = options or GpsGradientOptions()
         self.dark = dark
-        self._view.setHtml(build_gps_map_html(log, options=self.options, dark=dark))
+        self.map_mode = normalize_map_mode(mode or getattr(self, "map_mode", "3d"))
+        html = build_gps_map_html(log, options=self.options, dark=dark, mode=self.map_mode)
+        if self._web_engine:
+            previous_path = self._html_path
+            self._html_path = _write_temp_html(html, "gps-map-")
+            self._view.setUrl(QUrl.fromLocalFile(str(self._html_path)))
+            _remove_file(previous_path)
+        else:
+            self._view.setHtml(html)
+
+    def set_mode(self, mode: str) -> None:
+        self.map_mode = normalize_map_mode(mode)
+        if self._web_engine and hasattr(self, "_page"):
+            mode_json = json.dumps(self.map_mode)
+            script = f"window.sloppyGpsMap ? (window.sloppyGpsMap.setMode({mode_json}), true) : false;"
+            self._page.runJavaScript(
+                script,
+                lambda applied: None
+                if applied
+                else self.set_path(self.log, options=self.options, dark=self.dark, mode=self.map_mode),
+            )
+        else:
+            self.set_path(self.log, options=self.options, dark=self.dark, mode=self.map_mode)
+
+    def closeEvent(self, event) -> None:
+        _remove_file(self._html_path)
+        self._html_path = None
+        super().closeEvent(event)

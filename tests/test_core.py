@@ -12,6 +12,7 @@ from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.plotting import build_gps_figure, build_gps_map_html, build_gps_map_payload, build_telemetry_figure, figure_html
+from sloppy_log_explorer.qt_plot import GpsPathWidget
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 
 
@@ -71,6 +72,39 @@ def write_cardinal_coordinate_sample(path: Path) -> None:
                 '2026-01-01,12:00:00,"39.0000N 75.0000W"',
                 '2026-01-01,12:00:01,"39.0005 N, 75.0005 W"',
                 '2026-01-01,12:00:02,"N39.0010 W75.0010"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_origin_placeholder_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,Alt(m)",
+                "2026-01-01,12:00:00,0,0,10",
+                "2026-01-01,12:00:01,39.0000,-75.0000,11",
+                "2026-01-01,12:00:02,39.0005,-75.0005,12",
+                "2026-01-01,12:00:03,0,0,13",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_gps_outlier_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,Alt(m)",
+                "2026-01-01,12:00:00,5.0000,-10.0000,10",
+                "2026-01-01,12:00:01,39.0000,-75.0000,11",
+                "2026-01-01,12:00:02,39.0005,-75.0005,12",
+                "2026-01-01,12:00:03,4.0000,-12.0000,13",
+                "2026-01-01,12:00:04,39.0010,-75.0010,14",
+                "2026-01-01,12:00:05,39.0015,-75.0015,15",
+                "2026-01-01,12:00:06,6.0000,-11.0000,16",
             ]
         ),
         encoding="utf-8",
@@ -167,30 +201,30 @@ def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) ->
     assert list(log.dataframe[log.gps_columns.longitude].head(2)) == pytest.approx([-75.0, -75.0005])
 
 
-def test_gps_map_html_uses_cesium_openstreetmap_without_api_keys(tmp_path: Path) -> None:
+def test_gps_map_html_uses_maplibre_openfreemap_without_api_keys(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
     log = load_log(path)
 
     html = build_gps_map_html(log, GpsGradientOptions(color_column="Current(A)"))
 
-    assert "Cesium.Viewer" in html
-    assert "Cesium.OpenStreetMapImageryProvider" in html
-    assert "tile.openstreetmap.org" in html
+    assert "maplibregl.Map" in html
+    assert "maplibre-gl-csp.js" in html
+    assert "maplibre-gl-csp-worker.js" in html
+    assert "maplibregl.workerUrl" in html
+    assert "https://tiles.openfreemap.org/styles/liberty" in html
+    assert "OpenFreeMap" in html
     assert "OpenStreetMap contributors" in html
-    assert "leaflet@1.9.4" in html
-    assert 'id="leafletContainer"' in html
-    assert "L.tileLayer(osmTileUrl" in html
-    assert "preferLeafletRenderer = /QtWebEngine/i.test" in html
-    assert 'transientStatus("2D map ready", "ok", 1200)' in html
-    assert 'switchToLeaflet("Cesium script unavailable")' in html
-    assert 'switchToLeaflet("Cesium readiness timed out")' in html
-    assert "baseLayer: new Cesium.ImageryLayer(osmProvider)" in html
-    assert "baseLayer: false" not in html
-    assert "viewer.imageryLayers.removeAll()" not in html
-    assert "Ion.defaultAccessToken" not in html
-    assert "createWorldTerrain" not in html
-    assert "createWorldImagery" not in html
+    forbidden = ["".join(parts) for parts in [
+        ("Ces", "ium"),
+        ("Leaf", "let"),
+        ("leaf", "let"),
+        ("tile.", "openstreetmap", ".org"),
+        ("Ion.", "defaultAccessToken"),
+        ("createWorld", "Terrain"),
+        ("createWorld", "Imagery"),
+    ]]
+    assert [token for token in forbidden if token in html] == []
 
 
 def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path) -> None:
@@ -204,23 +238,106 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert payload["status"] == "ok"
     assert len(payload["points"]) == 9
     assert len(payload["segments"]) == len(payload["points"]) - 1
-    assert "const pathPositions = [];" in html
-    assert "pathPositions.push(point.lon, point.lat);" in html
-    assert 'name: "Flight path underlay"' in html
-    assert "Cesium.Cartesian3.fromDegreesArray(pathPositions)" in html
-    assert "Cesium.Color.WHITE.withAlpha(0.82)" in html
+    assert 'const pathParts = Array.isArray(flightData.pathParts)' in html
+    assert "function buildFlightGeoJson()" in html
+    assert "pathParts.forEach((part, index) => {" in html
+    assert "coordinatesFromPart(part)" in html
+    assert 'id: "flight-underlay"' in html
+    assert 'source: "flight-underlay-source"' in html
+    assert '"line-color": "#ffffff"' in html
+    assert '"line-opacity": 0.82' in html
     assert "flightData.segments.forEach((segment, index) => {" in html
-    assert 'name: `Flight segment ${index + 1}`' in html
-    assert "Cesium.Cartesian3.fromDegreesArray([" in html
-    assert "clampToGround: true" in html
-    assert "marker(flightData.points[0], \"Start\"" in html
-    assert "marker(flightData.points[flightData.points.length - 1], \"End\"" in html
-    assert "disableDepthTestDistance: Number.POSITIVE_INFINITY" in html
-    assert "const pathLatLngs = flightData.points.map((point) => [point.lat, point.lon]);" in html
-    assert "L.polyline(pathLatLngs" in html
-    assert "L.polyline([[left.lat, left.lon], [right.lat, right.lon]]" in html
-    assert "L.circleMarker([point.lat, point.lon]" in html
-    assert "map.fitBounds(bounds" in html
+    assert "const left = coordinateFromPoint(segment.left);" in html
+    assert "const right = coordinateFromPoint(segment.right);" in html
+    assert 'id: "flight-segments"' in html
+    assert '"line-color": ["get", "color"]' in html
+    assert 'map.addSource("flight-markers"' in html
+    assert 'id: "flight-marker-circles"' in html
+    assert 'id: "flight-marker-labels"' in html
+    assert "let flightLayersAdded = false" in html
+    assert "if (flightLayersAdded)" in html
+    assert "flightLayersAdded = true" in html
+    assert 'maxZoom: 17' in html
+    assert "map.fitBounds(flightBounds" in html
+    assert 'map.once("style.load", revealFlightPath)' in html
+    assert 'map.once("load", revealFlightPath)' in html
+    assert "function applyMapMode(mode, options)" in html
+    assert "map.dragRotate.enable()" in html
+    assert "map.dragRotate.disable()" in html
+
+
+def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_origin_placeholder_sample(path)
+
+    log = load_log(path)
+    payload = build_gps_map_payload(log)
+    build_gps_map_html(log)
+
+    assert payload["status"] == "ok"
+    assert len(payload["points"]) == 2
+    assert len(payload["pathParts"]) == 1
+    assert len(payload["segments"]) == 1
+    assert payload["points"][0]["lat"] == pytest.approx(39.0)
+    assert payload["points"][0]["lon"] == pytest.approx(-75.0)
+    assert payload["points"][-1]["lat"] == pytest.approx(39.0005)
+    assert payload["points"][-1]["lon"] == pytest.approx(-75.0005)
+
+
+def test_gps_map_payload_skips_isolated_far_away_points(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_gps_outlier_sample(path)
+
+    log = load_log(path)
+    payload = build_gps_map_payload(log)
+
+    assert payload["status"] == "ok"
+    assert [point["row"] for point in payload["points"]] == [2, 3, 5, 6]
+    assert len(payload["pathParts"]) == 1
+    assert len(payload["segments"]) == 3
+    assert payload["points"][0]["lat"] == pytest.approx(39.0)
+    assert payload["points"][0]["lon"] == pytest.approx(-75.0)
+    assert payload["points"][-1]["lat"] == pytest.approx(39.0015)
+    assert payload["points"][-1]["lon"] == pytest.approx(-75.0015)
+
+
+def test_gps_webengine_widget_loads_map_from_local_html_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    class FakeView:
+        def __init__(self) -> None:
+            self.html: str | None = None
+            self.url = None
+
+        def setHtml(self, html: str) -> None:
+            self.html = html
+
+        def setUrl(self, url) -> None:
+            self.url = url
+
+    fake_view = FakeView()
+    fake_widget = GpsPathWidget.__new__(GpsPathWidget)
+    fake_widget._web_engine = True
+    fake_widget._view = fake_view
+    previous_path = tmp_path / "old-gps-map.html"
+    previous_path.write_text("old", encoding="utf-8")
+    fake_widget._html_path = previous_path
+
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.app_data_dir", lambda: tmp_path)
+
+    GpsPathWidget.set_path(fake_widget, log, mode="2d")
+
+    assert fake_view.html is None
+    assert fake_view.url is not None
+    assert fake_widget.map_mode == "2d"
+    assert not previous_path.exists()
+    html_path = Path(fake_view.url.toLocalFile())
+    assert html_path.exists()
+    html = html_path.read_text(encoding="utf-8")
+    assert "maplibregl.Map" in html
+    assert 'const initialMapMode = "2d";' in html
 
 
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
@@ -464,6 +581,38 @@ def test_gps_color_selector_uses_all_numeric_parameters(tmp_path: Path, monkeypa
     app.quit()
 
 
+def test_gps_mode_selector_propagates_to_map_widget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    assert window.gps_map_mode == "3d"
+    assert window.gps_view.map_mode == "3d"
+    assert window.gps_3d_button.isChecked()
+    assert not window.gps_2d_button.isChecked()
+
+    window.set_gps_map_mode("2d")
+
+    assert window.gps_map_mode == "2d"
+    assert window.gps_view.map_mode == "2d"
+    assert not window.gps_3d_button.isChecked()
+    assert window.gps_2d_button.isChecked()
+
+    window.set_gps_map_mode("3d")
+
+    assert window.gps_map_mode == "3d"
+    assert window.gps_view.map_mode == "3d"
+    assert window.gps_3d_button.isChecked()
+    assert not window.gps_2d_button.isChecked()
+    window.close()
+    app.quit()
+
+
 def test_real_frsky_sensor_ranking_prefers_pack_voltage_and_current() -> None:
     columns = [
         "TxBat(V)",
@@ -532,4 +681,4 @@ def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
     assert fig.layout.yaxis2.title.text == "Current(A)"
     assert "QWebChannel" in html
     assert len(gps.data) == 1
-    assert "Cesium.Viewer" in gps_map
+    assert "maplibregl.Map" in gps_map

@@ -60,32 +60,36 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
         raise AssertionError("cursor values were empty")
 
     gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=selected[0]))
-    if log.info.has_gps and ("cesium.viewer" not in gps_html.lower() or "tile.openstreetmap.org" not in gps_html.lower()):
-        raise AssertionError("GPS map HTML is missing Cesium or OpenStreetMap")
+    gps_html_lower = gps_html.lower()
+    if log.info.has_gps and ("maplibregl.map" not in gps_html_lower or "tiles.openfreemap.org/styles/liberty" not in gps_html_lower):
+        raise AssertionError("GPS map HTML is missing MapLibre or OpenFreeMap")
     if log.info.has_gps:
         required_map_tokens = [
-            "leaflet@1.9.4",
-            'id="leafletContainer"',
-            "L.tileLayer(osmTileUrl",
-            "preferLeafletRenderer = /QtWebEngine/i.test",
-            'transientStatus("2D map ready", "ok", 1200)',
-            'switchToLeaflet("Cesium readiness timed out")',
-            "baseLayer: new Cesium.ImageryLayer(osmProvider)",
-            'name: "Flight path underlay"',
-            "Cesium.Cartesian3.fromDegreesArray(pathPositions)",
-            "L.polyline(pathLatLngs",
-            "L.polyline([[left.lat, left.lon], [right.lat, right.lon]]",
+            "maplibre-gl-csp.js",
+            "maplibre-gl-csp-worker.js",
+            "maplibregl.workerUrl",
+            "new maplibregl.Map",
+            "OpenFreeMap",
+            'const pathParts = Array.isArray(flightData.pathParts)',
+            "function buildFlightGeoJson()",
+            'id: "flight-underlay"',
+            'id: "flight-segments"',
+            'map.addSource("flight-markers"',
+            '"line-color": ["get", "color"]',
             "flightData.segments.forEach((segment, index) => {",
-            "clampToGround: true",
+            "let flightLayersAdded = false",
+            "flightLayersAdded = true",
+            "maxZoom: 17",
+            "function applyMapMode(mode, options)",
+            "map.dragRotate.enable()",
+            "map.dragRotate.disable()",
+            "map.fitBounds(flightBounds",
+            'map.once("style.load", revealFlightPath)',
+            "window.sloppyGpsMap",
         ]
         missing = [token for token in required_map_tokens if token not in gps_html]
         if missing:
             raise AssertionError(f"GPS map HTML is missing visible map/path tokens: {missing}")
-        forbidden_map_tokens = ["baseLayer: false", "viewer.imageryLayers.removeAll()"]
-        present = [token for token in forbidden_map_tokens if token in gps_html]
-        if present:
-            raise AssertionError(f"GPS map HTML still contains blank-map-prone setup: {present}")
-
     voltage_columns = find_voltage_columns(log.parameter_columns)
     current_columns = find_current_columns(log.parameter_columns)
     ir_result = None

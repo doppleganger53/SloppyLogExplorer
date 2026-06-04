@@ -9,7 +9,7 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 - Select telemetry parameters and view a native multi-series telemetry graph.
 - Click the graph or use left/right arrow keys in the graph to inspect telemetry values in the cursor panel.
 - Load a comparison flight and view matching parameter deltas.
-- View detected GPS latitude/longitude/altitude on a CesiumJS 3D globe with OpenStreetMap tiles.
+- View detected GPS latitude/longitude/altitude on a MapLibre/OpenFreeMap flight map with 3D and 2D camera modes.
 - Color the GPS flight path by any numeric telemetry parameter with custom start/end colors and range controls.
 - Store flight notes and link a local video file to each flight.
 - Register batteries, calculate pack and per-cell internal resistance from voltage/current logs, and retain health history.
@@ -65,7 +65,7 @@ python build.py --clean
 
 Application state is stored under `%APPDATA%\SloppyLogExplorer` on Windows or `~/.sloppy_log_explorer` on other platforms. The app stores settings, flight notes, video links, battery history, and switch aliases in a local SQLite database.
 
-The 3D flight-path tab uses CesiumJS and public OpenStreetMap raster tiles. It does not require Google, Mapbox, Cesium ion, paid subscriptions, account signups, or API keys. Map tiles require normal internet access and are cached by Qt WebEngine under the app data directory.
+The flight map tab uses locally bundled MapLibre GL JS assets with OpenFreeMap's public Liberty style, which is based on OpenStreetMap data. It does not require Google Maps, Mapbox, paid subscriptions, account signups, or API keys. The map style and tiles require normal internet access and are cached by Qt WebEngine under the app data directory.
 
 ## License And Attribution
 

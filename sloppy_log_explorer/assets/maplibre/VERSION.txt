@@ -1,0 +1,10 @@
+MapLibre GL JS 5.24.0
+
+Vendored files:
+- maplibre-gl-csp.js
+- maplibre-gl-csp-worker.js
+- maplibre-gl.css
+- LICENSE.txt
+
+Source package:
+https://unpkg.com/maplibre-gl@5.24.0/

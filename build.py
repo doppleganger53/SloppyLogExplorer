@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ def build(one_file: bool = False, clean: bool = False) -> int:
     project_root = Path(__file__).resolve().parent
     dist_dir = project_root / "dist"
     build_dir = project_root / "build"
+    assets_dir = project_root / "sloppy_log_explorer" / "assets"
 
     if clean:
         shutil.rmtree(dist_dir, ignore_errors=True)
@@ -41,6 +43,8 @@ def build(one_file: bool = False, clean: bool = False) -> int:
         "plotly",
         "--collect-data",
         "kaleido",
+        "--add-data",
+        f"{assets_dir}{os.pathsep}sloppy_log_explorer/assets",
         "--collect-submodules",
         "pyttsx3",
         "--hidden-import",
