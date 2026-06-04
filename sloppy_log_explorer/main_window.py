@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         self._build_sync_tab()
         self._build_alias_tab()
         self._build_voice_tab()
+        self.tabs.currentChanged.connect(self.tab_changed)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -293,6 +294,7 @@ class MainWindow(QMainWindow):
 
         self.gps_view = GpsPathWidget()
         layout.addWidget(self.gps_view, 1)
+        self.gps_tab = tab
         self.tabs.addTab(tab, "Flight Map")
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
@@ -800,6 +802,10 @@ class MainWindow(QMainWindow):
             dark=self.dark_mode,
             mode=self.gps_map_mode,
         )
+
+    def tab_changed(self, index: int) -> None:
+        if hasattr(self, "gps_tab") and self.tabs.widget(index) is self.gps_tab:
+            self.gps_view.refresh_viewport(fit=True)
 
     def populate_gps_color_combo(self) -> None:
         self.gps_color_combo.blockSignals(True)

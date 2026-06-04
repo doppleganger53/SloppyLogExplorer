@@ -52,8 +52,8 @@ def _validate_log(path: str) -> None:
         raise ValueError("Rendered telemetry HTML is missing the Qt bridge")
     if log.info.has_gps:
         gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=columns[0]))
-        if "maplibregl.Map" not in gps_html or "tiles.openfreemap.org/styles/liberty" not in gps_html:
-            raise ValueError("Rendered GPS map HTML is missing MapLibre or OpenFreeMap")
+        if "maplibregl.Map" not in gps_html or "tile.openstreetmap.org" not in gps_html:
+            raise ValueError("Rendered GPS map HTML is missing MapLibre or OpenStreetMap raster tiles")
     message = (
         f"validated {log.info.name}: rows={log.info.rows} "
         f"columns={log.info.columns} traces={len(fig.data)} duration={log.info.duration_seconds:.2f}s"

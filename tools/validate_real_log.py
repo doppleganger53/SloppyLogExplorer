@@ -61,15 +61,17 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
 
     gps_html = build_gps_map_html(log, GpsGradientOptions(color_column=selected[0]))
     gps_html_lower = gps_html.lower()
-    if log.info.has_gps and ("maplibregl.map" not in gps_html_lower or "tiles.openfreemap.org/styles/liberty" not in gps_html_lower):
-        raise AssertionError("GPS map HTML is missing MapLibre or OpenFreeMap")
+    if log.info.has_gps and ("maplibregl.map" not in gps_html_lower or "tile.openstreetmap.org" not in gps_html_lower):
+        raise AssertionError("GPS map HTML is missing MapLibre or OpenStreetMap raster tiles")
     if log.info.has_gps:
         required_map_tokens = [
             "maplibre-gl-csp.js",
             "maplibre-gl-csp-worker.js",
             "maplibregl.workerUrl",
             "new maplibregl.Map",
-            "OpenFreeMap",
+            "OpenStreetMap contributors",
+            "function buildRasterBaseStyle()",
+            'id: "osm-raster-base"',
             'const pathParts = Array.isArray(flightData.pathParts)',
             "function buildFlightGeoJson()",
             'id: "flight-underlay"',
@@ -79,7 +81,7 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
             "flightData.segments.forEach((segment, index) => {",
             "let flightLayersAdded = false",
             "flightLayersAdded = true",
-            "maxZoom: 17",
+            "maxZoom: mapMaxZoom",
             "function applyMapMode(mode, options)",
             "map.dragRotate.enable()",
             "map.dragRotate.disable()",

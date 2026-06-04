@@ -5,7 +5,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -49,7 +49,10 @@ def _persistent_web_profile() -> QWebEngineProfile:
         profile.setCachePath(str(cache))
         profile.setPersistentStoragePath(str(storage))
         profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
-        profile.setHttpUserAgent("SloppyLogExplorer/0.1 QtWebEngine")
+        profile.setHttpUserAgent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) SloppyLogExplorer/0.1 QtWebEngine"
+        )
         _WEB_PROFILE = profile
     return _WEB_PROFILE
 
@@ -174,7 +177,9 @@ class GpsPathWidget(QWidget):
         if self._web_engine:
             self._view = QWebEngineView(self)
             self._page = QWebEnginePage(_persistent_web_profile(), self._view)
+            self._page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
             self._page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            self._page.loadFinished.connect(self._map_page_loaded)
             self._view.setPage(self._page)
         else:
             self._view = QTextEdit(self)
@@ -198,6 +203,7 @@ class GpsPathWidget(QWidget):
             self._html_path = _write_temp_html(html, "gps-map-")
             self._view.setUrl(QUrl.fromLocalFile(str(self._html_path)))
             _remove_file(previous_path)
+            self._schedule_viewport_refresh(fit=True)
         else:
             self._view.setHtml(html)
 
@@ -214,6 +220,30 @@ class GpsPathWidget(QWidget):
             )
         else:
             self.set_path(self.log, options=self.options, dark=self.dark, mode=self.map_mode)
+
+    def refresh_viewport(self, fit: bool = False) -> None:
+        if not self._web_engine or not hasattr(self, "_page"):
+            return
+        options = json.dumps({"fit": fit})
+        self._page.runJavaScript(f"window.sloppyGpsMap ? window.sloppyGpsMap.refresh({options}) : false;")
+
+    def _schedule_viewport_refresh(self, fit: bool = False) -> None:
+        if not self._web_engine:
+            return
+        for delay in (0, 150, 600):
+            QTimer.singleShot(delay, lambda fit=fit: self.refresh_viewport(fit=fit))
+
+    def _map_page_loaded(self, ok: bool) -> None:
+        if ok:
+            self._schedule_viewport_refresh(fit=True)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_viewport_refresh(fit=True)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._schedule_viewport_refresh(fit=False)
 
     def closeEvent(self, event) -> None:
         _remove_file(self._html_path)

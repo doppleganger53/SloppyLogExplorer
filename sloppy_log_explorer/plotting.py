@@ -6,7 +6,12 @@ import re
 import pandas as pd
 import plotly.graph_objects as go
 
-from .gps_map_renderer import OPENFREEMAP_STYLE_URL, build_gps_map_html as render_gps_map_html
+from .gps_map_renderer import (
+    MAP_MAX_ZOOM,
+    OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
+    OPENSTREETMAP_RASTER_TILE_URL,
+    build_gps_map_html as render_gps_map_html,
+)
 from .models import GpsGradientOptions, LoadedLog
 from .parser import relative_seconds
 
@@ -370,7 +375,9 @@ def _empty_gps_payload(message: str) -> dict[str, object]:
         "points": [],
         "segments": [],
         "legend": {"enabled": False},
-        "mapStyleUrl": OPENFREEMAP_STYLE_URL,
+        "mapMaxZoom": MAP_MAX_ZOOM,
+        "rasterTileUrls": [OPENSTREETMAP_RASTER_TILE_URL],
+        "rasterTileMaxZoom": OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
     }
 
 
@@ -523,7 +530,9 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
         "altitudeLabel": altitude_label,
-        "mapStyleUrl": OPENFREEMAP_STYLE_URL,
+        "mapMaxZoom": MAP_MAX_ZOOM,
+        "rasterTileUrls": [OPENSTREETMAP_RASTER_TILE_URL],
+        "rasterTileMaxZoom": OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
     }
 
 

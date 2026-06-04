@@ -16,13 +16,12 @@ No assets from `Ethos_LogView/img` are included in this repository. The implemen
 
 The feature target was the publicly documented behavior and screenshots for PhaedraDG's "Ethos log explorer" on itch.io, including model-organized browsing, graph inspection, compare mode, GPS path viewing, battery health history, SD-card sync, flight notes/video links, switch aliases, and voice-pack generation. No proprietary code or downloadable binary content from that tool is included.
 
-## MapLibre, OpenFreeMap, And OpenStreetMap
+## MapLibre And OpenStreetMap
 
-The flight map uses MapLibre GL JS 5.24.0, bundled in `sloppy_log_explorer/assets/maplibre/`, and OpenFreeMap's public Liberty style with OpenStreetMap-derived map data.
+The flight map uses MapLibre GL JS 5.24.0, bundled in `sloppy_log_explorer/assets/maplibre/`, and OpenStreetMap raster tiles for Qt WebEngine rendering reliability.
 
 - MapLibre GL JS: https://maplibre.org/maplibre-gl-js/docs/
 - License: BSD 3-Clause License
-- OpenFreeMap: https://openfreemap.org/
 - OpenStreetMap attribution: Tiles and map data copyright OpenStreetMap contributors
 
 The application does not use Google Maps, Mapbox, paid subscriptions, account signups, or API keys for the GPS visualization.

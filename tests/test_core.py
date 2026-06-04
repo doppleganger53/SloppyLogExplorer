@@ -201,7 +201,7 @@ def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) ->
     assert list(log.dataframe[log.gps_columns.longitude].head(2)) == pytest.approx([-75.0, -75.0005])
 
 
-def test_gps_map_html_uses_maplibre_openfreemap_without_api_keys(tmp_path: Path) -> None:
+def test_gps_map_html_uses_maplibre_openstreetmap_without_api_keys(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
     log = load_log(path)
@@ -212,14 +212,12 @@ def test_gps_map_html_uses_maplibre_openfreemap_without_api_keys(tmp_path: Path)
     assert "maplibre-gl-csp.js" in html
     assert "maplibre-gl-csp-worker.js" in html
     assert "maplibregl.workerUrl" in html
-    assert "https://tiles.openfreemap.org/styles/liberty" in html
-    assert "OpenFreeMap" in html
+    assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in html
     assert "OpenStreetMap contributors" in html
     forbidden = ["".join(parts) for parts in [
         ("Ces", "ium"),
         ("Leaf", "let"),
         ("leaf", "let"),
-        ("tile.", "openstreetmap", ".org"),
         ("Ion.", "defaultAccessToken"),
         ("createWorld", "Terrain"),
         ("createWorld", "Imagery"),
@@ -238,6 +236,9 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert payload["status"] == "ok"
     assert len(payload["points"]) == 9
     assert len(payload["segments"]) == len(payload["points"]) - 1
+    assert payload["mapMaxZoom"] == 17
+    assert payload["rasterTileMaxZoom"] == 19
+    assert payload["rasterTileUrls"] == ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"]
     assert 'const pathParts = Array.isArray(flightData.pathParts)' in html
     assert "function buildFlightGeoJson()" in html
     assert "pathParts.forEach((part, index) => {" in html
@@ -249,6 +250,12 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "flightData.segments.forEach((segment, index) => {" in html
     assert "const left = coordinateFromPoint(segment.left);" in html
     assert "const right = coordinateFromPoint(segment.right);" in html
+    assert 'id="flightOverlay"' in html
+    assert "function drawFlightOverlay()" in html
+    assert "function refreshMapViewport(options)" in html
+    assert "function addRasterFallbackLayer()" in html
+    assert 'id: "osm-raster-base"' in html
+    assert '"https://tile.openstreetmap.org/{z}/{x}/{y}.png"' in html
     assert 'id: "flight-segments"' in html
     assert '"line-color": ["get", "color"]' in html
     assert 'map.addSource("flight-markers"' in html
@@ -257,13 +264,16 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "let flightLayersAdded = false" in html
     assert "if (flightLayersAdded)" in html
     assert "flightLayersAdded = true" in html
-    assert 'maxZoom: 17' in html
+    assert "const mapMaxZoom = Number(flightData.mapMaxZoom) || 17;" in html
+    assert "maxZoom: mapMaxZoom" in html
     assert "map.fitBounds(flightBounds" in html
     assert 'map.once("style.load", revealFlightPath)' in html
     assert 'map.once("load", revealFlightPath)' in html
     assert "function applyMapMode(mode, options)" in html
     assert "map.dragRotate.enable()" in html
     assert "map.dragRotate.disable()" in html
+    assert "window.sloppyGpsMap" in html
+    assert "refresh: refreshMapViewport" in html
 
 
 def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None:
@@ -338,6 +348,27 @@ def test_gps_webengine_widget_loads_map_from_local_html_file(tmp_path: Path, mon
     html = html_path.read_text(encoding="utf-8")
     assert "maplibregl.Map" in html
     assert 'const initialMapMode = "2d";' in html
+
+
+def test_gps_webengine_widget_refreshes_map_viewport() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def runJavaScript(self, script: str, callback=None) -> None:
+            self.scripts.append(script)
+            if callback:
+                callback(True)
+
+    fake_widget = GpsPathWidget.__new__(GpsPathWidget)
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+
+    GpsPathWidget.refresh_viewport(fake_widget, fit=True)
+
+    assert fake_widget._page.scripts
+    assert "window.sloppyGpsMap.refresh" in fake_widget._page.scripts[-1]
+    assert '"fit": true' in fake_widget._page.scripts[-1]
 
 
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:

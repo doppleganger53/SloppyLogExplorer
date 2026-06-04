@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 
 MAPLIBRE_VERSION = "5.24.0"
-OPENFREEMAP_STYLE_URL = "https://tiles.openfreemap.org/styles/liberty"
+OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
+MAP_MAX_ZOOM = 17
 
 
 def normalize_map_mode(mode: str | None) -> str:
@@ -75,6 +77,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       width: 100%;
       height: 100%;
       background: __BACKGROUND__;
+    }
+    #flightOverlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 7;
+      pointer-events: none;
     }
     #legend {
       position: absolute;
@@ -166,6 +176,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
 </head>
 <body>
   <div id="map"></div>
+  <canvas id="flightOverlay" aria-hidden="true"></canvas>
   <div id="legend" hidden>
     <div id="legendTitle"></div>
     <div id="gradientBar"></div>
@@ -178,14 +189,17 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
   <div id="statusOverlay" hidden></div>
   <div id="mapModeBadge"></div>
   <div id="mapAttribution">
-    Map style by <a href="https://openfreemap.org/">OpenFreeMap</a> |
-    data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
+    Map tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
   </div>
   <script>
     maplibregl.workerUrl = __MAPLIBRE_WORKER_URI__;
     const flightData = __FLIGHT_DATA__;
     const initialMapMode = __MAP_MODE__;
-    const openFreeMapStyleUrl = "__OPENFREEMAP_STYLE_URL__";
+    const mapMaxZoom = Number(flightData.mapMaxZoom) || 17;
+    const rasterTileUrls = Array.isArray(flightData.rasterTileUrls) && flightData.rasterTileUrls.length
+      ? flightData.rasterTileUrls
+      : ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
+    const rasterTileMaxZoom = Number(flightData.rasterTileMaxZoom) || 19;
     const pathParts = Array.isArray(flightData.pathParts) && flightData.pathParts.length
       ? flightData.pathParts
       : [flightData.points];
@@ -197,12 +211,15 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
     const legendMax = document.getElementById("legendMax");
     const statusOverlay = document.getElementById("statusOverlay");
     const mapModeBadge = document.getElementById("mapModeBadge");
+    const flightOverlay = document.getElementById("flightOverlay");
+    const flightOverlayContext = flightOverlay ? flightOverlay.getContext("2d") : null;
     let statusHideTimer = null;
     let map = null;
     let activeMapMode = initialMapMode;
     let flightBounds = null;
     let initialBearing = 0;
     let flightLayersAdded = false;
+    let flightOverlayDrawQueued = false;
 
     function finiteNumber(value) {
       return Number.isFinite(Number(value));
@@ -380,6 +397,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       if (flightLayersAdded) {
         return;
       }
+      if (!map || !map.isStyleLoaded()) {
+        return;
+      }
       const geoJson = buildFlightGeoJson();
       map.addSource("flight-underlay-source", {
         type: "geojson",
@@ -454,13 +474,190 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       flightLayersAdded = true;
     }
 
+    function buildRasterBaseStyle() {
+      return {
+        version: 8,
+        sources: {
+          "osm-raster-source": {
+            type: "raster",
+            tiles: rasterTileUrls,
+            tileSize: 256,
+            minzoom: 0,
+            maxzoom: rasterTileMaxZoom,
+            attribution: "&copy; OpenStreetMap contributors"
+          }
+        },
+        layers: [
+          {
+            id: "background",
+            type: "background",
+            paint: { "background-color": "__BACKGROUND__" }
+          },
+          {
+            id: "osm-raster-base",
+            type: "raster",
+            source: "osm-raster-source",
+            paint: { "raster-opacity": 1 }
+          }
+        ]
+      };
+    }
+
+    function addRasterFallbackLayer() {
+      if (!map || !map.isStyleLoaded() || !rasterTileUrls.length || map.getSource("osm-raster-source")) {
+        return;
+      }
+      map.addSource("osm-raster-source", {
+        type: "raster",
+        tiles: rasterTileUrls,
+        tileSize: 256,
+        minzoom: 0,
+        maxzoom: rasterTileMaxZoom,
+        attribution: "&copy; OpenStreetMap contributors"
+      });
+      const styleLayers = (map.getStyle() && map.getStyle().layers) || [];
+      const beforeLayer = styleLayers.find((layer) => layer.id !== "background" && layer.id !== "osm-raster-base");
+      map.addLayer({
+        id: "osm-raster-base",
+        type: "raster",
+        source: "osm-raster-source",
+        paint: {
+          "raster-opacity": 0.9
+        }
+      }, beforeLayer ? beforeLayer.id : undefined);
+    }
+
+    function projectedPoint(point) {
+      const coordinate = coordinateFromPoint(point);
+      if (!coordinate || !map) {
+        return null;
+      }
+      const projected = map.project(coordinate);
+      if (!projected || !Number.isFinite(projected.x) || !Number.isFinite(projected.y)) {
+        return null;
+      }
+      return projected;
+    }
+
+    function resizeFlightOverlay() {
+      if (!flightOverlay || !flightOverlayContext || !map) {
+        return;
+      }
+      const rect = map.getContainer().getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(rect.width * dpr));
+      const height = Math.max(1, Math.round(rect.height * dpr));
+      if (flightOverlay.width !== width || flightOverlay.height !== height) {
+        flightOverlay.width = width;
+        flightOverlay.height = height;
+        flightOverlay.style.width = `${Math.max(1, rect.width)}px`;
+        flightOverlay.style.height = `${Math.max(1, rect.height)}px`;
+      }
+      flightOverlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function drawPathPart(part, color, width, alpha) {
+      if (!flightOverlayContext || !Array.isArray(part) || part.length < 2) {
+        return;
+      }
+      flightOverlayContext.beginPath();
+      let started = false;
+      part.forEach((point) => {
+        const projected = projectedPoint(point);
+        if (!projected) {
+          return;
+        }
+        if (!started) {
+          flightOverlayContext.moveTo(projected.x, projected.y);
+          started = true;
+        } else {
+          flightOverlayContext.lineTo(projected.x, projected.y);
+        }
+      });
+      if (!started) {
+        return;
+      }
+      flightOverlayContext.globalAlpha = alpha;
+      flightOverlayContext.strokeStyle = color;
+      flightOverlayContext.lineWidth = width;
+      flightOverlayContext.lineCap = "round";
+      flightOverlayContext.lineJoin = "round";
+      flightOverlayContext.stroke();
+      flightOverlayContext.globalAlpha = 1;
+    }
+
+    function drawSegment(segment) {
+      if (!flightOverlayContext || !segment) {
+        return;
+      }
+      const left = projectedPoint(segment.left);
+      const right = projectedPoint(segment.right);
+      if (!left || !right) {
+        return;
+      }
+      flightOverlayContext.beginPath();
+      flightOverlayContext.moveTo(left.x, left.y);
+      flightOverlayContext.lineTo(right.x, right.y);
+      flightOverlayContext.strokeStyle = segment.color || "#55d977";
+      flightOverlayContext.lineWidth = 6;
+      flightOverlayContext.lineCap = "round";
+      flightOverlayContext.stroke();
+    }
+
+    function drawMarker(point, label, color) {
+      if (!flightOverlayContext) {
+        return;
+      }
+      const projected = projectedPoint(point);
+      if (!projected) {
+        return;
+      }
+      flightOverlayContext.beginPath();
+      flightOverlayContext.arc(projected.x, projected.y, 7, 0, Math.PI * 2);
+      flightOverlayContext.fillStyle = color;
+      flightOverlayContext.fill();
+      flightOverlayContext.lineWidth = 2;
+      flightOverlayContext.strokeStyle = "#ffffff";
+      flightOverlayContext.stroke();
+      flightOverlayContext.font = "700 13px Arial, sans-serif";
+      flightOverlayContext.textAlign = "center";
+      flightOverlayContext.textBaseline = "bottom";
+      flightOverlayContext.lineWidth = 4;
+      flightOverlayContext.strokeStyle = "#111827";
+      flightOverlayContext.strokeText(label, projected.x, projected.y - 11);
+      flightOverlayContext.fillStyle = "#ffffff";
+      flightOverlayContext.fillText(label, projected.x, projected.y - 11);
+    }
+
+    function drawFlightOverlay() {
+      flightOverlayDrawQueued = false;
+      if (!flightOverlay || !flightOverlayContext || !map) {
+        return;
+      }
+      resizeFlightOverlay();
+      const rect = map.getContainer().getBoundingClientRect();
+      flightOverlayContext.clearRect(0, 0, rect.width, rect.height);
+      pathParts.forEach((part) => drawPathPart(part, "#ffffff", 10, 0.82));
+      flightData.segments.forEach(drawSegment);
+      drawMarker(flightData.points[0], "Start", "#27ae60");
+      drawMarker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
+    }
+
+    function scheduleFlightOverlayDraw() {
+      if (flightOverlayDrawQueued) {
+        return;
+      }
+      flightOverlayDrawQueued = true;
+      window.requestAnimationFrame(drawFlightOverlay);
+    }
+
     function fitFlightBounds() {
       if (!flightBounds) {
         return;
       }
       map.fitBounds(flightBounds, {
         padding: 52,
-        maxZoom: 17,
+        maxZoom: mapMaxZoom,
         duration: 0
       });
     }
@@ -494,6 +691,28 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       return activeMapMode;
     }
 
+    function refreshMapViewport(options) {
+      if (!map) {
+        return false;
+      }
+      map.resize();
+      if (options && options.fit) {
+        fitFlightBounds();
+      }
+      scheduleFlightOverlayDraw();
+      if (typeof map.triggerRepaint === "function") {
+        map.triggerRepaint();
+      }
+      window.requestAnimationFrame(() => {
+        map.resize();
+        scheduleFlightOverlayDraw();
+        if (typeof map.triggerRepaint === "function") {
+          map.triggerRepaint();
+        }
+      });
+      return true;
+    }
+
     function initMapLibreFlightMap() {
       if (!window.maplibregl) {
         throw new Error("MapLibre library failed to load");
@@ -505,43 +724,61 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       const center = coordinateFromPoint(startPoint) || [-75, 39];
       map = new maplibregl.Map({
         container: "map",
-        style: flightData.mapStyleUrl || openFreeMapStyleUrl,
+        style: buildRasterBaseStyle(),
         center,
         zoom: 13,
-        maxZoom: 17,
+        maxZoom: mapMaxZoom,
         pitch: activeMapMode === "3d" ? 60 : 0,
         bearing: activeMapMode === "3d" ? initialBearing : 0,
-        attributionControl: false
+        attributionControl: false,
+        trackResize: true
       });
+      window.__sloppyDebugMap = map;
       map.addControl(new maplibregl.NavigationControl({
         visualizePitch: true
       }), "top-right");
       map.addControl(new maplibregl.AttributionControl({
         compact: true,
-        customAttribution: '<a href="https://openfreemap.org/">OpenFreeMap</a>'
+        customAttribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
       }), "bottom-right");
 
       map.on("error", (event) => {
         const details = event && event.error && (event.error.message || String(event.error));
         setStatus("Map render error" + (details ? ": " + details : ""), "error");
+        scheduleFlightOverlayDraw();
+      });
+      ["move", "zoom", "rotate", "pitch", "resize"].forEach((eventName) => {
+        map.on(eventName, scheduleFlightOverlayDraw);
       });
 
       const revealFlightPath = () => {
-        addFlightLayers();
-        renderLegend();
-        fitFlightBounds();
-        applyMapMode(activeMapMode, { duration: 0 });
-        transientStatus("Map ready", "ok", 1200);
+        try {
+          addRasterFallbackLayer();
+          addFlightLayers();
+          renderLegend();
+          fitFlightBounds();
+          applyMapMode(activeMapMode, { duration: 0 });
+          refreshMapViewport();
+          transientStatus("Map ready", "ok", 1200);
+        } catch (error) {
+          const details = error && error.message ? error.message : String(error);
+          setStatus("Map render error: " + details, "error");
+          scheduleFlightOverlayDraw();
+        }
       };
       map.once("style.load", revealFlightPath);
       map.once("load", revealFlightPath);
       applyMapMode(activeMapMode, { duration: 0 });
+      refreshMapViewport({ fit: true });
+      window.setTimeout(() => refreshMapViewport({ fit: true }), 250);
+      window.setTimeout(() => refreshMapViewport({ fit: true }), 1000);
     }
 
     window.sloppyGpsMap = {
       setMode: applyMapMode,
       mode: () => activeMapMode,
-      fit: fitFlightBounds
+      fit: fitFlightBounds,
+      refresh: refreshMapViewport
     };
 
     try {
@@ -561,7 +798,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__FLIGHT_DATA__": data_json,
         "__MAP_MODE__": mode_json,
-        "__OPENFREEMAP_STYLE_URL__": OPENFREEMAP_STYLE_URL,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,
