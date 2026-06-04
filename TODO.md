@@ -2,8 +2,8 @@
 
 ## flightpath vis
 
-- Fix out of bounds gps start and end
-- 3d map view impl and selectable mode
+- Fix out of bounds gps start and end (in progress)
+- 3d map view impl and selectable 2d/3d mode MapLibre/OpenFreeMap (in progress)
 
 ## new zoom-linked views
 
@@ -16,3 +16,4 @@
 - sortable file list
 - telemetry view drag mode defaults to zoom
 - multi-axis view fix: ![!\[alt text\](image.png)](validation_artifacts/image.png)
+- build: single self-contained executable - minimize size of single-file package
