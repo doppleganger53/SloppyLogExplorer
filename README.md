@@ -9,7 +9,7 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 - Select telemetry parameters and view a native multi-series telemetry graph.
 - Click the graph or use left/right arrow keys in the graph to inspect telemetry values in the cursor panel.
 - Load a comparison flight and view matching parameter deltas.
-- View detected GPS latitude/longitude/altitude on a MapLibre/OpenStreetMap flight map with 3D and 2D camera modes.
+- View detected GPS latitude/longitude/altitude on a 3D MapLibre/OpenStreetMap flight map.
 - Color the GPS flight path by any numeric telemetry parameter with custom start/end colors and range controls.
 - Store flight notes and link a local video file to each flight.
 - Register batteries, calculate pack and per-cell internal resistance from voltage/current logs, and retain health history.

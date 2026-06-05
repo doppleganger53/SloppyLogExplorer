@@ -250,10 +250,7 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "flightData.segments.forEach((segment, index) => {" in html
     assert "const left = coordinateFromPoint(segment.left);" in html
     assert "const right = coordinateFromPoint(segment.right);" in html
-    assert 'id="flightOverlay"' in html
-    assert "function drawFlightOverlay()" in html
     assert "function refreshMapViewport(options)" in html
-    assert "function addRasterFallbackLayer()" in html
     assert 'id: "osm-raster-base"' in html
     assert '"https://tile.openstreetmap.org/{z}/{x}/{y}.png"' in html
     assert 'id: "flight-segments"' in html
@@ -269,11 +266,19 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "map.fitBounds(flightBounds" in html
     assert 'map.once("style.load", revealFlightPath)' in html
     assert 'map.once("load", revealFlightPath)' in html
-    assert "function applyMapMode(mode, options)" in html
+    assert "pitch: 60" in html
+    assert "bearing: initialBearing" in html
     assert "map.dragRotate.enable()" in html
-    assert "map.dragRotate.disable()" in html
+    assert "map.touchZoomRotate.enableRotation()" in html
     assert "window.sloppyGpsMap" in html
+    assert "fit: fitFlightBounds" in html
     assert "refresh: refreshMapViewport" in html
+    assert 'id="flightOverlay"' not in html
+    assert "function drawFlightOverlay()" not in html
+    assert "function addRasterFallbackLayer()" not in html
+    assert "function applyMapMode(mode, options)" not in html
+    assert "map.dragRotate.disable()" not in html
+    assert "window.sloppyGpsMap.setMode" not in html
 
 
 def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None:
@@ -337,17 +342,16 @@ def test_gps_webengine_widget_loads_map_from_local_html_file(tmp_path: Path, mon
 
     monkeypatch.setattr("sloppy_log_explorer.qt_plot.app_data_dir", lambda: tmp_path)
 
-    GpsPathWidget.set_path(fake_widget, log, mode="2d")
+    GpsPathWidget.set_path(fake_widget, log)
 
     assert fake_view.html is None
     assert fake_view.url is not None
-    assert fake_widget.map_mode == "2d"
     assert not previous_path.exists()
     html_path = Path(fake_view.url.toLocalFile())
     assert html_path.exists()
     html = html_path.read_text(encoding="utf-8")
     assert "maplibregl.Map" in html
-    assert 'const initialMapMode = "2d";' in html
+    assert "initialMapMode" not in html
 
 
 def test_gps_webengine_widget_refreshes_map_viewport() -> None:
@@ -612,7 +616,7 @@ def test_gps_color_selector_uses_all_numeric_parameters(tmp_path: Path, monkeypa
     app.quit()
 
 
-def test_gps_mode_selector_propagates_to_map_widget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gps_tab_has_no_map_mode_selector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_root = tmp_path / "appdata"
     monkeypatch.setenv("APPDATA", str(app_root))
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -622,24 +626,15 @@ def test_gps_mode_selector_propagates_to_map_widget(tmp_path: Path, monkeypatch:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
 
-    assert window.gps_map_mode == "3d"
-    assert window.gps_view.map_mode == "3d"
-    assert window.gps_3d_button.isChecked()
-    assert not window.gps_2d_button.isChecked()
+    assert not hasattr(window, "gps_map_mode")
+    assert not hasattr(window, "gps_3d_button")
+    assert not hasattr(window, "gps_2d_button")
+    assert not hasattr(window, "set_gps_map_mode")
+    assert not hasattr(window.gps_view, "map_mode")
+    assert not hasattr(window.gps_view, "set_mode")
 
-    window.set_gps_map_mode("2d")
+    window.refresh_gps()
 
-    assert window.gps_map_mode == "2d"
-    assert window.gps_view.map_mode == "2d"
-    assert not window.gps_3d_button.isChecked()
-    assert window.gps_2d_button.isChecked()
-
-    window.set_gps_map_mode("3d")
-
-    assert window.gps_map_mode == "3d"
-    assert window.gps_view.map_mode == "3d"
-    assert window.gps_3d_button.isChecked()
-    assert not window.gps_2d_button.isChecked()
     window.close()
     app.quit()
 

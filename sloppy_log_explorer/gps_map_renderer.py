@@ -10,10 +10,6 @@ OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
 MAP_MAX_ZOOM = 17
 
 
-def normalize_map_mode(mode: str | None) -> str:
-    return "2d" if str(mode or "").lower() == "2d" else "3d"
-
-
 def _asset_uri(filename: str) -> str:
     asset_path = Path(__file__).resolve().parent / "assets" / "maplibre" / filename
     return asset_path.as_uri()
@@ -36,7 +32,7 @@ def _gps_message_html(message: str, dark: bool) -> str:
 """
 
 
-def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str = "3d") -> str:
+def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     if payload.get("status") != "ok":
         return _gps_message_html(str(payload.get("message") or "No GPS path to display."), dark)
 
@@ -48,7 +44,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
     js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
     worker_uri_json = json.dumps(_asset_uri("maplibre-gl-csp-worker.js"))
     data_json = json.dumps(payload, allow_nan=False)
-    mode_json = json.dumps(normalize_map_mode(mode))
 
     document = """
 <!doctype html>
@@ -77,14 +72,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       width: 100%;
       height: 100%;
       background: __BACKGROUND__;
-    }
-    #flightOverlay {
-      position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      z-index: 7;
-      pointer-events: none;
     }
     #legend {
       position: absolute;
@@ -119,8 +106,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       justify-content: space-between;
       gap: 8px;
     }
-    #statusOverlay,
-    #mapModeBadge {
+    #statusOverlay {
       position: absolute;
       z-index: 12;
       font-size: 11px;
@@ -135,18 +121,10 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-    }
-    #statusOverlay {
       left: 8px;
       top: 8px;
       min-width: 160px;
       max-width: 360px;
-    }
-    #mapModeBadge {
-      right: 48px;
-      top: 8px;
-      font-weight: 700;
-      letter-spacing: 0;
     }
     #statusOverlay[data-kind="error"] {
       border-color: rgba(239,68,68,0.85);
@@ -176,7 +154,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
 </head>
 <body>
   <div id="map"></div>
-  <canvas id="flightOverlay" aria-hidden="true"></canvas>
   <div id="legend" hidden>
     <div id="legendTitle"></div>
     <div id="gradientBar"></div>
@@ -187,14 +164,12 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
     </div>
   </div>
   <div id="statusOverlay" hidden></div>
-  <div id="mapModeBadge"></div>
   <div id="mapAttribution">
     Map tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
   </div>
   <script>
     maplibregl.workerUrl = __MAPLIBRE_WORKER_URI__;
     const flightData = __FLIGHT_DATA__;
-    const initialMapMode = __MAP_MODE__;
     const mapMaxZoom = Number(flightData.mapMaxZoom) || 17;
     const rasterTileUrls = Array.isArray(flightData.rasterTileUrls) && flightData.rasterTileUrls.length
       ? flightData.rasterTileUrls
@@ -210,16 +185,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
     const legendMid = document.getElementById("legendMid");
     const legendMax = document.getElementById("legendMax");
     const statusOverlay = document.getElementById("statusOverlay");
-    const mapModeBadge = document.getElementById("mapModeBadge");
-    const flightOverlay = document.getElementById("flightOverlay");
-    const flightOverlayContext = flightOverlay ? flightOverlay.getContext("2d") : null;
     let statusHideTimer = null;
     let map = null;
-    let activeMapMode = initialMapMode;
     let flightBounds = null;
     let initialBearing = 0;
     let flightLayersAdded = false;
-    let flightOverlayDrawQueued = false;
 
     function finiteNumber(value) {
       return Number.isFinite(Number(value));
@@ -503,154 +473,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       };
     }
 
-    function addRasterFallbackLayer() {
-      if (!map || !map.isStyleLoaded() || !rasterTileUrls.length || map.getSource("osm-raster-source")) {
-        return;
-      }
-      map.addSource("osm-raster-source", {
-        type: "raster",
-        tiles: rasterTileUrls,
-        tileSize: 256,
-        minzoom: 0,
-        maxzoom: rasterTileMaxZoom,
-        attribution: "&copy; OpenStreetMap contributors"
-      });
-      const styleLayers = (map.getStyle() && map.getStyle().layers) || [];
-      const beforeLayer = styleLayers.find((layer) => layer.id !== "background" && layer.id !== "osm-raster-base");
-      map.addLayer({
-        id: "osm-raster-base",
-        type: "raster",
-        source: "osm-raster-source",
-        paint: {
-          "raster-opacity": 0.9
-        }
-      }, beforeLayer ? beforeLayer.id : undefined);
-    }
-
-    function projectedPoint(point) {
-      const coordinate = coordinateFromPoint(point);
-      if (!coordinate || !map) {
-        return null;
-      }
-      const projected = map.project(coordinate);
-      if (!projected || !Number.isFinite(projected.x) || !Number.isFinite(projected.y)) {
-        return null;
-      }
-      return projected;
-    }
-
-    function resizeFlightOverlay() {
-      if (!flightOverlay || !flightOverlayContext || !map) {
-        return;
-      }
-      const rect = map.getContainer().getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const width = Math.max(1, Math.round(rect.width * dpr));
-      const height = Math.max(1, Math.round(rect.height * dpr));
-      if (flightOverlay.width !== width || flightOverlay.height !== height) {
-        flightOverlay.width = width;
-        flightOverlay.height = height;
-        flightOverlay.style.width = `${Math.max(1, rect.width)}px`;
-        flightOverlay.style.height = `${Math.max(1, rect.height)}px`;
-      }
-      flightOverlayContext.setTransform(dpr, 0, 0, dpr, 0, 0);
-    }
-
-    function drawPathPart(part, color, width, alpha) {
-      if (!flightOverlayContext || !Array.isArray(part) || part.length < 2) {
-        return;
-      }
-      flightOverlayContext.beginPath();
-      let started = false;
-      part.forEach((point) => {
-        const projected = projectedPoint(point);
-        if (!projected) {
-          return;
-        }
-        if (!started) {
-          flightOverlayContext.moveTo(projected.x, projected.y);
-          started = true;
-        } else {
-          flightOverlayContext.lineTo(projected.x, projected.y);
-        }
-      });
-      if (!started) {
-        return;
-      }
-      flightOverlayContext.globalAlpha = alpha;
-      flightOverlayContext.strokeStyle = color;
-      flightOverlayContext.lineWidth = width;
-      flightOverlayContext.lineCap = "round";
-      flightOverlayContext.lineJoin = "round";
-      flightOverlayContext.stroke();
-      flightOverlayContext.globalAlpha = 1;
-    }
-
-    function drawSegment(segment) {
-      if (!flightOverlayContext || !segment) {
-        return;
-      }
-      const left = projectedPoint(segment.left);
-      const right = projectedPoint(segment.right);
-      if (!left || !right) {
-        return;
-      }
-      flightOverlayContext.beginPath();
-      flightOverlayContext.moveTo(left.x, left.y);
-      flightOverlayContext.lineTo(right.x, right.y);
-      flightOverlayContext.strokeStyle = segment.color || "#55d977";
-      flightOverlayContext.lineWidth = 6;
-      flightOverlayContext.lineCap = "round";
-      flightOverlayContext.stroke();
-    }
-
-    function drawMarker(point, label, color) {
-      if (!flightOverlayContext) {
-        return;
-      }
-      const projected = projectedPoint(point);
-      if (!projected) {
-        return;
-      }
-      flightOverlayContext.beginPath();
-      flightOverlayContext.arc(projected.x, projected.y, 7, 0, Math.PI * 2);
-      flightOverlayContext.fillStyle = color;
-      flightOverlayContext.fill();
-      flightOverlayContext.lineWidth = 2;
-      flightOverlayContext.strokeStyle = "#ffffff";
-      flightOverlayContext.stroke();
-      flightOverlayContext.font = "700 13px Arial, sans-serif";
-      flightOverlayContext.textAlign = "center";
-      flightOverlayContext.textBaseline = "bottom";
-      flightOverlayContext.lineWidth = 4;
-      flightOverlayContext.strokeStyle = "#111827";
-      flightOverlayContext.strokeText(label, projected.x, projected.y - 11);
-      flightOverlayContext.fillStyle = "#ffffff";
-      flightOverlayContext.fillText(label, projected.x, projected.y - 11);
-    }
-
-    function drawFlightOverlay() {
-      flightOverlayDrawQueued = false;
-      if (!flightOverlay || !flightOverlayContext || !map) {
-        return;
-      }
-      resizeFlightOverlay();
-      const rect = map.getContainer().getBoundingClientRect();
-      flightOverlayContext.clearRect(0, 0, rect.width, rect.height);
-      pathParts.forEach((part) => drawPathPart(part, "#ffffff", 10, 0.82));
-      flightData.segments.forEach(drawSegment);
-      drawMarker(flightData.points[0], "Start", "#27ae60");
-      drawMarker(flightData.points[flightData.points.length - 1], "End", "#eb5757");
-    }
-
-    function scheduleFlightOverlayDraw() {
-      if (flightOverlayDrawQueued) {
-        return;
-      }
-      flightOverlayDrawQueued = true;
-      window.requestAnimationFrame(drawFlightOverlay);
-    }
-
     function fitFlightBounds() {
       if (!flightBounds) {
         return;
@@ -662,35 +484,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       });
     }
 
-    function applyMapMode(mode, options) {
-      activeMapMode = mode === "2d" ? "2d" : "3d";
-      if (mapModeBadge) {
-        mapModeBadge.textContent = activeMapMode === "3d" ? "3D" : "2D";
-      }
-      if (!map) {
-        return activeMapMode;
-      }
-      const duration = options && Number.isFinite(options.duration) ? options.duration : 450;
-      if (activeMapMode === "3d") {
-        map.dragRotate.enable();
-        map.touchZoomRotate.enableRotation();
-        map.easeTo({
-          pitch: 60,
-          bearing: initialBearing,
-          duration
-        });
-      } else {
-        map.dragRotate.disable();
-        map.touchZoomRotate.disableRotation();
-        map.easeTo({
-          pitch: 0,
-          bearing: 0,
-          duration
-        });
-      }
-      return activeMapMode;
-    }
-
     function refreshMapViewport(options) {
       if (!map) {
         return false;
@@ -699,13 +492,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       if (options && options.fit) {
         fitFlightBounds();
       }
-      scheduleFlightOverlayDraw();
       if (typeof map.triggerRepaint === "function") {
         map.triggerRepaint();
       }
       window.requestAnimationFrame(() => {
         map.resize();
-        scheduleFlightOverlayDraw();
         if (typeof map.triggerRepaint === "function") {
           map.triggerRepaint();
         }
@@ -728,12 +519,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
         center,
         zoom: 13,
         maxZoom: mapMaxZoom,
-        pitch: activeMapMode === "3d" ? 60 : 0,
-        bearing: activeMapMode === "3d" ? initialBearing : 0,
+        pitch: 60,
+        bearing: initialBearing,
         attributionControl: false,
         trackResize: true
       });
       window.__sloppyDebugMap = map;
+      map.dragRotate.enable();
+      map.touchZoomRotate.enableRotation();
       map.addControl(new maplibregl.NavigationControl({
         visualizePitch: true
       }), "top-right");
@@ -745,38 +538,28 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
       map.on("error", (event) => {
         const details = event && event.error && (event.error.message || String(event.error));
         setStatus("Map render error" + (details ? ": " + details : ""), "error");
-        scheduleFlightOverlayDraw();
-      });
-      ["move", "zoom", "rotate", "pitch", "resize"].forEach((eventName) => {
-        map.on(eventName, scheduleFlightOverlayDraw);
       });
 
       const revealFlightPath = () => {
         try {
-          addRasterFallbackLayer();
           addFlightLayers();
           renderLegend();
           fitFlightBounds();
-          applyMapMode(activeMapMode, { duration: 0 });
           refreshMapViewport();
           transientStatus("Map ready", "ok", 1200);
         } catch (error) {
           const details = error && error.message ? error.message : String(error);
           setStatus("Map render error: " + details, "error");
-          scheduleFlightOverlayDraw();
         }
       };
       map.once("style.load", revealFlightPath);
       map.once("load", revealFlightPath);
-      applyMapMode(activeMapMode, { duration: 0 });
       refreshMapViewport({ fit: true });
       window.setTimeout(() => refreshMapViewport({ fit: true }), 250);
       window.setTimeout(() => refreshMapViewport({ fit: true }), 1000);
     }
 
     window.sloppyGpsMap = {
-      setMode: applyMapMode,
-      mode: () => activeMapMode,
       fit: fitFlightBounds,
       refresh: refreshMapViewport
     };
@@ -797,7 +580,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True, mode: str 
         "__MAPLIBRE_JS_URI__": js_uri,
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__FLIGHT_DATA__": data_json,
-        "__MAP_MODE__": mode_json,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,

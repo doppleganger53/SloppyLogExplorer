@@ -11,7 +11,6 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineS
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
-from .gps_map_renderer import normalize_map_mode
 from .models import GpsGradientOptions, LoadedLog
 from .plotting import build_gps_map_html, build_telemetry_figure, figure_html
 from .storage import app_data_dir
@@ -168,7 +167,6 @@ class GpsPathWidget(QWidget):
         self.log: LoadedLog | None = None
         self.options = GpsGradientOptions()
         self.dark = True
-        self.map_mode = "3d"
         self._html_path: Path | None = None
         self.setMinimumHeight(420)
         layout = QVBoxLayout(self)
@@ -191,13 +189,11 @@ class GpsPathWidget(QWidget):
         log: LoadedLog | None,
         options: GpsGradientOptions | None = None,
         dark: bool = True,
-        mode: str | None = None,
     ) -> None:
         self.log = log
         self.options = options or GpsGradientOptions()
         self.dark = dark
-        self.map_mode = normalize_map_mode(mode or getattr(self, "map_mode", "3d"))
-        html = build_gps_map_html(log, options=self.options, dark=dark, mode=self.map_mode)
+        html = build_gps_map_html(log, options=self.options, dark=dark)
         if self._web_engine:
             previous_path = self._html_path
             self._html_path = _write_temp_html(html, "gps-map-")
@@ -206,20 +202,6 @@ class GpsPathWidget(QWidget):
             self._schedule_viewport_refresh(fit=True)
         else:
             self._view.setHtml(html)
-
-    def set_mode(self, mode: str) -> None:
-        self.map_mode = normalize_map_mode(mode)
-        if self._web_engine and hasattr(self, "_page"):
-            mode_json = json.dumps(self.map_mode)
-            script = f"window.sloppyGpsMap ? (window.sloppyGpsMap.setMode({mode_json}), true) : false;"
-            self._page.runJavaScript(
-                script,
-                lambda applied: None
-                if applied
-                else self.set_path(self.log, options=self.options, dark=self.dark, mode=self.map_mode),
-            )
-        else:
-            self.set_path(self.log, options=self.options, dark=self.dark, mode=self.map_mode)
 
     def refresh_viewport(self, fit: bool = False) -> None:
         if not self._web_engine or not hasattr(self, "_page"):

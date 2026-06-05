@@ -540,10 +540,9 @@ def build_gps_map_html(
     log: LoadedLog | None,
     options: GpsGradientOptions | None = None,
     dark: bool = True,
-    mode: str = "3d",
 ) -> str:
     payload = build_gps_map_payload(log, options)
-    return render_gps_map_html(payload, dark=dark, mode=mode)
+    return render_gps_map_html(payload, dark=dark)
 
 
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:

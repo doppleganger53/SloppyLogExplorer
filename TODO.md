@@ -3,8 +3,7 @@
 ## flightpath vis
 
 - need raster / imagry tile source
-- 3d flightpath vis not displayed on 2d map
-- remove 2D map fallbacks / selectability once 3dmap is stable
+- 3d flightpath vis still needs debugging
 
 ## new zoom-linked views
 
@@ -17,4 +16,4 @@
 - sortable file list
 - telemetry view drag mode defaults to zoom
 - multi-axis view fix: ![!\[alt text\](image.png)](validation_artifacts/image.png)
-- build: single self-contained executable - minimize size of single-file package or installer package with map caching
+- build: investigate debug vs minimal PyInstaller targets and reduce `_internal` size using `prompts/build-size-and-targets-investigation.md`
