@@ -7,7 +7,11 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from .gps_map_renderer import (
+    ALTITUDE_EXAGGERATION,
+    ALTITUDE_FLOOR_METERS,
+    MAP_FIT_MAX_ZOOM,
     MAP_MAX_ZOOM,
+    MAP_MAX_PITCH,
     OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
     OPENSTREETMAP_RASTER_TILE_URL,
     build_gps_map_html as render_gps_map_html,
@@ -375,7 +379,13 @@ def _empty_gps_payload(message: str) -> dict[str, object]:
         "points": [],
         "segments": [],
         "legend": {"enabled": False},
+        "altitudeLabel": "Altitude",
+        "altitudeStats": {"label": "Altitude", "minimum": None, "maximum": None, "baseMeters": 0.0},
+        "altitudeScale": ALTITUDE_EXAGGERATION,
+        "altitudeFloorMeters": ALTITUDE_FLOOR_METERS,
         "mapMaxZoom": MAP_MAX_ZOOM,
+        "mapFitMaxZoom": MAP_FIT_MAX_ZOOM,
+        "mapMaxPitch": MAP_MAX_PITCH,
         "rasterTileUrls": [OPENSTREETMAP_RASTER_TILE_URL],
         "rasterTileMaxZoom": OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
     }
@@ -520,6 +530,10 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             "highColor": high_color,
         }
 
+    valid_altitudes = [float(point["alt"]) for point in points if _is_finite_number(point.get("alt"))]
+    altitude_minimum = min(valid_altitudes) if valid_altitudes else 0.0
+    altitude_maximum = max(valid_altitudes) if valid_altitudes else 0.0
+
     return {
         "status": "ok",
         "message": "",
@@ -530,7 +544,17 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
         "altitudeLabel": altitude_label,
+        "altitudeStats": {
+            "label": altitude_label,
+            "minimum": altitude_minimum,
+            "maximum": altitude_maximum,
+            "baseMeters": altitude_minimum,
+        },
+        "altitudeScale": ALTITUDE_EXAGGERATION,
+        "altitudeFloorMeters": ALTITUDE_FLOOR_METERS,
         "mapMaxZoom": MAP_MAX_ZOOM,
+        "mapFitMaxZoom": MAP_FIT_MAX_ZOOM,
+        "mapMaxPitch": MAP_MAX_PITCH,
         "rasterTileUrls": [OPENSTREETMAP_RASTER_TILE_URL],
         "rasterTileMaxZoom": OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
     }

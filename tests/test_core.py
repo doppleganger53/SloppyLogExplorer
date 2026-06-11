@@ -50,6 +50,20 @@ def write_coordinate_sample(path: Path) -> None:
     )
 
 
+def write_coordinate_sample_with_separate_altitude(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS,GPS alt(m)",
+                '2026-01-01,12:00:00,"39.0000,-75.0000",100',
+                '2026-01-01,12:00:01,"39.0005,-75.0005",105',
+                '2026-01-01,12:00:02,"39.0010,-75.0010",112',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_split_coordinate_sample(path: Path) -> None:
     path.write_text(
         "\n".join(
@@ -167,6 +181,24 @@ def test_load_log_detects_coordinate_string_gps_under_single_heading(tmp_path: P
     assert fig.layout.scene.zaxis.title.text == "GPS (alt)"
 
 
+def test_load_log_pairs_coordinate_string_gps_with_separate_gps_altitude(tmp_path: Path) -> None:
+    path = tmp_path / "string_gps_external_alt.csv"
+    write_coordinate_sample_with_separate_altitude(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "GPS (lat)"
+    assert log.gps_columns.longitude_label == "GPS (lon)"
+    assert log.gps_columns.altitude == "GPS alt(m)"
+    assert log.gps_columns.altitude_label == "GPS alt(m)"
+
+    payload = build_gps_map_payload(log)
+    assert payload["altitudeLabel"] == "GPS alt(m)"
+    assert [point["alt"] for point in payload["points"][:3]] == pytest.approx([100.0, 105.0, 112.0])
+
+
 def test_load_log_detects_split_coordinate_columns_with_arbitrary_headings(tmp_path: Path) -> None:
     path = tmp_path / "split_gps.csv"
     write_split_coordinate_sample(path)
@@ -236,7 +268,18 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert payload["status"] == "ok"
     assert len(payload["points"]) == 9
     assert len(payload["segments"]) == len(payload["points"]) - 1
-    assert payload["mapMaxZoom"] == 17
+    assert payload["altitudeLabel"] == "Alt(m)"
+    assert payload["altitudeStats"] == {
+        "label": "Alt(m)",
+        "minimum": 10.0,
+        "maximum": 26.0,
+        "baseMeters": 10.0,
+    }
+    assert payload["altitudeScale"] == 5.0
+    assert payload["altitudeFloorMeters"] == 12.0
+    assert payload["mapMaxZoom"] == 19
+    assert payload["mapFitMaxZoom"] == 17
+    assert payload["mapMaxPitch"] == 85
     assert payload["rasterTileMaxZoom"] == 19
     assert payload["rasterTileUrls"] == ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"]
     assert 'const pathParts = Array.isArray(flightData.pathParts)' in html
@@ -245,40 +288,78 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "coordinatesFromPart(part)" in html
     assert 'id: "flight-underlay"' in html
     assert 'source: "flight-underlay-source"' in html
-    assert '"line-color": "#ffffff"' in html
-    assert '"line-opacity": 0.82' in html
+    assert '"line-color": "#111827"' in html
+    assert '"line-opacity": 0.16' in html
     assert "flightData.segments.forEach((segment, index) => {" in html
     assert "const left = coordinateFromPoint(segment.left);" in html
     assert "const right = coordinateFromPoint(segment.right);" in html
+    assert 'id="flightCanvas"' in html
+    assert "const flightCanvas = document.getElementById(\"flightCanvas\");" in html
+    assert "canvasPathReady" in html
+    assert "function drawFlightCanvas()" in html
+    assert "map.project(coordinate)" in html
+    assert "[\"move\", \"zoom\", \"rotate\", \"pitch\", \"resize\", \"render\"]" in html
+    assert "const altitudeStats = flightData.altitudeStats || {};" in html
+    assert "function altitudeRenderMeters(point)" in html
+    assert "function buildElevationRenderData()" in html
+    assert "function matrixForUniform(renderArgs)" in html
+    assert "renderArgs.modelViewProjectionMatrix" in html
+    assert "maplibregl.MercatorCoordinate.fromLngLat" in html
+    assert "function mercatorCoordinate(point, altitudeMeters)" in html
+    assert "function setCameraMode(mode, options)" in html
+    assert "addRibbonQuad(ribbonPositions, ribbonColors" in html
+    assert "gl.drawArrays(gl.TRIANGLES, 0, vertexCount)" in html
+    assert "gl.disable(gl.DEPTH_TEST)" in html
+    assert 'id: "flight-elevation-layer"' in html
+    assert 'id: "flight-extrusions"' in html
+    assert 'type: "fill-extrusion"' in html
+    assert '"fill-extrusion-height": ["get", "height"]' in html
+    assert 'renderingMode: "3d"' in html
+    assert "extrusionLayerReady" in html
+    assert "native3dPathReady: extrusionLayerReady" in html
+    assert "elevationLayerReady" in html
+    assert "webglPathReady: elevationLayerReady" in html
+    assert "ribbonVertexCount" in html
+    assert "window.__sloppyDebugMapState = state" in html
+    assert "document.body.dataset.mapState = state.state" in html
     assert "function refreshMapViewport(options)" in html
+    assert 'id="cameraControls"' in html
+    assert 'data-camera-mode="ground"' in html
     assert 'id: "osm-raster-base"' in html
     assert '"https://tile.openstreetmap.org/{z}/{x}/{y}.png"' in html
     assert 'id: "flight-segments"' in html
+    assert 'map.addSource("flight-extrusions-source"' in html
     assert '"line-color": ["get", "color"]' in html
+    assert '"line-opacity": 0.22' in html
     assert 'map.addSource("flight-markers"' in html
     assert 'id: "flight-marker-circles"' in html
     assert 'id: "flight-marker-labels"' in html
     assert "let flightLayersAdded = false" in html
     assert "if (flightLayersAdded)" in html
     assert "flightLayersAdded = true" in html
-    assert "const mapMaxZoom = Number(flightData.mapMaxZoom) || 17;" in html
+    assert "const mapMaxZoom = Number(flightData.mapMaxZoom) || 19;" in html
+    assert "const mapFitMaxZoom = Number(flightData.mapFitMaxZoom) || Math.min(17, mapMaxZoom);" in html
+    assert "const mapMaxPitch = Number(flightData.mapMaxPitch) || 85;" in html
     assert "maxZoom: mapMaxZoom" in html
+    assert "maxZoom: mapFitMaxZoom" in html
     assert "map.fitBounds(flightBounds" in html
     assert 'map.once("style.load", revealFlightPath)' in html
     assert 'map.once("load", revealFlightPath)' in html
-    assert "pitch: 60" in html
+    assert "maxPitch: mapMaxPitch" in html
+    assert "pitch: Math.min(54, mapMaxPitch)" in html
+    assert "requestedMode === \"ground\" ? Math.min(84, mapMaxPitch)" in html
     assert "bearing: initialBearing" in html
     assert "map.dragRotate.enable()" in html
     assert "map.touchZoomRotate.enableRotation()" in html
     assert "window.sloppyGpsMap" in html
     assert "fit: fitFlightBounds" in html
     assert "refresh: refreshMapViewport" in html
+    assert "setCameraMode" in html
+    assert "getState: debugMapState" in html
     assert 'id="flightOverlay"' not in html
     assert "function drawFlightOverlay()" not in html
     assert "function addRasterFallbackLayer()" not in html
-    assert "function applyMapMode(mode, options)" not in html
     assert "map.dragRotate.disable()" not in html
-    assert "window.sloppyGpsMap.setMode" not in html
 
 
 def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None:
@@ -708,3 +789,16 @@ def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
     assert "QWebChannel" in html
     assert len(gps.data) == 1
     assert "maplibregl.Map" in gps_map
+
+
+def test_real_log_validator_accepts_current_3d_map_contract(tmp_path: Path) -> None:
+    from tools.validate_real_log import validate_core
+
+    path = tmp_path / "Panther" / "flight.csv"
+    path.parent.mkdir()
+    write_sample(path)
+
+    result = validate_core(path, None, tmp_path)
+
+    assert result["has_gps_lat_lon"] is True
+    assert result["library_logs_scanned"] == 1

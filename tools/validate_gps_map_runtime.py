@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from sloppy_log_explorer.models import GpsGradientOptions
+from sloppy_log_explorer.parser import load_log
+from sloppy_log_explorer.plotting import build_gps_map_html
+
+
+def _run_event_loop(timeout_ms: int) -> None:
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    QTimer.singleShot(timeout_ms, loop.quit)
+    loop.exec()
+
+
+def _run_js(page: Any, script: str, timeout_ms: int = 1000) -> Any:
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    result: dict[str, Any] = {}
+    page.runJavaScript(script, lambda value: (result.setdefault("value", value), loop.quit()))
+    QTimer.singleShot(timeout_ms, loop.quit)
+    loop.exec()
+    return result.get("value")
+
+
+def _wait_for_ready_state(page: Any, attempts: int = 60) -> dict[str, Any] | None:
+    state = None
+    for _ in range(attempts):
+        state = _run_js(
+            page,
+            "window.sloppyGpsMap && window.sloppyGpsMap.getState ? window.sloppyGpsMap.getState() : null;",
+            timeout_ms=500,
+        )
+        if state and state.get("state") == "ready" and (state.get("native3dPathReady") or state.get("webglPathReady")):
+            return state
+        _run_event_loop(250)
+    return state
+
+
+def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float | None = None) -> None:
+    if not state or state.get("state") != "ready":
+        raise AssertionError(f"GPS map did not stay ready at {label}: {state}")
+    layers = state.get("layers") if isinstance(state.get("layers"), dict) else {}
+    camera = state.get("camera") if isinstance(state.get("camera"), dict) else {}
+    if not layers.get("flight-extrusions"):
+        raise AssertionError(f"GPS map is missing the native 3D extrusion path layer at {label}: {state}")
+    if not state.get("native3dPathReady"):
+        raise AssertionError(f"GPS map native 3D extrusion path is not ready at {label}: {state}")
+    if layers.get("flight-elevation-layer") and int(state.get("ribbonVertexCount") or 0) <= 0:
+        raise AssertionError(f"GPS map WebGL diagnostic ribbon has no vertices at {label}: {state}")
+    if float(camera.get("maxPitch") or 0) < 85:
+        raise AssertionError(f"GPS map camera cannot pitch to ground level at {label}: {state}")
+    if float(camera.get("maxZoom") or 0) < 19:
+        raise AssertionError(f"GPS map camera cannot zoom close enough at {label}: {state}")
+    if min_pitch is not None and float(camera.get("pitch") or 0) < min_pitch:
+        raise AssertionError(f"GPS map camera pitch is too shallow at {label}: {state}")
+
+
+def _image_metrics(image: Any) -> dict[str, int]:
+    from PyQt6.QtGui import QColor
+
+    width = image.width()
+    height = image.height()
+    unique: set[tuple[int, int, int]] = set()
+    bright = 0
+    colored = 0
+    samples = 0
+    y_step = max(1, height // 80)
+    x_step = max(1, width // 120)
+    for y in range(0, height, y_step):
+        for x in range(0, width, x_step):
+            color = QColor(image.pixel(x, y))
+            unique.add((color.red() // 16, color.green() // 16, color.blue() // 16))
+            samples += 1
+            if color.red() > 200 or color.green() > 200 or color.blue() > 200:
+                bright += 1
+            if max(color.red(), color.green(), color.blue()) - min(color.red(), color.green(), color.blue()) > 40:
+                colored += 1
+    return {
+        "width": width,
+        "height": height,
+        "uniqueBuckets": len(unique),
+        "brightSamples": bright,
+        "coloredSamples": colored,
+        "samples": samples,
+    }
+
+
+def validate_gps_map_runtime(
+    log_path: Path,
+    color_column: str | None,
+    output: Path,
+    state_root: Path | None,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    log_path = log_path.resolve()
+    output = output.resolve()
+    if state_root is None:
+        state_root = Path(tempfile.mkdtemp(prefix="sloppy-gps-map-runtime-"))
+    state_root = state_root.resolve()
+    state_root.mkdir(parents=True, exist_ok=True)
+    os.environ["APPDATA"] = str(state_root / "appdata")
+
+    from PyQt6.QtCore import QEventLoop, QTimer, QUrl
+    from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWidgets import QApplication
+
+    log = load_log(log_path)
+    if not log.info.has_gps:
+        raise AssertionError(f"{log_path} does not contain detected GPS coordinates")
+
+    options = GpsGradientOptions(color_column=color_column)
+    html_path = state_root / "gps-map-runtime.html"
+    html_path.write_text(build_gps_map_html(log, options), encoding="utf-8")
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    profile = QWebEngineProfile("SloppyLogExplorerRuntimeValidation", app)
+    cache_path = state_root / "web-cache"
+    storage_path = state_root / "web-storage"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    storage_path.mkdir(parents=True, exist_ok=True)
+    profile.setCachePath(str(cache_path))
+    profile.setPersistentStoragePath(str(storage_path))
+    profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+
+    page = QWebEnginePage(profile, app)
+    page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+    page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+    view = QWebEngineView()
+    view.resize(width, height)
+    view.setPage(page)
+    view.show()
+
+    load_loop = QEventLoop()
+    loaded: dict[str, bool] = {}
+    page.loadFinished.connect(lambda ok: (loaded.setdefault("ok", ok), load_loop.quit()))
+    view.setUrl(QUrl.fromLocalFile(str(html_path)))
+    QTimer.singleShot(15000, load_loop.quit)
+    load_loop.exec()
+    if not loaded.get("ok"):
+        view.close()
+        raise AssertionError("Qt WebEngine did not finish loading the GPS map HTML")
+
+    initial_state = _wait_for_ready_state(page)
+    try:
+        _assert_3d_state(initial_state, "initial")
+    except AssertionError:
+        view.close()
+        raise
+
+    _run_js(
+        page,
+        (
+            "window.sloppyGpsMap.setCameraMode('ground', {animate:false, fit:false});"
+            "window.sloppyGpsMap.refresh({fit:false});"
+            "true;"
+        ),
+    )
+    after_camera_state = _wait_for_ready_state(page)
+    _run_js(page, "window.sloppyGpsMap.setCameraMode('orbit', {animate:false, fit:true}); true;")
+    after_fit_state = _wait_for_ready_state(page)
+    try:
+        _assert_3d_state(after_camera_state, "ground camera", min_pitch=80)
+        _assert_3d_state(after_fit_state, "fit/orbit camera", min_pitch=50)
+    except AssertionError:
+        view.close()
+        raise
+
+    _run_event_loop(1200)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image = view.grab().toImage()
+    if not image.save(str(output)):
+        view.close()
+        raise AssertionError(f"failed to save map screenshot to {output}")
+    metrics = _image_metrics(image)
+    if metrics["uniqueBuckets"] < 8 or metrics["brightSamples"] < 1 or metrics["coloredSamples"] < 1:
+        view.close()
+        raise AssertionError(f"GPS map screenshot looked blank or too flat: {metrics}")
+
+    view.close()
+    app.quit()
+    return {
+        "log": str(log_path),
+        "html": str(html_path),
+        "screenshot": str(output),
+        "loaded": True,
+        "initial": initial_state,
+        "afterCamera": after_camera_state,
+        "afterFit": after_fit_state,
+        "image": metrics,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Validate the MapLibre 3D GPS map in a live Qt WebEngine view.")
+    parser.add_argument("log", type=Path)
+    parser.add_argument("--color-column")
+    parser.add_argument("--output", type=Path, default=Path("validation_artifacts/flight-map-3d-webengine.png"))
+    parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=820)
+    args = parser.parse_args()
+
+    result = validate_gps_map_runtime(
+        log_path=args.log,
+        color_column=args.color_column,
+        output=args.output,
+        state_root=args.state_root,
+        width=args.width,
+        height=args.height,
+    )
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

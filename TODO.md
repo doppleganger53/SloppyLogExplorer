@@ -1,10 +1,5 @@
 # TODO
 
-## flightpath vis
-
-- need raster / imagry tile source
-- 3d flightpath vis still needs debugging
-
 ## new zoom-linked views
 
 - telemetry tab x axis zoom range linked to other tabs

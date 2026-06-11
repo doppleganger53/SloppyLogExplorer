@@ -7,7 +7,11 @@ from pathlib import Path
 MAPLIBRE_VERSION = "5.24.0"
 OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
-MAP_MAX_ZOOM = 17
+MAP_MAX_ZOOM = 19
+MAP_FIT_MAX_ZOOM = 17
+MAP_MAX_PITCH = 85
+ALTITUDE_EXAGGERATION = 5.0
+ALTITUDE_FLOOR_METERS = 12.0
 
 
 def _asset_uri(filename: str) -> str:
@@ -73,6 +77,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       height: 100%;
       background: __BACKGROUND__;
     }
+    #flightCanvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 5;
+      pointer-events: none;
+    }
     #legend {
       position: absolute;
       left: 12px;
@@ -136,6 +148,42 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       background: rgba(20,83,45,0.88);
       border-color: rgba(74,222,128,0.65);
     }
+    #cameraControls {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 11;
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      color: __PANEL_FG__;
+      background: __PANEL_BG__;
+      border: 1px solid __BORDER__;
+      border-radius: 6px;
+      box-sizing: border-box;
+    }
+    #cameraControls button {
+      min-width: 54px;
+      height: 28px;
+      padding: 0 10px;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      color: __PANEL_FG__;
+      background: transparent;
+      font: 12px Arial, sans-serif;
+      cursor: pointer;
+    }
+    #cameraControls button:hover,
+    #cameraControls button:focus {
+      border-color: __BORDER__;
+      outline: none;
+    }
+    #cameraControls button[aria-pressed="true"] {
+      color: #ffffff;
+      background: #2f80ed;
+      border-color: #2f80ed;
+    }
     #mapAttribution {
       position: absolute;
       right: 8px;
@@ -154,6 +202,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
 </head>
 <body>
   <div id="map"></div>
+  <canvas id="flightCanvas"></canvas>
   <div id="legend" hidden>
     <div id="legendTitle"></div>
     <div id="gradientBar"></div>
@@ -164,13 +213,20 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     </div>
   </div>
   <div id="statusOverlay" hidden></div>
+  <div id="cameraControls" aria-label="Map camera">
+    <button type="button" data-camera-mode="top" title="Top-down map view">Top</button>
+    <button type="button" data-camera-mode="orbit" title="Oblique 3D flight view" aria-pressed="true">3D</button>
+    <button type="button" data-camera-mode="ground" title="Near-ground flight path view">Ground</button>
+  </div>
   <div id="mapAttribution">
     Map tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
   </div>
   <script>
     maplibregl.workerUrl = __MAPLIBRE_WORKER_URI__;
     const flightData = __FLIGHT_DATA__;
-    const mapMaxZoom = Number(flightData.mapMaxZoom) || 17;
+    const mapMaxZoom = Number(flightData.mapMaxZoom) || 19;
+    const mapFitMaxZoom = Number(flightData.mapFitMaxZoom) || Math.min(17, mapMaxZoom);
+    const mapMaxPitch = Number(flightData.mapMaxPitch) || 85;
     const rasterTileUrls = Array.isArray(flightData.rasterTileUrls) && flightData.rasterTileUrls.length
       ? flightData.rasterTileUrls
       : ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
@@ -178,6 +234,17 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const pathParts = Array.isArray(flightData.pathParts) && flightData.pathParts.length
       ? flightData.pathParts
       : [flightData.points];
+    const altitudeStats = flightData.altitudeStats || {};
+    const altitudeBase = Number.isFinite(Number(altitudeStats.baseMeters))
+      ? Number(altitudeStats.baseMeters)
+      : 0;
+    const altitudeScale = Number.isFinite(Number(flightData.altitudeScale))
+      ? Number(flightData.altitudeScale)
+      : 5;
+    const altitudeFloorMeters = Number.isFinite(Number(flightData.altitudeFloorMeters))
+      ? Number(flightData.altitudeFloorMeters)
+      : 12;
+    const pathRibbonWidthMeters = 24;
     const legendContainer = document.getElementById("legend");
     const legendTitle = document.getElementById("legendTitle");
     const gradientBar = document.getElementById("gradientBar");
@@ -185,14 +252,98 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const legendMid = document.getElementById("legendMid");
     const legendMax = document.getElementById("legendMax");
     const statusOverlay = document.getElementById("statusOverlay");
+    const cameraControls = document.getElementById("cameraControls");
+    const flightCanvas = document.getElementById("flightCanvas");
+    const flightCanvasContext = flightCanvas ? flightCanvas.getContext("2d") : null;
     let statusHideTimer = null;
     let map = null;
     let flightBounds = null;
     let initialBearing = 0;
     let flightLayersAdded = false;
+    let elevationLayerReady = false;
+    let elevationLayerError = "";
+    let canvasPathReady = false;
+    let extrusionLayerReady = false;
+    let ribbonVertexCount = 0;
+    let guideVertexCount = 0;
+    let activeCameraMode = "orbit";
+    let elevationMatrixSource = "";
+    let elevationRenderArgKeys = [];
 
     function finiteNumber(value) {
-      return Number.isFinite(Number(value));
+      return value !== null && value !== "" && Number.isFinite(Number(value));
+    }
+
+    function debugMapState() {
+      const layerIds = [
+        "osm-raster-base",
+        "flight-underlay",
+        "flight-segments",
+        "flight-extrusions",
+        "flight-marker-circles",
+        "flight-marker-labels",
+        "flight-elevation-layer"
+      ];
+      const sourceIds = [
+        "osm-raster-source",
+        "flight-underlay-source",
+        "flight-segments-source",
+        "flight-extrusions-source",
+        "flight-markers"
+      ];
+      const pathReady = extrusionLayerReady || elevationLayerReady || canvasPathReady;
+      const state = {
+        ready: flightLayersAdded && pathReady,
+        state: flightLayersAdded && pathReady ? "ready" : (elevationLayerError ? "degraded" : "loading"),
+        initialized: !!map,
+        styleLoaded: !!(map && map.isStyleLoaded && map.isStyleLoaded()),
+        points: Array.isArray(flightData.points) ? flightData.points.length : 0,
+        segments: Array.isArray(flightData.segments) ? flightData.segments.length : 0,
+        pathParts: pathParts.length,
+        canvasPathReady,
+        extrusionLayerReady,
+        elevationLayerReady,
+        elevationLayerError,
+        elevationMatrixSource,
+        elevationRenderArgKeys,
+        webglPathReady: elevationLayerReady,
+        native3dPathReady: extrusionLayerReady,
+        ribbonVertexCount,
+        guideVertexCount,
+        cameraMode: activeCameraMode,
+        camera: map ? {
+          zoom: map.getZoom(),
+          pitch: map.getPitch(),
+          bearing: map.getBearing(),
+          maxZoom: mapMaxZoom,
+          fitMaxZoom: mapFitMaxZoom,
+          maxPitch: mapMaxPitch
+        } : null,
+        altitude: {
+          label: altitudeStats.label || flightData.altitudeLabel || "Altitude",
+          minimum: finiteNumber(altitudeStats.minimum) ? Number(altitudeStats.minimum) : null,
+          maximum: finiteNumber(altitudeStats.maximum) ? Number(altitudeStats.maximum) : null,
+          baseMeters: altitudeBase,
+          scale: altitudeScale,
+          floorMeters: altitudeFloorMeters
+        },
+        layers: {},
+        sources: {},
+        status: statusOverlay && !statusOverlay.hidden ? statusOverlay.textContent : ""
+      };
+      if (document.body) {
+        document.body.dataset.mapState = state.state;
+      }
+      if (map) {
+        layerIds.forEach((id) => {
+          state.layers[id] = !!map.getLayer(id);
+        });
+        sourceIds.forEach((id) => {
+          state.sources[id] = !!map.getSource(id);
+        });
+      }
+      window.__sloppyDebugMapState = state;
+      return state;
     }
 
     function setStatus(message, kind) {
@@ -205,11 +356,13 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         statusOverlay.hidden = true;
         statusOverlay.textContent = "";
         statusOverlay.dataset.kind = "";
+        debugMapState();
         return;
       }
       statusOverlay.hidden = false;
       statusOverlay.dataset.kind = kind || "info";
       statusOverlay.textContent = message;
+      debugMapState();
     }
 
     function transientStatus(message, kind, timeoutMs) {
@@ -254,9 +407,350 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       return [Number(point.lon), Number(point.lat)];
     }
 
+    function extrusionCoordinatesForSegment(leftPoint, rightPoint, widthMeters) {
+      const left = coordinateFromPoint(leftPoint);
+      const right = coordinateFromPoint(rightPoint);
+      if (!left || !right) {
+        return null;
+      }
+      const midLatRadians = ((left[1] + right[1]) / 2) * Math.PI / 180;
+      const metersPerDegreeLat = 110540;
+      const metersPerDegreeLon = Math.max(1, 111320 * Math.cos(midLatRadians));
+      const dx = (right[0] - left[0]) * metersPerDegreeLon;
+      const dy = (right[1] - left[1]) * metersPerDegreeLat;
+      const length = Math.hypot(dx, dy);
+      if (!Number.isFinite(length) || length <= 0) {
+        return null;
+      }
+      const nx = -dy / length * widthMeters / 2;
+      const ny = dx / length * widthMeters / 2;
+      const offset = (coordinate, sign) => [
+        coordinate[0] + (nx * sign) / metersPerDegreeLon,
+        coordinate[1] + (ny * sign) / metersPerDegreeLat
+      ];
+      const leftA = offset(left, 1);
+      const rightA = offset(right, 1);
+      const rightB = offset(right, -1);
+      const leftB = offset(left, -1);
+      return [[leftA, rightA, rightB, leftB, leftA]];
+    }
+
+    function altitudeRenderMeters(point) {
+      if (!point || !finiteNumber(point.alt)) {
+        return altitudeFloorMeters;
+      }
+      return Math.max(0, (Number(point.alt) - altitudeBase) * altitudeScale + altitudeFloorMeters);
+    }
+
+    function colorToRgba(color, alpha) {
+      const fallback = [0.33, 0.85, 0.47, alpha];
+      if (typeof color !== "string" || !/^#[0-9a-fA-F]{6}$/.test(color)) {
+        return fallback;
+      }
+      return [
+        parseInt(color.slice(1, 3), 16) / 255,
+        parseInt(color.slice(3, 5), 16) / 255,
+        parseInt(color.slice(5, 7), 16) / 255,
+        alpha
+      ];
+    }
+
+    function mercatorCoordinate(point, altitudeMeters) {
+      return maplibregl.MercatorCoordinate.fromLngLat(
+        { lng: Number(point.lon), lat: Number(point.lat) },
+        altitudeMeters
+      );
+    }
+
+    function mercatorPoint(point, altitudeMeters) {
+      const coordinate = mercatorCoordinate(point, altitudeMeters);
+      return [coordinate.x, coordinate.y, coordinate.z];
+    }
+
+    function buildElevationRenderData() {
+      const ribbonPositions = [];
+      const ribbonColors = [];
+      const shadowPositions = [];
+      const shadowColors = [];
+      const guidePositions = [];
+      const guideColors = [];
+      const guideColor = [1, 1, 1, 0.35];
+      const addRibbonQuad = (positions, colors, start, end, color, widthMeters) => {
+        const dx = end.x - start.x;
+        const dy = end.y - start.y;
+        const length = Math.hypot(dx, dy);
+        if (!Number.isFinite(length) || length <= 0) {
+          return;
+        }
+        const widthUnits = ((start.meterInMercatorCoordinateUnits() + end.meterInMercatorCoordinateUnits()) / 2)
+          * Math.max(1, widthMeters);
+        const halfWidth = widthUnits / 2;
+        const nx = -dy / length * halfWidth;
+        const ny = dx / length * halfWidth;
+        const leftStart = [start.x + nx, start.y + ny, start.z];
+        const rightStart = [start.x - nx, start.y - ny, start.z];
+        const leftEnd = [end.x + nx, end.y + ny, end.z];
+        const rightEnd = [end.x - nx, end.y - ny, end.z];
+        positions.push(
+          ...leftStart, ...rightStart, ...leftEnd,
+          ...rightStart, ...rightEnd, ...leftEnd
+        );
+        for (let index = 0; index < 6; index += 1) {
+          colors.push(...color);
+        }
+      };
+
+      flightData.segments.forEach((segment) => {
+        if (!segment || !segment.left || !segment.right) {
+          return;
+        }
+        const left = coordinateFromPoint(segment.left);
+        const right = coordinateFromPoint(segment.right);
+        if (!left || !right) {
+          return;
+        }
+        const color = colorToRgba(segment.color, 0.98);
+        const shadowColor = colorToRgba(segment.color, 0.24);
+        const leftGround = mercatorCoordinate(segment.left, 0);
+        const rightGround = mercatorCoordinate(segment.right, 0);
+        const leftElevated = mercatorCoordinate(segment.left, altitudeRenderMeters(segment.left));
+        const rightElevated = mercatorCoordinate(segment.right, altitudeRenderMeters(segment.right));
+        addRibbonQuad(shadowPositions, shadowColors, leftGround, rightGround, shadowColor, pathRibbonWidthMeters * 1.5);
+        addRibbonQuad(ribbonPositions, ribbonColors, leftElevated, rightElevated, color, pathRibbonWidthMeters);
+      });
+
+      const points = Array.isArray(flightData.points) ? flightData.points : [];
+      const guideStride = Math.max(1, Math.floor(points.length / 24));
+      points.forEach((point, index) => {
+        if (index !== 0 && index !== points.length - 1 && index % guideStride !== 0) {
+          return;
+        }
+        const coordinate = coordinateFromPoint(point);
+        if (!coordinate) {
+          return;
+        }
+        const ground = mercatorPoint(point, 0);
+        const elevated = mercatorPoint(point, altitudeRenderMeters(point));
+        guidePositions.push(...ground, ...elevated);
+        guideColors.push(...guideColor, ...guideColor);
+      });
+
+      return {
+        ribbonPositions: new Float32Array(ribbonPositions),
+        ribbonColors: new Float32Array(ribbonColors),
+        ribbonVertexCount: ribbonPositions.length / 3,
+        shadowPositions: new Float32Array(shadowPositions),
+        shadowColors: new Float32Array(shadowColors),
+        shadowVertexCount: shadowPositions.length / 3,
+        guidePositions: new Float32Array(guidePositions),
+        guideColors: new Float32Array(guideColors),
+        guideVertexCount: guidePositions.length / 3
+      };
+    }
+
+    function compileShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const details = gl.getShaderInfoLog(shader) || "unknown shader compile error";
+        gl.deleteShader(shader);
+        throw new Error(details);
+      }
+      return shader;
+    }
+
+    function createElevationProgram(gl) {
+      const vertexShader = compileShader(gl, gl.VERTEX_SHADER, `
+        attribute vec3 a_pos;
+        attribute vec4 a_color;
+        uniform mat4 u_matrix;
+        varying vec4 v_color;
+        void main() {
+          gl_Position = u_matrix * vec4(a_pos, 1.0);
+          v_color = a_color;
+        }
+      `);
+      const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, `
+        precision mediump float;
+        varying vec4 v_color;
+        void main() {
+          gl_FragColor = v_color;
+        }
+      `);
+      const program = gl.createProgram();
+      gl.attachShader(program, vertexShader);
+      gl.attachShader(program, fragmentShader);
+      gl.linkProgram(program);
+      gl.deleteShader(vertexShader);
+      gl.deleteShader(fragmentShader);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const details = gl.getProgramInfoLog(program) || "unknown program link error";
+        gl.deleteProgram(program);
+        throw new Error(details);
+      }
+      return program;
+    }
+
+    function createArrayBuffer(gl, data) {
+      const buffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      return buffer;
+    }
+
+    function matrixForUniform(renderArgs) {
+      if (renderArgs && typeof renderArgs === "object" && typeof renderArgs.length !== "number") {
+        elevationRenderArgKeys = Object.keys(renderArgs).slice(0, 12);
+      }
+      let matrix = null;
+      if (renderArgs && renderArgs.modelViewProjectionMatrix) {
+        matrix = renderArgs.modelViewProjectionMatrix;
+        elevationMatrixSource = "modelViewProjectionMatrix";
+      } else if (renderArgs && renderArgs.defaultProjectionData && renderArgs.defaultProjectionData.mainMatrix) {
+        matrix = renderArgs.defaultProjectionData.mainMatrix;
+        elevationMatrixSource = "defaultProjectionData.mainMatrix";
+      } else if (renderArgs && renderArgs.projectionData && renderArgs.projectionData.mainMatrix) {
+        matrix = renderArgs.projectionData.mainMatrix;
+        elevationMatrixSource = "projectionData.mainMatrix";
+      } else {
+        matrix = renderArgs;
+        elevationMatrixSource = "legacy-matrix";
+      }
+      if (!matrix) {
+        throw new Error("custom layer render matrix was not provided");
+      }
+      if (matrix instanceof Float32Array) {
+        return matrix;
+      }
+      if (Array.isArray(matrix)) {
+        return new Float32Array(matrix);
+      }
+      if (typeof matrix.length === "number") {
+        const values = new Float32Array(matrix.length);
+        for (let index = 0; index < matrix.length; index += 1) {
+          values[index] = Number(matrix[index]);
+        }
+        return values;
+      }
+      throw new Error("custom layer render matrix was not array-like");
+    }
+
+    function makeFlightElevationLayer() {
+      const renderData = buildElevationRenderData();
+      return {
+        id: "flight-elevation-layer",
+        type: "custom",
+        renderingMode: "3d",
+
+        onAdd: function(_map, gl) {
+          this.program = createElevationProgram(gl);
+          this.positionLocation = gl.getAttribLocation(this.program, "a_pos");
+          this.colorLocation = gl.getAttribLocation(this.program, "a_color");
+          this.matrixLocation = gl.getUniformLocation(this.program, "u_matrix");
+          this.ribbonPositionBuffer = createArrayBuffer(gl, renderData.ribbonPositions);
+          this.ribbonColorBuffer = createArrayBuffer(gl, renderData.ribbonColors);
+          this.ribbonVertexCount = renderData.ribbonVertexCount;
+          this.shadowPositionBuffer = createArrayBuffer(gl, renderData.shadowPositions);
+          this.shadowColorBuffer = createArrayBuffer(gl, renderData.shadowColors);
+          this.shadowVertexCount = renderData.shadowVertexCount;
+          this.guidePositionBuffer = createArrayBuffer(gl, renderData.guidePositions);
+          this.guideColorBuffer = createArrayBuffer(gl, renderData.guideColors);
+          this.guideVertexCount = renderData.guideVertexCount;
+          ribbonVertexCount = this.ribbonVertexCount;
+          guideVertexCount = this.guideVertexCount;
+          elevationLayerReady = this.ribbonVertexCount > 0;
+          elevationLayerError = "";
+          debugMapState();
+        },
+
+        render: function(gl, renderArgs) {
+          try {
+            if (!this.program || !this.ribbonVertexCount) {
+              return;
+            }
+            const matrix = matrixForUniform(renderArgs);
+            gl.useProgram(this.program);
+            gl.uniformMatrix4fv(this.matrixLocation, false, matrix);
+            gl.disable(gl.DEPTH_TEST);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            const bindArrays = (positionBuffer, colorBuffer) => {
+              gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+              gl.enableVertexAttribArray(this.positionLocation);
+              gl.vertexAttribPointer(this.positionLocation, 3, gl.FLOAT, false, 0, 0);
+              gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+              gl.enableVertexAttribArray(this.colorLocation);
+              gl.vertexAttribPointer(this.colorLocation, 4, gl.FLOAT, false, 0, 0);
+            };
+            const drawTriangles = (positionBuffer, colorBuffer, vertexCount) => {
+              if (!vertexCount) {
+                return;
+              }
+              bindArrays(positionBuffer, colorBuffer);
+              gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+            };
+            const drawLines = (positionBuffer, colorBuffer, vertexCount) => {
+              if (!vertexCount) {
+                return;
+              }
+              bindArrays(positionBuffer, colorBuffer);
+              gl.drawArrays(gl.LINES, 0, vertexCount);
+            };
+
+            drawTriangles(this.shadowPositionBuffer, this.shadowColorBuffer, this.shadowVertexCount);
+            drawLines(this.guidePositionBuffer, this.guideColorBuffer, this.guideVertexCount);
+            drawTriangles(this.ribbonPositionBuffer, this.ribbonColorBuffer, this.ribbonVertexCount);
+          } catch (error) {
+            elevationLayerReady = false;
+            elevationLayerError = error && error.message ? error.message : String(error);
+            debugMapState();
+          }
+        },
+
+        onRemove: function(_map, gl) {
+          [
+            this.ribbonPositionBuffer,
+            this.ribbonColorBuffer,
+            this.shadowPositionBuffer,
+            this.shadowColorBuffer,
+            this.guidePositionBuffer,
+            this.guideColorBuffer
+          ].forEach((buffer) => {
+            if (buffer) {
+              gl.deleteBuffer(buffer);
+            }
+          });
+          if (this.program) {
+            gl.deleteProgram(this.program);
+          }
+          elevationLayerReady = false;
+          ribbonVertexCount = 0;
+          guideVertexCount = 0;
+          debugMapState();
+        }
+      };
+    }
+
+    function addElevationLayer() {
+      if (!map || !maplibregl.MercatorCoordinate || !Array.isArray(flightData.segments) || !flightData.segments.length) {
+        return;
+      }
+      try {
+        map.addLayer(makeFlightElevationLayer());
+      } catch (error) {
+        elevationLayerReady = false;
+        elevationLayerError = error && error.message ? error.message : String(error);
+        transientStatus("2D map ready; 3D path unavailable: " + elevationLayerError, "error");
+      }
+      debugMapState();
+    }
+
     function buildFlightGeoJson() {
       const underlayFeatures = [];
       const segmentFeatures = [];
+      const extrusionFeatures = [];
       const markerFeatures = [];
 
       pathParts.forEach((part, index) => {
@@ -288,6 +782,21 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           },
           geometry: { type: "LineString", coordinates: [left, right] }
         });
+        const extrusionCoordinates = extrusionCoordinatesForSegment(segment.left, segment.right, pathRibbonWidthMeters);
+        if (extrusionCoordinates) {
+          extrusionFeatures.push({
+            type: "Feature",
+            properties: {
+              color: segment.color,
+              index: index + 1,
+              height: Math.max(
+                altitudeFloorMeters,
+                (altitudeRenderMeters(segment.left) + altitudeRenderMeters(segment.right)) / 2
+              )
+            },
+            geometry: { type: "Polygon", coordinates: extrusionCoordinates }
+          });
+        }
       });
 
       const startPoint = flightData.points[0];
@@ -315,8 +824,163 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       return {
         underlay: { type: "FeatureCollection", features: underlayFeatures },
         segments: { type: "FeatureCollection", features: segmentFeatures },
+        extrusions: { type: "FeatureCollection", features: extrusionFeatures },
         markers: { type: "FeatureCollection", features: markerFeatures }
       };
+    }
+
+    function resizeFlightCanvas() {
+      if (!flightCanvas || !flightCanvasContext || !map) {
+        return false;
+      }
+      const canvas = map.getCanvas();
+      const width = Math.max(1, canvas.clientWidth || canvas.width || 1);
+      const height = Math.max(1, canvas.clientHeight || canvas.height || 1);
+      const pixelRatio = window.devicePixelRatio || 1;
+      const targetWidth = Math.max(1, Math.floor(width * pixelRatio));
+      const targetHeight = Math.max(1, Math.floor(height * pixelRatio));
+      if (flightCanvas.width !== targetWidth || flightCanvas.height !== targetHeight) {
+        flightCanvas.width = targetWidth;
+        flightCanvas.height = targetHeight;
+        flightCanvas.style.width = `${width}px`;
+        flightCanvas.style.height = `${height}px`;
+      }
+      flightCanvasContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      return true;
+    }
+
+    function altitudePixels(point) {
+      if (!map) {
+        return 0;
+      }
+      const zoomScale = Math.pow(2, map.getZoom() - 17);
+      const pixelsPerMeter = Math.max(0.12, Math.min(2.0, zoomScale * 0.55));
+      const pitchFactor = Math.max(0.25, Math.sin(map.getPitch() * Math.PI / 180));
+      return altitudeRenderMeters(point) * pixelsPerMeter * pitchFactor;
+    }
+
+    function projectedPoint(point, elevated) {
+      const coordinate = coordinateFromPoint(point);
+      if (!map || !coordinate) {
+        return null;
+      }
+      const projected = map.project(coordinate);
+      return {
+        x: projected.x,
+        y: projected.y - (elevated ? altitudePixels(point) : 0)
+      };
+    }
+
+    function drawCanvasLine(points, options) {
+      if (!flightCanvasContext || points.length < 2) {
+        return false;
+      }
+      flightCanvasContext.save();
+      flightCanvasContext.lineCap = "round";
+      flightCanvasContext.lineJoin = "round";
+      flightCanvasContext.strokeStyle = options.color;
+      flightCanvasContext.globalAlpha = options.alpha == null ? 1 : options.alpha;
+      flightCanvasContext.lineWidth = options.width;
+      flightCanvasContext.beginPath();
+      let started = false;
+      points.forEach((point) => {
+        if (!point) {
+          started = false;
+          return;
+        }
+        if (!started) {
+          flightCanvasContext.moveTo(point.x, point.y);
+          started = true;
+        } else {
+          flightCanvasContext.lineTo(point.x, point.y);
+        }
+      });
+      flightCanvasContext.stroke();
+      flightCanvasContext.restore();
+      return true;
+    }
+
+    function drawFlightCanvas() {
+      if (!flightCanvas || !flightCanvasContext || !map || !resizeFlightCanvas()) {
+        canvasPathReady = false;
+        debugMapState();
+        return false;
+      }
+      const canvas = map.getCanvas();
+      const width = Math.max(1, canvas.clientWidth || canvas.width || 1);
+      const height = Math.max(1, canvas.clientHeight || canvas.height || 1);
+      flightCanvasContext.clearRect(0, 0, width, height);
+
+      let drawn = false;
+      const drawFallbackPath = !extrusionLayerReady && !elevationLayerReady;
+      const drawAccentPath = extrusionLayerReady || elevationLayerReady;
+      const guideStride = Math.max(1, Math.floor(flightData.points.length / 24));
+      flightData.points.forEach((point, index) => {
+        if (index !== 0 && index !== flightData.points.length - 1 && index % guideStride !== 0) {
+          return;
+        }
+        const ground = projectedPoint(point, false);
+        const elevated = projectedPoint(point, true);
+        if (ground && elevated) {
+          drawn = drawCanvasLine([ground, elevated], { color: "#ffffff", alpha: 0.28, width: 1.5 }) || drawn;
+        }
+      });
+
+      if (drawFallbackPath || drawAccentPath) {
+        pathParts.forEach((part) => {
+          const points = part.map((point) => projectedPoint(point, true));
+          drawn = drawCanvasLine(points, {
+            color: "#111827",
+            alpha: drawFallbackPath ? 0.72 : 0.45,
+            width: drawFallbackPath ? 10 : 7
+          }) || drawn;
+        });
+
+        flightData.segments.forEach((segment) => {
+          const left = projectedPoint(segment.left, true);
+          const right = projectedPoint(segment.right, true);
+          if (!left || !right) {
+            return;
+          }
+          drawn = drawCanvasLine([left, right], {
+            color: segment.color || "#55d977",
+            alpha: drawFallbackPath ? 0.98 : 0.92,
+            width: drawFallbackPath ? 6 : 4
+          }) || drawn;
+        });
+      }
+
+      [
+        { point: flightData.points[0], color: "#27ae60", label: "Start" },
+        { point: flightData.points[flightData.points.length - 1], color: "#eb5757", label: "End" }
+      ].forEach((marker) => {
+        const point = projectedPoint(marker.point, true);
+        if (!point) {
+          return;
+        }
+        flightCanvasContext.save();
+        flightCanvasContext.fillStyle = marker.color;
+        flightCanvasContext.strokeStyle = "#ffffff";
+        flightCanvasContext.lineWidth = 2;
+        flightCanvasContext.beginPath();
+        flightCanvasContext.arc(point.x, point.y, 7, 0, Math.PI * 2);
+        flightCanvasContext.fill();
+        flightCanvasContext.stroke();
+        flightCanvasContext.font = "13px Arial, sans-serif";
+        flightCanvasContext.textAlign = "center";
+        flightCanvasContext.textBaseline = "bottom";
+        flightCanvasContext.lineWidth = 4;
+        flightCanvasContext.strokeStyle = "#111827";
+        flightCanvasContext.fillStyle = "#ffffff";
+        flightCanvasContext.strokeText(marker.label, point.x, point.y - 10);
+        flightCanvasContext.fillText(marker.label, point.x, point.y - 10);
+        flightCanvasContext.restore();
+        drawn = true;
+      });
+
+      canvasPathReady = drawn && drawFallbackPath;
+      debugMapState();
+      return drawn;
     }
 
     function calculateBounds(points) {
@@ -384,9 +1048,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           "line-join": "round"
         },
         paint: {
-          "line-color": "#ffffff",
-          "line-width": 10,
-          "line-opacity": 0.82
+          "line-color": "#111827",
+          "line-width": 3,
+          "line-opacity": 0.16
         }
       });
 
@@ -404,8 +1068,25 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         },
         paint: {
           "line-color": ["get", "color"],
-          "line-width": 6,
-          "line-opacity": 0.96
+          "line-width": 2,
+          "line-opacity": 0.22
+        }
+      });
+      map.addSource("flight-extrusions-source", {
+        type: "geojson",
+        data: geoJson.extrusions
+      });
+      extrusionLayerReady = geoJson.extrusions.features.length > 0;
+      map.addLayer({
+        id: "flight-extrusions",
+        type: "fill-extrusion",
+        source: "flight-extrusions-source",
+        paint: {
+          "fill-extrusion-color": ["get", "color"],
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-base": 0,
+          "fill-extrusion-opacity": 0.9,
+          "fill-extrusion-vertical-gradient": true
         }
       });
 
@@ -441,7 +1122,10 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           "text-halo-width": 2
         }
       });
+      addElevationLayer();
       flightLayersAdded = true;
+      drawFlightCanvas();
+      debugMapState();
     }
 
     function buildRasterBaseStyle() {
@@ -479,9 +1163,82 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       }
       map.fitBounds(flightBounds, {
         padding: 52,
-        maxZoom: mapMaxZoom,
+        maxZoom: mapFitMaxZoom,
         duration: 0
       });
+    }
+
+    function setCameraControlState(mode) {
+      activeCameraMode = mode || activeCameraMode;
+      if (!cameraControls) {
+        return;
+      }
+      Array.from(cameraControls.querySelectorAll("button[data-camera-mode]")).forEach((button) => {
+        button.setAttribute("aria-pressed", button.dataset.cameraMode === activeCameraMode ? "true" : "false");
+      });
+    }
+
+    function setCameraMode(mode, options) {
+      if (!map) {
+        return false;
+      }
+      const requestedMode = mode || "orbit";
+      const animate = !(options && options.animate === false);
+      const fit = !!(options && options.fit);
+      const modePitch = requestedMode === "top"
+        ? 0
+        : (requestedMode === "ground" ? Math.min(84, mapMaxPitch) : Math.min(54, mapMaxPitch));
+      const modeBearing = requestedMode === "top" ? 0 : initialBearing;
+      const centerPoint = requestedMode === "ground"
+        ? coordinateFromPoint(flightData.points[0])
+        : null;
+      const cameraOptions = { duration: animate ? 650 : 0 };
+      if (fit && flightBounds && typeof map.cameraForBounds === "function") {
+        const fitted = map.cameraForBounds(flightBounds, {
+          padding: { top: 86, right: 72, bottom: 132, left: 72 },
+          maxZoom: mapFitMaxZoom,
+          bearing: modeBearing,
+          pitch: modePitch
+        });
+        if (fitted) {
+          if (fitted.center) {
+            cameraOptions.center = fitted.center;
+          }
+          if (Number.isFinite(Number(fitted.zoom))) {
+            cameraOptions.zoom = Math.min(Number(fitted.zoom), requestedMode === "top" ? mapFitMaxZoom : mapMaxZoom);
+          }
+        }
+      } else if (fit) {
+        fitFlightBounds();
+      }
+      if (requestedMode === "top") {
+        Object.assign(cameraOptions, {
+          pitch: modePitch,
+          bearing: modeBearing,
+          zoom: Number.isFinite(Number(cameraOptions.zoom)) ? cameraOptions.zoom : Math.min(mapFitMaxZoom, mapMaxZoom)
+        });
+      } else if (requestedMode === "ground") {
+        Object.assign(cameraOptions, {
+          pitch: modePitch,
+          bearing: modeBearing,
+          zoom: Math.min(Math.max(map.getZoom(), 18.2), mapMaxZoom)
+        });
+        if (centerPoint) {
+          cameraOptions.center = centerPoint;
+        }
+      } else {
+        Object.assign(cameraOptions, {
+          pitch: modePitch,
+          bearing: modeBearing,
+          zoom: Number.isFinite(Number(cameraOptions.zoom))
+            ? cameraOptions.zoom
+            : Math.min(Math.max(map.getZoom(), 15.4), mapFitMaxZoom)
+        });
+      }
+      map.easeTo(cameraOptions);
+      setCameraControlState(requestedMode);
+      refreshMapViewport({ fit: false });
+      return true;
     }
 
     function refreshMapViewport(options) {
@@ -492,11 +1249,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       if (options && options.fit) {
         fitFlightBounds();
       }
+      drawFlightCanvas();
       if (typeof map.triggerRepaint === "function") {
         map.triggerRepaint();
       }
+      debugMapState();
       window.requestAnimationFrame(() => {
         map.resize();
+        drawFlightCanvas();
         if (typeof map.triggerRepaint === "function") {
           map.triggerRepaint();
         }
@@ -519,12 +1279,15 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         center,
         zoom: 13,
         maxZoom: mapMaxZoom,
-        pitch: 60,
+        minPitch: 0,
+        maxPitch: mapMaxPitch,
+        pitch: Math.min(54, mapMaxPitch),
         bearing: initialBearing,
         attributionControl: false,
         trackResize: true
       });
       window.__sloppyDebugMap = map;
+      debugMapState();
       map.dragRotate.enable();
       map.touchZoomRotate.enableRotation();
       map.addControl(new maplibregl.NavigationControl({
@@ -534,6 +1297,19 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         compact: true,
         customAttribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
       }), "bottom-right");
+      if (cameraControls) {
+        cameraControls.addEventListener("click", (event) => {
+          const button = event.target && event.target.closest
+            ? event.target.closest("button[data-camera-mode]")
+            : null;
+          if (button) {
+            setCameraMode(button.dataset.cameraMode, { fit: button.dataset.cameraMode !== "ground" });
+          }
+        });
+      }
+      ["move", "zoom", "rotate", "pitch", "resize", "render"].forEach((eventName) => {
+        map.on(eventName, drawFlightCanvas);
+      });
 
       map.on("error", (event) => {
         const details = event && event.error && (event.error.message || String(event.error));
@@ -545,6 +1321,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           addFlightLayers();
           renderLegend();
           fitFlightBounds();
+          setCameraMode("orbit", { animate: false, fit: false });
           refreshMapViewport();
           transientStatus("Map ready", "ok", 1200);
         } catch (error) {
@@ -561,7 +1338,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
 
     window.sloppyGpsMap = {
       fit: fitFlightBounds,
-      refresh: refreshMapViewport
+      refresh: refreshMapViewport,
+      setCameraMode,
+      getState: debugMapState
     };
 
     try {

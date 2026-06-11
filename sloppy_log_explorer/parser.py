@@ -255,7 +255,7 @@ def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | Non
     return score
 
 
-def _detect_coordinate_string_gps(df: pd.DataFrame) -> GpsColumns | None:
+def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
     best: tuple[int, str, pd.Series, pd.Series, pd.Series, str] | None = None
     for column in df.columns:
         series = df[column]
@@ -308,6 +308,16 @@ def _detect_coordinate_string_gps(df: pd.DataFrame) -> GpsColumns | None:
         df[_GPS_HELPER_ALT] = alt_series
         altitude = _GPS_HELPER_ALT
         altitude_label = f"{column} (alt)"
+    else:
+        external_altitude = (
+            _find_named_column(numeric_columns, ("gps", "alt"))
+            or _find_named_column(numeric_columns, ("alt",))
+            or _find_named_column(numeric_columns, ("height",))
+            or _find_named_column(numeric_columns, ("gps", "z"))
+        )
+        if external_altitude:
+            altitude = external_altitude
+            altitude_label = external_altitude
     return GpsColumns(
         latitude=_GPS_HELPER_LAT,
         longitude=_GPS_HELPER_LON,
@@ -410,7 +420,7 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
 
 
 def detect_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
-    gps = _detect_coordinate_string_gps(df)
+    gps = _detect_coordinate_string_gps(df, numeric_columns)
     if gps is not None:
         return gps
     return _detect_split_gps_columns(df, numeric_columns)
