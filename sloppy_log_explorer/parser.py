@@ -19,7 +19,8 @@ _COORDINATE_DECIMAL_RE = re.compile(
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
+    mask = df.columns.to_series().astype(str).str.match(r"^Unnamed", na=False)
+    df = df.loc[:, ~mask]
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
@@ -256,7 +257,7 @@ def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | Non
 
 
 def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
-    best: tuple[int, str, pd.Series, pd.Series, pd.Series, str] | None = None
+    best: tuple[float, str, pd.Series, pd.Series, pd.Series, str] | None = None
     for column in df.columns:
         series = df[column]
         lat_values: list[float] = []

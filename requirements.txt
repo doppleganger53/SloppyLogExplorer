@@ -1,4 +1,5 @@
 pandas>=2.0.0
+pandas-stubs
 numpy>=1.24.0
 PyQt6>=6.6.0
 PyQt6-WebEngine>=6.6.0
