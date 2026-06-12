@@ -11,7 +11,8 @@ Repo-local guidance for `SloppyLogExplorer`.
 ## Working Rules
 
 - When changing behavior, packaging, or commands, check `README.md` and `pyproject.toml` first.
-- Prefer root-cause fixes over compatibility shims unless the user asks for compatibility.
+- Prefer root-cause fixes over compatibility shims unless the user asks for compatibility explicitly.
+- Prefer efficient, high performance code over compatibility and low-probability fallback chains.
 - Keep generated and machine-local files out of Git, including `.venv/`, `build/`, `dist/`, `validation_artifacts/`, `*.log`, `*.zip`, `*.wav`, and `*.egg-info/`.
 - If you are working from the parent `EthosLua` workspace, check `git -C SloppyLogExplorer status --short --branch` before editing.
 
