@@ -1,3 +1,5 @@
+"""Offline MapLibre HTML/JS template for the GPS flight path view."""
+
 from __future__ import annotations
 
 import html
@@ -15,6 +17,8 @@ ALTITUDE_FLOOR_METERS = 12.0
 
 
 def _asset_uri(filename: str) -> str:
+    # MapLibre assets are bundled with the package; the WebEngine view loads
+    # them from local file URIs so the map works without networked assets.
     asset_path = Path(__file__).resolve().parent / "assets" / "maplibre" / filename
     return asset_path.as_uri()
 
@@ -49,6 +53,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     worker_uri_json = json.dumps(_asset_uri("maplibre-gl-csp-worker.js"))
     data_json = json.dumps(payload, allow_nan=False)
 
+    # The document is a large inline template because the WebEngine path needs
+    # to stay self-contained and work even when the app is packaged.
     document = """
 <!doctype html>
 <html>
@@ -1364,6 +1370,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         "__PANEL_FG__": panel_fg,
         "__BORDER__": border,
     }
+    # Replace placeholder tokens last so the template stays readable above and
+    # the payload can be serialized with strict JSON escaping.
     for token, value in replacements.items():
         document = document.replace(token, value)
     return document

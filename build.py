@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""PyInstaller build wrapper for the desktop executable."""
+
 from __future__ import annotations
 
 import argparse
@@ -20,6 +22,8 @@ def build(one_file: bool = False, clean: bool = False) -> int:
     assets_dir = project_root / "sloppy_log_explorer" / "assets"
 
     if clean:
+        # Clean only the local build outputs so a stale spec or previous dist
+        # tree does not mask packaging changes during a fresh run.
         shutil.rmtree(dist_dir, ignore_errors=True)
         shutil.rmtree(build_dir, ignore_errors=True)
         spec_file = project_root / f"{APP_NAME}.spec"
@@ -41,6 +45,8 @@ def build(one_file: bool = False, clean: bool = False) -> int:
         str(project_root),
         "--collect-all",
         "plotly",
+        # Kaleido and pyttsx3 both need extra data or submodule collection for
+        # the packaged app to render charts and synthesize speech reliably.
         "--collect-data",
         "kaleido",
         "--add-data",

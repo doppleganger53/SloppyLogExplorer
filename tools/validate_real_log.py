@@ -1,3 +1,5 @@
+"""Command-line validation against a real telemetry log."""
+
 from __future__ import annotations
 
 import argparse
@@ -21,6 +23,8 @@ from sloppy_log_explorer.plotting import build_gps_map_html, build_telemetry_fig
 
 
 def as_jsonable(value: Any) -> Any:
+    # Normalize paths and timestamps so the final report can be dumped to JSON
+    # without custom serializers.
     if isinstance(value, Path):
         return str(value)
     if hasattr(value, "isoformat"):
@@ -50,6 +54,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
 
     compare = load_log(compare_path, library_root) if compare_path else log
     common = [column for column in selected if column in compare.dataframe.columns]
+    # Reuse the same cursor logic against the compare log so the contract
+    # covers both the primary view and the diff view.
     compare_fig = build_telemetry_figure(log, common, compare=compare, selected_index=min(10, log.info.rows - 1))
     if common and len(compare_fig.data) < len(common) * 2:
         raise AssertionError("compare figure did not include primary and compare traces")
@@ -64,6 +70,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
     if log.info.has_gps and ("maplibregl.map" not in gps_html_lower or "tile.openstreetmap.org" not in gps_html_lower):
         raise AssertionError("GPS map HTML is missing MapLibre or OpenStreetMap raster tiles")
     if log.info.has_gps:
+        # These tokens pin the generated HTML/JS contract that the live map
+        # validator depends on, so a renderer regression shows up immediately.
         required_map_tokens = [
             "maplibre-gl-csp.js",
             "maplibre-gl-csp-worker.js",
@@ -200,6 +208,8 @@ def validate_ui(
     if render_graph is not None:
         render_graph.parent.mkdir(parents=True, exist_ok=True)
         window.graph_view.resize(1200, 650)
+        # Grab a screenshot after the widget is sized so the output reflects a
+        # realistic rendered graph rather than an initial placeholder layout.
         image = window.graph_view.grab()
         if not image.save(str(render_graph)):
             raise AssertionError(f"failed to save graph render to {render_graph}")

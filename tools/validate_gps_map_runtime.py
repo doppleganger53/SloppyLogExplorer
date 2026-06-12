@@ -1,3 +1,5 @@
+"""Live Qt WebEngine validation for the GPS map renderer."""
+
 from __future__ import annotations
 
 import argparse
@@ -17,6 +19,7 @@ def _run_event_loop(timeout_ms: int) -> None:
     from PyQt6.QtCore import QEventLoop, QTimer
 
     loop = QEventLoop()
+    # Let the WebEngine event queue drain for a short, deterministic window.
     QTimer.singleShot(timeout_ms, loop.quit)
     loop.exec()
 
@@ -35,6 +38,8 @@ def _run_js(page: Any, script: str, timeout_ms: int = 1000) -> Any:
 def _wait_for_ready_state(page: Any, attempts: int = 60) -> dict[str, Any] | None:
     state = None
     for _ in range(attempts):
+        # Poll instead of sleeping blindly because MapLibre becomes ready
+        # asynchronously after the HTML page and tile assets finish loading.
         state = _run_js(
             page,
             "window.sloppyGpsMap && window.sloppyGpsMap.getState ? window.sloppyGpsMap.getState() : null;",
@@ -55,6 +60,8 @@ def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float 
         raise AssertionError(f"GPS map is missing the native 3D extrusion path layer at {label}: {state}")
     if not state.get("native3dPathReady"):
         raise AssertionError(f"GPS map native 3D extrusion path is not ready at {label}: {state}")
+    # The WebGL diagnostic layer is optional, but if it exists it should carry
+    # real vertices so it can prove the renderer path is working.
     if layers.get("flight-elevation-layer") and int(state.get("ribbonVertexCount") or 0) <= 0:
         raise AssertionError(f"GPS map WebGL diagnostic ribbon has no vertices at {label}: {state}")
     if float(camera.get("maxPitch") or 0) < 85:
@@ -122,6 +129,8 @@ def validate_gps_map_runtime(
 
     options = GpsGradientOptions(color_column=color_column)
     html_path = state_root / "gps-map-runtime.html"
+    # Write the HTML to disk so the page exercises the same file:// loading
+    # path that the desktop widget uses.
     html_path.write_text(build_gps_map_html(log, options), encoding="utf-8")
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -179,6 +188,8 @@ def validate_gps_map_runtime(
 
     _run_event_loop(1200)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Sample the viewport after the map has settled so the screenshot reflects
+    # both the rendered terrain and the flight overlay.
     image = view.grab().toImage()
     if not image.save(str(output)):
         view.close()

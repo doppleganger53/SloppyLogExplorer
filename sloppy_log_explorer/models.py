@@ -1,3 +1,5 @@
+"""Shared telemetry, GPS, and sync data containers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -64,7 +66,11 @@ class LoadedLog:
     def parameter_columns(self) -> list[str]:
         hidden = set()
         if self.time is not None:
+            # Keep timeline fields out of the plot picker so users only see
+            # actual telemetry parameters instead of redundant time columns.
             hidden.update(c for c in self.dataframe.columns if "time" in c.lower() or "date" in c.lower())
+        # Internal helper columns are injected during GPS parsing and should
+        # never surface as normal plot candidates.
         hidden.update(c for c in self.dataframe.columns if c.startswith("__"))
         return [c for c in self.numeric_columns if c not in hidden]
 

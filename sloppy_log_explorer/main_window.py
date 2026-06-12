@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
-    QWidget,
+    QWidget
 )
 
 from .analysis import (
@@ -79,7 +79,12 @@ class MainWindow(QMainWindow):
         self._restore_state()
 
     def _build_actions(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
+        menu_bar = self.menuBar()
+        if menu_bar is None:
+            raise RuntimeError("Failed to get menu bar")    
+        file_menu =  menu_bar.addMenu("File")
+        if file_menu is None:
+            raise RuntimeError("Failed to create File menu")
         open_log = QAction("Open Log...", self)
         open_log.triggered.connect(self.open_log_dialog)
         file_menu.addAction(open_log)
@@ -89,23 +94,31 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
-        view_menu = self.menuBar().addMenu("View")
-        self.grid_action = QAction("Show Grid", self, checkable=True)
+        view_menu = menu_bar.addMenu("View")
+        if view_menu is None:
+            raise RuntimeError("Failed to create View menu")
+        self.grid_action = QAction("Show Grid", self)
+        self.grid_action.setCheckable(True)
         self.grid_action.setChecked(True)
         self.grid_action.triggered.connect(self.refresh_plots)
         view_menu.addAction(self.grid_action)
-        self.dark_action = QAction("Dark Theme", self, checkable=True)
+        self.dark_action = QAction("Dark Theme", self)
+        self.dark_action.setCheckable(True)
         self.dark_action.setChecked(True)
         self.dark_action.triggered.connect(self.toggle_theme)
         view_menu.addAction(self.dark_action)
         view_menu.addSeparator()
         view_menu.addAction("Reset Telemetry View", self.reset_telemetry_view)
 
-        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu = menu_bar.addMenu("Tools")
+        if tools_menu is None:
+            raise RuntimeError("Failed to create Tools menu")
         tools_menu.addAction("Scan Sync Candidates", self.scan_sync)
         tools_menu.addAction("Generate Voice Pack", self.generate_voice_pack)
 
-        help_menu = self.menuBar().addMenu("Help")
+        help_menu = menu_bar.addMenu("Help")
+        if help_menu is None:
+            raise RuntimeError("Failed to create Help menu")
         help_menu.addAction("About", self.about)
 
     def _build_ui(self) -> None:
@@ -133,6 +146,8 @@ class MainWindow(QMainWindow):
         self.library_tree = QTreeWidget()
         self.library_tree.setHeaderLabels(["Model / Log", "Logs", "Latest", "Size"])
         header = self.library_tree.header()
+        if header is None:
+            raise RuntimeError("Failed to get library tree header")
         for column in range(4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         header.setSectionsClickable(True)
@@ -161,7 +176,7 @@ class MainWindow(QMainWindow):
 
         self.column_table = QTableWidget(0, 2)
         self.column_table.setHorizontalHeaderLabels(["Show", "Parameter"])
-        self.column_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.column_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.column_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._configure_sortable_table(self.column_table)
         self.column_table.itemChanged.connect(self.column_changed)
@@ -339,13 +354,13 @@ class MainWindow(QMainWindow):
 
         self.battery_table = QTableWidget(0, 4)
         self.battery_table.setHorizontalHeaderLabels(["ID", "Name", "Cells", "Active"])
-        self.battery_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.battery_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.battery_table)
         layout.addWidget(self.battery_table, 1)
 
         self.history_table = QTableWidget(0, 6)
         self.history_table.setHorizontalHeaderLabels(["Battery", "Date", "Pack mOhm", "Cell mOhm", "Health", "Log"])
-        self.history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.history_table).setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.history_table)
         layout.addWidget(self.history_table, 2)
         self.tabs.addTab(tab, "Batteries")
@@ -371,7 +386,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         self.sync_table = QTableWidget(0, 4)
         self.sync_table.setHorizontalHeaderLabels(["Reason", "Relative Path", "Source", "Target"])
-        self.sync_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.sync_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.sync_table)
         layout.addWidget(self.sync_table)
         self.tabs.addTab(tab, "SD Sync")
@@ -391,7 +406,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.alias_table = QTableWidget(0, 2)
         self.alias_table.setHorizontalHeaderLabels(["Hardware switch/file", "Radio alias/UI label"])
-        self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.alias_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.alias_table)
         layout.addWidget(self.alias_table)
         self.tabs.addTab(tab, "Switch Aliases")
@@ -417,8 +432,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.voice_table = QTableWidget(0, 2)
         self.voice_table.setHorizontalHeaderLabels(["Text to be Spoken", "Target WAV Filename"])
-        self.voice_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.voice_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.voice_table).setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.voice_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.voice_table)
         layout.addWidget(self.voice_table)
         self.tabs.addTab(tab, "Voice Pack")
@@ -481,6 +496,8 @@ class MainWindow(QMainWindow):
         color_column = self.gps_color_combo.currentText()
         has_color = bool(color_column and color_column != "(none)")
         auto_range = self.gps_auto_range_check.isChecked()
+        # Range controls only make sense when a numeric color column is active;
+        # the midpoint slider is a second-order option layered on top of that.
         self.gps_auto_range_check.setEnabled(has_color)
         self.gps_min_spin.setEnabled(has_color and not auto_range)
         self.gps_max_spin.setEnabled(has_color and not auto_range)
@@ -497,6 +514,8 @@ class MainWindow(QMainWindow):
         values = series.dropna()
         if values.empty:
             return
+        # Seed the manual range controls from the current data so the user can
+        # immediately switch off auto-range without getting blank defaults.
         minimum = float(values.min())
         maximum = float(values.max())
         midpoint = minimum + (maximum - minimum) / 2.0
@@ -525,14 +544,24 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _configure_sortable_table(table: QTableWidget) -> None:
+    def _horizontal_header(table: QTableWidget) -> QHeaderView:
         header = table.horizontalHeader()
+        if header is None:
+            raise RuntimeError("QTableWidget did not provide a horizontal header")
+        return header
+
+    @staticmethod
+    def _configure_sortable_table(table: QTableWidget) -> None:
+        header = MainWindow._horizontal_header(table)
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         table.setSortingEnabled(True)
 
     def _apply_style(self) -> None:
-        QApplication.instance().setStyle("Fusion")
+        app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            raise RuntimeError("No QApplication instance found")
+        app.setStyle("Fusion")
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #20242b; color: #e5e7eb; }
@@ -552,6 +581,8 @@ class MainWindow(QMainWindow):
         )
 
     def _restore_state(self) -> None:
+        # Restore the library first so any saved last-log path can be resolved
+        # against the same root that was active in the previous session.
         last_library = self.store.get_setting("library_root")
         if last_library and Path(last_library).exists():
             self.load_library(Path(last_library))
@@ -608,6 +639,8 @@ class MainWindow(QMainWindow):
             parent.setData(1, Qt.ItemDataRole.UserRole, len(logs))
             parent.setData(2, Qt.ItemDataRole.UserRole, latest)
             parent.setData(3, Qt.ItemDataRole.UserRole, total_size)
+            # Store numeric sort keys separately from the visible labels so the
+            # tree can be re-sorted without reparsing formatted text.
             self.library_tree.addTopLevelItem(parent)
             for log in logs:
                 item = QTreeWidgetItem(
@@ -632,6 +665,8 @@ class MainWindow(QMainWindow):
 
     def library_header_clicked(self, column: int) -> None:
         header = self.library_tree.header()
+        if header is None:
+            return
         current_column = header.sortIndicatorSection()
         current_order = header.sortIndicatorOrder()
         if current_column == column:
@@ -645,6 +680,8 @@ class MainWindow(QMainWindow):
             self.current_log = load_log(path, self.library_root)
             self.selected_index = 0
             self.store.set_setting("last_log", str(path))
+            # Every dependent widget needs a refresh because a new log changes
+            # the available columns, GPS choices, and saved notes target.
             self.initialize_selected_parameters()
             self.populate_columns()
             self.populate_gps_color_combo()
@@ -695,12 +732,16 @@ class MainWindow(QMainWindow):
         stored = set(self.store.get_setting("selected_columns", []))
         selected = stored & available
         if not selected:
+            # Fall back to a heuristic shortlist only when the previous
+            # selection no longer matches the current log.
             selected = set(suggest_display_columns(self.current_log.parameter_columns))
         self.selected_parameter_columns = selected
 
     def set_visible_columns_checked(self, checked: bool) -> None:
         if self.current_log is None:
             return
+        # Block signals while bulk-toggling to avoid a cascade of itemChanged
+        # callbacks for every row in the table.
         self.column_table.blockSignals(True)
         try:
             for row in range(self.column_table.rowCount()):
@@ -733,6 +774,8 @@ class MainWindow(QMainWindow):
     def commit_column_selection(self) -> None:
         cols = self.selected_columns()
         self.store.set_setting("selected_columns", cols)
+        # The GPS color picker depends on the visible parameter list, so refresh
+        # it before repainting the plots.
         self.populate_gps_color_combo()
         self.refresh_plots()
 
@@ -793,6 +836,8 @@ class MainWindow(QMainWindow):
         self.gps_color_combo.clear()
         self.gps_color_combo.addItem("(none)")
         if self.current_log is not None:
+            # Offer every numeric parameter here, not just selected plot
+            # channels, so the color ramp can use hidden telemetry fields too.
             for col in self.current_log.parameter_columns:
                 self.gps_color_combo.addItem(col)
         if current:
@@ -898,6 +943,8 @@ class MainWindow(QMainWindow):
     def refresh_batteries(self) -> None:
         batteries = self.store.list_batteries()
         self.battery_select.clear()
+        # Disable sorting while repopulating so row inserts do not keep moving
+        # the cursor around mid-update.
         self.battery_table.setSortingEnabled(False)
         self.battery_table.setRowCount(0)
         for battery in batteries:
@@ -1005,6 +1052,8 @@ class MainWindow(QMainWindow):
             return
         aliases = self.store.load_aliases(profile)
         if not aliases:
+            # Seed a fixed switch matrix so an empty profile still exposes the
+            # common radio switch names users are likely to edit.
             aliases = {switch: "" for switch in [f"S{i}" for i in range(1, 13)] + ["SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH"]}
         self.alias_table.setSortingEnabled(False)
         self.alias_table.setRowCount(0)
@@ -1041,6 +1090,8 @@ class MainWindow(QMainWindow):
             text = self.voice_table.item(row, 0)
             filename = self.voice_table.item(row, 1)
             if text and filename and text.text().strip() and filename.text().strip():
+                # Ignore draft rows so partially entered voice-pack entries do
+                # not produce empty output files.
                 items.append(VoiceItem(text.text().strip(), filename.text().strip()))
         return items
 
@@ -1082,28 +1133,46 @@ class MainWindow(QMainWindow):
         )
 
     def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
-        items = [self.library_tree.topLevelItem(index) for index in range(self.library_tree.topLevelItemCount())]
+        _my_library_tree = self.library_tree
+        if _my_library_tree is None:
+            raise RuntimeError("Library tree widget not found for sorting")
+        items: list[QTreeWidgetItem] = []
+        for index in range(_my_library_tree.topLevelItemCount()):
+            item = _my_library_tree.topLevelItem(index)
+            if item is None:
+                raise RuntimeError("Failed to retrieve library tree items for sorting")
+            items.append(item)
+        # Capture expansion state before we rebuild the tree, otherwise Qt will
+        # collapse everything when the items are reinserted.
         expanded_state = {id(item): item.isExpanded() for item in items}
-        while self.library_tree.topLevelItemCount():
-            self.library_tree.takeTopLevelItem(0)
+        while _my_library_tree.topLevelItemCount():
+            _my_library_tree.takeTopLevelItem(0)
 
         reverse = order == Qt.SortOrder.DescendingOrder
         items.sort(key=lambda item: self._library_sort_key(item, column), reverse=reverse)
 
-        self.library_tree.setUpdatesEnabled(False)
+        _my_library_tree.setUpdatesEnabled(False)
         try:
             for index, item in enumerate(items):
-                self.library_tree.insertTopLevelItem(index, item)
+                _my_library_tree.insertTopLevelItem(index, item)
                 self._sort_library_children(item, column, order)
             for item in items:
                 item.setExpanded(expanded_state.get(id(item), False))
         finally:
-            self.library_tree.setUpdatesEnabled(True)
+            _my_library_tree.setUpdatesEnabled(True)
 
-        self.library_tree.header().setSortIndicator(column, order)
+        header = _my_library_tree.header()
+        if header is None:
+            raise RuntimeError("Failed to get library tree header for sort indicator")
+        header.setSortIndicator(column, order)
 
     def _sort_library_children(self, item: QTreeWidgetItem, column: int, order: Qt.SortOrder) -> None:
-        children = [item.child(index) for index in range(item.childCount())]
+        children: list[QTreeWidgetItem] = []
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if child is None:
+                raise RuntimeError("Failed to retrieve library tree child items for sorting")
+            children.append(child)
         expanded_state = {id(child): child.isExpanded() for child in children}
         while item.childCount():
             item.takeChild(0)
@@ -1119,6 +1188,8 @@ class MainWindow(QMainWindow):
     def _library_sort_key(self, item: QTreeWidgetItem, column: int, child_rows: bool = False) -> tuple[object, str]:
         label = str(item.text(0)).casefold()
         if column == 1:
+            # Model rows sort by their stored counts, while child rows fall back
+            # to the label because the count column is intentionally blank there.
             primary = label if child_rows else int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
         elif column == 2:
             primary = float(item.data(2, Qt.ItemDataRole.UserRole) or 0.0)
@@ -1142,6 +1213,7 @@ class MainWindow(QMainWindow):
             if value < 1024.0 or unit == units[-1]:
                 return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
             value /= 1024.0
+        raise ValueError("Size value is too large to format")
 
     def closeEvent(self, event) -> None:
         self.store.close()
