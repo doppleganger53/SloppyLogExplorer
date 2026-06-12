@@ -6,7 +6,7 @@ import os
 import json
 import tempfile
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
@@ -30,6 +30,24 @@ class _PlotBridge(QObject):
     @pyqtSlot(int)
     def stepIndex(self, delta: int) -> None:
         self.index_stepped.emit(delta)
+
+
+class _GpsBridge(QObject):
+    elapsed_seeked = pyqtSignal(float)
+    playing_changed = pyqtSignal(bool)
+    speed_changed = pyqtSignal(float)
+
+    @pyqtSlot(float)
+    def seekElapsed(self, elapsed_seconds: float) -> None:
+        self.elapsed_seeked.emit(elapsed_seconds)
+
+    @pyqtSlot(bool)
+    def setPlaying(self, playing: bool) -> None:
+        self.playing_changed.emit(playing)
+
+    @pyqtSlot(float)
+    def setSpeed(self, speed: float) -> None:
+        self.speed_changed.emit(speed)
 
 
 def _use_web_engine() -> bool:
@@ -177,11 +195,16 @@ class TelemetryPlotWidget(QWidget):
 
 
 class GpsPathWidget(QWidget):
+    elapsed_seeked = pyqtSignal(float)
+    playing_changed = pyqtSignal(bool)
+    speed_changed = pyqtSignal(float)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.log: LoadedLog | None = None
         self.options = GpsGradientOptions()
         self.dark = True
+        self._last_cursor: dict[str, Any] | None = None
         self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
         self._page: QWebEnginePage | None = None
@@ -201,6 +224,13 @@ class GpsPathWidget(QWidget):
                 raise RuntimeError("QWebEnginePage.settings() returned None")
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            self._bridge = _GpsBridge()
+            self._bridge.elapsed_seeked.connect(self.elapsed_seeked.emit)
+            self._bridge.playing_changed.connect(self.playing_changed.emit)
+            self._bridge.speed_changed.connect(self.speed_changed.emit)
+            self._channel = QWebChannel(self._page)
+            self._channel.registerObject("gpsBridge", self._bridge)
+            self._page.setWebChannel(self._channel)
             self._page.loadFinished.connect(self._map_page_loaded)
             self._view.setPage(self._page)
         else:
@@ -228,6 +258,16 @@ class GpsPathWidget(QWidget):
             self._schedule_viewport_refresh(fit=True)
         else:
             self._view.setHtml(html)
+
+    def set_cursor(self, cursor: dict[str, Any]) -> None:
+        self._last_cursor = dict(cursor)
+        if not self._web_engine:
+            return
+        page = self._page
+        if page is None:
+            return
+        data = json.dumps(cursor, allow_nan=False)
+        page.runJavaScript(f"window.sloppyGpsMap ? window.sloppyGpsMap.setCursor({data}) : false;")
 
     def refresh_viewport(self, fit: bool = False) -> None:
         if not self._web_engine:
@@ -258,6 +298,8 @@ class GpsPathWidget(QWidget):
     def _map_page_loaded(self, ok: bool) -> None:
         if ok:
             self._schedule_viewport_refresh(fit=True)
+            if self._last_cursor is not None:
+                self.set_cursor(self._last_cursor)
 
     def showEvent(self, a0) -> None:
         super().showEvent(a0)

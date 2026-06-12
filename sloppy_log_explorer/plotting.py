@@ -71,7 +71,7 @@ def _is_finite_number(value: object) -> bool:
 def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     series = df[column]
     if isinstance(series, pd.DataFrame):
-        series = series.iloc[:, 0]
+        series = series[series.columns[0]]
     numeric = pd.to_numeric(series, errors="coerce")
     return pd.Series(numeric, index=series.index)
 
@@ -100,6 +100,7 @@ class GpsPoint(TypedDict):
     lon: float
     alt: float
     row: int
+    elapsedSeconds: float
     value: float | None
 
 
@@ -426,6 +427,13 @@ def _empty_gps_payload(message: str) -> dict[str, object]:
         "points": [],
         "segments": [],
         "legend": {"enabled": False},
+        "timeline": {
+            "enabled": False,
+            "durationSeconds": 0.0,
+            "startElapsedSeconds": 0.0,
+            "endElapsedSeconds": 0.0,
+            "rows": 0,
+        },
         "altitudeLabel": "Altitude",
         "altitudeStats": {"label": "Altitude", "minimum": None, "maximum": None, "baseMeters": 0.0},
         "altitudeScale": ALTITUDE_EXAGGERATION,
@@ -451,6 +459,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     lat_values = _numeric_series(df, gps.latitude)
     lon_values = _numeric_series(df, gps.longitude)
     time_values = list(log.time) if log.time is not None else [None] * len(df)
+    elapsed_values = relative_seconds(log)
     if gps.altitude and gps.altitude in df.columns:
         alt_values = _numeric_series(df, gps.altitude)
         altitude_label = gps.altitude_label or gps.altitude
@@ -478,6 +487,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             "lon": lon,
             "alt": alt if alt is not None else 0.0,
             "row": row_index + 1,
+            "elapsedSeconds": elapsed_values[row_index] if row_index < len(elapsed_values) else float(row_index),
             "value": None,
         }
         if color_values is not None:
@@ -600,6 +610,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     valid_altitudes = [point["alt"] for point in points if math.isfinite(point["alt"])]
     altitude_minimum = min(valid_altitudes) if valid_altitudes else 0.0
     altitude_maximum = max(valid_altitudes) if valid_altitudes else 0.0
+    timeline_end = max(elapsed_values) if elapsed_values else 0.0
 
     return {
         "status": "ok",
@@ -608,6 +619,13 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "pathParts": path_parts_json,
         "segments": segments,
         "legend": legend,
+        "timeline": {
+            "enabled": bool(points),
+            "durationSeconds": timeline_end,
+            "startElapsedSeconds": 0.0,
+            "endElapsedSeconds": timeline_end,
+            "rows": len(df),
+        },
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
         "altitudeLabel": altitude_label,

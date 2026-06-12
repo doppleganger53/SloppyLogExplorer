@@ -346,6 +346,15 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert payload["mapMaxPitch"] == 85
     assert payload["rasterTileMaxZoom"] == 19
     assert payload["rasterTileUrls"] == ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"]
+    assert payload["timeline"] == {
+        "enabled": True,
+        "durationSeconds": 8.0,
+        "startElapsedSeconds": 0.0,
+        "endElapsedSeconds": 8.0,
+        "rows": 9,
+    }
+    assert payload["points"][0]["elapsedSeconds"] == pytest.approx(0.0)
+    assert payload["points"][-1]["elapsedSeconds"] == pytest.approx(8.0)
     assert 'const pathParts = Array.isArray(flightData.pathParts)' in html
     assert "function buildFlightGeoJson()" in html
     assert "pathParts.forEach((part, index) => {" in html
@@ -358,6 +367,18 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "const left = coordinateFromPoint(segment.left);" in html
     assert "const right = coordinateFromPoint(segment.right);" in html
     assert 'id="flightCanvas"' in html
+    assert 'id="currentPointReadout"' in html
+    assert 'id="playbackOverlay"' in html
+    assert 'id="playbackSlider"' in html
+    assert 'id="playbackSpeed"' in html
+    assert 'value="10"' in html
+    assert "qrc:///qtwebchannel/qwebchannel.js" in html
+    assert "let gpsBridge = null" in html
+    assert "function connectGpsBridge()" in html
+    assert "function interpolatedPointForElapsed(elapsedSeconds)" in html
+    assert "function drawCurrentCursorMarker()" in html
+    assert "function setCursor(cursor)" in html
+    assert "function setPlayback(playback)" in html
     assert "const flightCanvas = document.getElementById(\"flightCanvas\");" in html
     assert "canvasPathReady" in html
     assert "function drawFlightCanvas()" in html
@@ -421,6 +442,8 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "fit: fitFlightBounds" in html
     assert "refresh: refreshMapViewport" in html
     assert "setCameraMode" in html
+    assert "setCursor" in html
+    assert "setPlayback" in html
     assert "getState: debugMapState" in html
     assert 'id="flightOverlay"' not in html
     assert "function drawFlightOverlay()" not in html
@@ -520,6 +543,40 @@ def test_gps_webengine_widget_refreshes_map_viewport() -> None:
     assert fake_widget._page.scripts
     assert "window.sloppyGpsMap.refresh" in fake_widget._page.scripts[-1]
     assert '"fit": true' in fake_widget._page.scripts[-1]
+
+
+def test_gps_webengine_widget_updates_cursor_without_reloading_map() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def runJavaScript(self, script: str, callback=None) -> None:
+            self.scripts.append(script)
+            if callback:
+                callback(True)
+
+    fake_widget = GpsPathWidget.__new__(GpsPathWidget)
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+    fake_widget._last_cursor = None
+
+    GpsPathWidget.set_cursor(
+        fake_widget,
+        {
+            "index": 3,
+            "row": 4,
+            "elapsedSeconds": 3.0,
+            "durationSeconds": 8.0,
+            "playing": False,
+            "speed": 1.0,
+            "values": [{"label": "Current(A)", "value": 30.0}],
+        },
+    )
+
+    assert fake_widget._last_cursor["row"] == 4
+    assert fake_widget._page.scripts
+    assert "window.sloppyGpsMap ? window.sloppyGpsMap.setCursor" in fake_widget._page.scripts[-1]
+    assert '"elapsedSeconds": 3.0' in fake_widget._page.scripts[-1]
 
 
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
@@ -759,6 +816,88 @@ def test_gps_color_selector_uses_all_numeric_parameters(tmp_path: Path, monkeypa
     assert "Current(A)" in gps_choices
     assert "Alt(m)" in gps_choices
     assert "Current(A)" not in window.selected_columns()
+    window.close()
+    app.quit()
+
+
+def test_gps_marker_value_selectors_drive_cursor_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    cursor_payloads: list[dict[str, object]] = []
+    monkeypatch.setattr(window.gps_view, "set_cursor", lambda payload: cursor_payloads.append(dict(payload)))
+
+    window.gps_color_combo.setCurrentText("Current(A)")
+    window.gps_marker_value_combos[0].setCurrentText("Alt(m)")
+    window.gps_marker_value_combos[1].setCurrentText("Current(A)")
+    map_reloads: list[object] = []
+    monkeypatch.setattr(window.gps_view, "set_path", lambda *args, **kwargs: map_reloads.append((args, kwargs)))
+    window.set_selected_index(3)
+
+    assert cursor_payloads
+    payload = cursor_payloads[-1]
+    assert payload["row"] == 4
+    assert payload["elapsedSeconds"] == pytest.approx(3.0)
+    assert payload["durationSeconds"] == pytest.approx(8.0)
+    assert payload["playing"] is False
+    assert payload["speed"] == pytest.approx(1.0)
+    assert payload["values"] == [
+        {"label": "Current(A)", "value": 30.0},
+        {"label": "Alt(m)", "value": 16},
+    ]
+    assert map_reloads == []
+
+    window.close()
+    app.quit()
+
+
+def test_gps_playback_tick_advances_synced_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    import sloppy_log_explorer.main_window as main_window_module
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    cursor_payloads: list[dict[str, object]] = []
+    monkeypatch.setattr(window.gps_view, "set_cursor", lambda payload: cursor_payloads.append(dict(payload)))
+    ticks = iter([100.0, 100.3, 100.6])
+    monkeypatch.setattr(main_window_module.time, "perf_counter", lambda: next(ticks))
+
+    window.set_gps_playback_speed(1.0)
+    window.set_gps_playback_playing(True)
+    window.gps_playback_tick()
+    assert window.selected_index == 0
+    window.gps_playback_tick()
+
+    assert window.selected_index == 1
+    assert cursor_payloads[-1]["row"] == 2
+    assert cursor_payloads[-1]["elapsedSeconds"] == pytest.approx(0.6)
+    assert cursor_payloads[-1]["playing"] is True
+    assert cursor_payloads[-1]["speed"] == pytest.approx(1.0)
+
+    window.set_gps_playback_playing(False)
     window.close()
     app.quit()
 

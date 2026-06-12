@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import html
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl
+import pandas as pd
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -45,7 +47,7 @@ from .analysis import (
 )
 from .library import group_by_model, scan_library
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
-from .parser import load_log
+from .parser import load_log, nearest_index, relative_seconds
 from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
@@ -71,8 +73,17 @@ class MainWindow(QMainWindow):
         self.selected_parameter_columns: set[str] = set()
         self.gps_start_color = GpsGradientOptions.start_color
         self.gps_end_color = GpsGradientOptions.end_color
+        self.gps_playback_playing = False
+        self.gps_playback_speed = 1.0
+        self.gps_playback_last_tick: float | None = None
+        self.gps_playback_elapsed_seconds = 0.0
+        self.gps_timeline_seconds: list[float] = []
+        self.gps_marker_value_combos: list[QComboBox] = []
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
+        self.gps_playback_timer = QTimer(self)
+        self.gps_playback_timer.setInterval(100)
+        self.gps_playback_timer.timeout.connect(self.gps_playback_tick)
 
         self._build_actions()
         self._build_ui()
@@ -296,12 +307,29 @@ class MainWindow(QMainWindow):
         range_row.addStretch()
         layout.addLayout(range_row)
 
+        marker_row = QHBoxLayout()
+        marker_row.addWidget(QLabel("Marker values"))
+        self.gps_marker_value_combos = []
+        for index in range(3):
+            combo = QComboBox()
+            combo.setMinimumWidth(150)
+            combo.currentTextChanged.connect(self.gps_marker_values_changed)
+            marker_row.addWidget(QLabel(f"{index + 1}"))
+            marker_row.addWidget(combo)
+            self.gps_marker_value_combos.append(combo)
+        marker_row.addStretch()
+        layout.addLayout(marker_row)
+
         self.gps_view = GpsPathWidget()
+        self.gps_view.elapsed_seeked.connect(self.seek_gps_elapsed)
+        self.gps_view.playing_changed.connect(self.set_gps_playback_playing)
+        self.gps_view.speed_changed.connect(self.set_gps_playback_speed)
         layout.addWidget(self.gps_view, 1)
         self.gps_tab = tab
         self.tabs.addTab(tab, "Flight Map")
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
+        self.populate_gps_value_combos()
         self.gps_view.set_path(None, dark=self.dark_mode)
 
     def _build_flight_tab(self) -> None:
@@ -483,6 +511,25 @@ class MainWindow(QMainWindow):
         self._update_gps_range_enabled()
         self.refresh_gps()
 
+    def gps_marker_values_changed(self, *_args) -> None:
+        self.sync_gps_cursor()
+
+    def populate_gps_value_combos(self) -> None:
+        current_values = [combo.currentText() for combo in self.gps_marker_value_combos]
+        for index, combo in enumerate(self.gps_marker_value_combos):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)")
+            if self.current_log is not None:
+                for column in self.current_log.parameter_columns:
+                    combo.addItem(column)
+            current = current_values[index] if index < len(current_values) else ""
+            restored_index = combo.findText(current)
+            if restored_index >= 0:
+                combo.setCurrentIndex(restored_index)
+            combo.blockSignals(False)
+        self.sync_gps_cursor()
+
     def gps_auto_range_changed(self, *_args) -> None:
         self._populate_gps_range_defaults()
         self._update_gps_range_enabled()
@@ -543,6 +590,115 @@ class MainWindow(QMainWindow):
             range_max=self.gps_max_spin.value(),
             midpoint=self.gps_midpoint_spin.value() if self.gps_midpoint_check.isChecked() else None,
         )
+
+    def _reset_gps_playback(self) -> None:
+        self.gps_playback_playing = False
+        self.gps_playback_speed = 1.0
+        self.gps_playback_last_tick = None
+        self.gps_playback_elapsed_seconds = 0.0
+        self.gps_playback_timer.stop()
+        self.gps_timeline_seconds = relative_seconds(self.current_log) if self.current_log is not None else []
+
+    def _gps_elapsed_for_index(self, index: int) -> float:
+        if not self.gps_timeline_seconds:
+            return 0.0
+        safe_index = max(0, min(index, len(self.gps_timeline_seconds) - 1))
+        return float(self.gps_timeline_seconds[safe_index])
+
+    def _gps_duration_seconds(self) -> float:
+        return max(self.gps_timeline_seconds) if self.gps_timeline_seconds else 0.0
+
+    def _gps_marker_columns(self) -> list[str]:
+        if self.current_log is None:
+            return []
+        columns: list[str] = []
+        color_column = self.gps_color_combo.currentText()
+        if color_column and color_column != "(none)" and color_column in self.current_log.dataframe.columns:
+            columns.append(color_column)
+        for combo in self.gps_marker_value_combos:
+            column = combo.currentText()
+            if (
+                column
+                and column != "(none)"
+                and column in self.current_log.dataframe.columns
+                and column not in columns
+            ):
+                columns.append(column)
+        return columns[:4]
+
+    def _gps_marker_values(self) -> list[dict[str, object]]:
+        if self.current_log is None:
+            return []
+        values: list[dict[str, object]] = []
+        row_index = max(0, min(self.selected_index, len(self.current_log.dataframe) - 1))
+        for column in self._gps_marker_columns():
+            value = self.current_log.dataframe[column].iloc[row_index]
+            if pd.isna(value):
+                clean_value: object | None = None
+            elif hasattr(value, "item"):
+                clean_value = value.item()
+            else:
+                clean_value = value
+            values.append({"label": column, "value": clean_value})
+        return values
+
+    def _gps_cursor_payload(self) -> dict[str, object]:
+        elapsed = self.gps_playback_elapsed_seconds if self.gps_playback_playing else self._gps_elapsed_for_index(self.selected_index)
+        return {
+            "index": self.selected_index,
+            "row": self.selected_index + 1,
+            "elapsedSeconds": elapsed,
+            "durationSeconds": self._gps_duration_seconds(),
+            "playing": self.gps_playback_playing,
+            "speed": self.gps_playback_speed,
+            "values": self._gps_marker_values(),
+        }
+
+    def sync_gps_cursor(self) -> None:
+        if not hasattr(self, "gps_view"):
+            return
+        self.gps_view.set_cursor(self._gps_cursor_payload())
+
+    def seek_gps_elapsed(self, elapsed_seconds: float) -> None:
+        if self.current_log is None:
+            return
+        self.gps_playback_elapsed_seconds = max(0.0, min(float(elapsed_seconds), self._gps_duration_seconds()))
+        self.set_selected_index(
+            nearest_index(self.current_log, self.gps_playback_elapsed_seconds),
+            sync_playback_elapsed=False,
+        )
+
+    def set_gps_playback_playing(self, playing: bool) -> None:
+        self.gps_playback_playing = bool(playing) and self.current_log is not None and bool(self.gps_timeline_seconds)
+        self.gps_playback_last_tick = time.perf_counter() if self.gps_playback_playing else None
+        if self.gps_playback_playing:
+            self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
+        if self.gps_playback_playing:
+            self.gps_playback_timer.start()
+        else:
+            self.gps_playback_timer.stop()
+        self.sync_gps_cursor()
+
+    def set_gps_playback_speed(self, speed: float) -> None:
+        allowed = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+        self.gps_playback_speed = min(allowed, key=lambda candidate: abs(candidate - float(speed)))
+        self.sync_gps_cursor()
+
+    def gps_playback_tick(self) -> None:
+        if self.current_log is None or not self.gps_playback_playing:
+            self.set_gps_playback_playing(False)
+            return
+        now = time.perf_counter()
+        previous = self.gps_playback_last_tick or now
+        self.gps_playback_last_tick = now
+        next_elapsed = self.gps_playback_elapsed_seconds + (now - previous) * self.gps_playback_speed
+        duration = self._gps_duration_seconds()
+        self.gps_playback_elapsed_seconds = min(next_elapsed, duration)
+        if next_elapsed >= duration:
+            self.set_selected_index(len(self.current_log.dataframe) - 1, sync_playback_elapsed=False)
+            self.set_gps_playback_playing(False)
+            return
+        self.set_selected_index(nearest_index(self.current_log, next_elapsed), sync_playback_elapsed=False)
 
     @staticmethod
     def _horizontal_header(table: QTableWidget) -> QHeaderView:
@@ -680,12 +836,14 @@ class MainWindow(QMainWindow):
         try:
             self.current_log = load_log(path, self.library_root)
             self.selected_index = 0
+            self._reset_gps_playback()
             self.store.set_setting("last_log", str(path))
             # Every dependent widget needs a refresh because a new log changes
             # the available columns, GPS choices, and saved notes target.
             self.initialize_selected_parameters()
             self.populate_columns()
             self.populate_gps_color_combo()
+            self.populate_gps_value_combos()
             self.populate_analysis_combos()
             self.load_flight_notes()
             self.refresh_plots()
@@ -825,6 +983,7 @@ class MainWindow(QMainWindow):
             options=self._gps_gradient_options(),
             dark=self.dark_mode,
         )
+        self.sync_gps_cursor()
 
     def tab_changed(self, index: int) -> None:
         if hasattr(self, "gps_tab") and self.tabs.widget(index) is self.gps_tab:
@@ -848,12 +1007,15 @@ class MainWindow(QMainWindow):
         self._populate_gps_range_defaults()
         self._update_gps_range_enabled()
 
-    def set_selected_index(self, index: int) -> None:
+    def set_selected_index(self, index: int, sync_playback_elapsed: bool = True) -> None:
         if self.current_log is None:
             return
         self.selected_index = max(0, min(index, len(self.current_log.dataframe) - 1))
+        if sync_playback_elapsed:
+            self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
         self.update_info_panel()
         self.refresh_graph()
+        self.sync_gps_cursor()
 
     def step_selected_index(self, delta: int) -> None:
         self.set_selected_index(self.selected_index + delta)

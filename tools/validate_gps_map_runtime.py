@@ -54,8 +54,10 @@ def _wait_for_ready_state(page: Any, attempts: int = 60) -> dict[str, Any] | Non
 def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float | None = None) -> None:
     if not state or state.get("state") != "ready":
         raise AssertionError(f"GPS map did not stay ready at {label}: {state}")
-    layers = state.get("layers") if isinstance(state.get("layers"), dict) else {}
-    camera = state.get("camera") if isinstance(state.get("camera"), dict) else {}
+    raw_layers = state.get("layers")
+    raw_camera = state.get("camera")
+    layers: dict[str, Any] = raw_layers if isinstance(raw_layers, dict) else {}
+    camera: dict[str, Any] = raw_camera if isinstance(raw_camera, dict) else {}
     if not layers.get("flight-extrusions"):
         raise AssertionError(f"GPS map is missing the native 3D extrusion path layer at {label}: {state}")
     if not state.get("native3dPathReady"):
@@ -144,8 +146,11 @@ def validate_gps_map_runtime(
     profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
 
     page = QWebEnginePage(profile, app)
-    page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-    page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+    settings = page.settings()
+    if settings is None:
+        raise AssertionError("QWebEnginePage.settings() returned None")
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
     view = QWebEngineView()
     view.resize(width, height)
     view.setPage(page)
@@ -167,6 +172,32 @@ def validate_gps_map_runtime(
     except AssertionError:
         view.close()
         raise
+
+    _run_js(
+        page,
+        (
+            "window.sloppyGpsMap.setCursor({"
+            "index:3,row:4,elapsedSeconds:3,durationSeconds:8,playing:false,speed:2,"
+            "values:[{label:'Current(A)',value:30},{label:'Alt(m)',value:16}]"
+            "}); true;"
+        ),
+    )
+    cursor_state = _wait_for_ready_state(page)
+    if cursor_state is None:
+        view.close()
+        raise AssertionError("GPS map cursor state was not reported")
+    cursor = cursor_state.get("cursor")
+    if not isinstance(cursor, dict):
+        view.close()
+        raise AssertionError(f"GPS map cursor state was not reported: {cursor_state}")
+    if int(cursor.get("row") or 0) != 4 or abs(float(cursor.get("elapsedSeconds") or 0) - 3.0) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map cursor did not update to the requested point: {cursor_state}")
+    raw_playback = cursor_state.get("playback")
+    playback: dict[str, Any] = raw_playback if isinstance(raw_playback, dict) else {}
+    if float(playback.get("speed") or 0) != 2.0:
+        view.close()
+        raise AssertionError(f"GPS map playback state did not preserve requested speed: {cursor_state}")
 
     _run_js(
         page,
@@ -207,6 +238,7 @@ def validate_gps_map_runtime(
         "screenshot": str(output),
         "loaded": True,
         "initial": initial_state,
+        "afterCursor": cursor_state,
         "afterCamera": after_camera_state,
         "afterFit": after_fit_state,
         "image": metrics,

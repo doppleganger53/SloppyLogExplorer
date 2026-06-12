@@ -55,7 +55,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
 
     # The document is a large inline template because the WebEngine path needs
     # to stay self-contained and work even when the app is packaged.
-    document = """
+    document = r"""
 <!doctype html>
 <html>
 <head>
@@ -63,6 +63,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="__MAPLIBRE_CSS_URI__">
   <script src="__MAPLIBRE_JS_URI__"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <style>
     html, body {
       width: 100%;
@@ -154,6 +155,51 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       background: rgba(20,83,45,0.88);
       border-color: rgba(74,222,128,0.65);
     }
+    #currentPointReadout {
+      position: absolute;
+      z-index: 13;
+      min-width: 150px;
+      max-width: 260px;
+      color: __PANEL_FG__;
+      background: __PANEL_BG__;
+      border: 1px solid __BORDER__;
+      border-radius: 6px;
+      padding: 7px 9px;
+      box-sizing: border-box;
+      pointer-events: none;
+      font-size: 12px;
+      line-height: 1.35;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    }
+    #currentPointReadout::after {
+      content: "";
+      position: absolute;
+      left: 18px;
+      bottom: -7px;
+      width: 12px;
+      height: 12px;
+      transform: rotate(45deg);
+      background: __PANEL_BG__;
+      border-right: 1px solid __BORDER__;
+      border-bottom: 1px solid __BORDER__;
+    }
+    .readoutTitle {
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+    .readoutRow {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      white-space: nowrap;
+    }
+    .readoutLabel {
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .readoutValue {
+      font-variant-numeric: tabular-nums;
+    }
     #cameraControls {
       position: absolute;
       top: 10px;
@@ -204,11 +250,63 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     #mapAttribution a {
       color: #0645ad;
     }
+    #playbackOverlay {
+      position: absolute;
+      left: 50%;
+      bottom: 26px;
+      transform: translateX(-50%);
+      z-index: 12;
+      width: min(760px, calc(100% - 32px));
+      display: grid;
+      grid-template-columns: auto 52px minmax(120px, 1fr) 52px auto;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      box-sizing: border-box;
+      color: __PANEL_FG__;
+      background: __PANEL_BG__;
+      border: 1px solid __BORDER__;
+      border-radius: 7px;
+      box-shadow: 0 10px 28px rgba(0,0,0,0.28);
+    }
+    #playbackOverlay[hidden] {
+      display: none;
+    }
+    #playPauseButton {
+      width: 58px;
+      height: 30px;
+      border: 1px solid __BORDER__;
+      border-radius: 4px;
+      color: #ffffff;
+      background: #2f80ed;
+      font: 15px Arial, sans-serif;
+      cursor: pointer;
+    }
+    #playbackSlider {
+      width: 100%;
+      accent-color: #2f80ed;
+    }
+    #playbackCurrent,
+    #playbackDuration {
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+      white-space: nowrap;
+    }
+    #playbackSpeed {
+      height: 30px;
+      color: __PANEL_FG__;
+      background: rgba(0,0,0,0.16);
+      border: 1px solid __BORDER__;
+      border-radius: 4px;
+      font: 12px Arial, sans-serif;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <canvas id="flightCanvas"></canvas>
+  <div id="currentPointReadout" hidden></div>
   <div id="legend" hidden>
     <div id="legendTitle"></div>
     <div id="gradientBar"></div>
@@ -223,6 +321,20 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     <button type="button" data-camera-mode="top" title="Top-down map view">Top</button>
     <button type="button" data-camera-mode="orbit" title="Oblique 3D flight view" aria-pressed="true">3D</button>
     <button type="button" data-camera-mode="ground" title="Near-ground flight path view">Ground</button>
+  </div>
+  <div id="playbackOverlay" aria-label="GPS playback" hidden>
+    <button type="button" id="playPauseButton" title="Play or pause flight playback">Play</button>
+    <span id="playbackCurrent">0:00</span>
+    <input type="range" id="playbackSlider" min="0" max="1000" value="0" step="1" aria-label="Flight timeline">
+    <span id="playbackDuration">0:00</span>
+    <select id="playbackSpeed" aria-label="Playback speed">
+      <option value="0.25">.25x</option>
+      <option value="0.5">.5x</option>
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+      <option value="5">5x</option>
+      <option value="10">10x</option>
+    </select>
   </div>
   <div id="mapAttribution">
     Map tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
@@ -250,6 +362,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const altitudeFloorMeters = Number.isFinite(Number(flightData.altitudeFloorMeters))
       ? Number(flightData.altitudeFloorMeters)
       : 12;
+    const timeline = flightData.timeline || {};
+    const timelineEnabled = !!timeline.enabled;
+    const timelineDurationSeconds = Number.isFinite(Number(timeline.durationSeconds))
+      ? Math.max(0, Number(timeline.durationSeconds))
+      : 0;
     const pathRibbonWidthMeters = 24;
     const legendContainer = document.getElementById("legend");
     const legendTitle = document.getElementById("legendTitle");
@@ -261,6 +378,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const cameraControls = document.getElementById("cameraControls");
     const flightCanvas = document.getElementById("flightCanvas");
     const flightCanvasContext = flightCanvas ? flightCanvas.getContext("2d") : null;
+    const currentPointReadout = document.getElementById("currentPointReadout");
+    const playbackOverlay = document.getElementById("playbackOverlay");
+    const playPauseButton = document.getElementById("playPauseButton");
+    const playbackSlider = document.getElementById("playbackSlider");
+    const playbackCurrent = document.getElementById("playbackCurrent");
+    const playbackDuration = document.getElementById("playbackDuration");
+    const playbackSpeed = document.getElementById("playbackSpeed");
+    let gpsBridge = null;
     let statusHideTimer = null;
     let map = null;
     let flightBounds = null;
@@ -273,6 +398,15 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     let ribbonVertexCount = 0;
     let guideVertexCount = 0;
     let activeCameraMode = "orbit";
+    let currentCursor = {
+      index: 0,
+      row: 1,
+      elapsedSeconds: 0,
+      durationSeconds: timelineDurationSeconds,
+      playing: false,
+      speed: 1,
+      values: []
+    };
     let elevationMatrixSource = "";
     let elevationRenderArgKeys = [];
     let canvasDrawFrame = null;
@@ -280,6 +414,65 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
 
     function finiteNumber(value) {
       return value !== null && value !== "" && Number.isFinite(Number(value));
+    }
+
+    function clampNumber(value, minimum, maximum) {
+      const number = Number(value);
+      if (!Number.isFinite(number)) {
+        return minimum;
+      }
+      return Math.max(minimum, Math.min(maximum, number));
+    }
+
+    function formatElapsed(seconds) {
+      const safeSeconds = Math.max(0, Math.floor(Number(seconds) || 0));
+      const hours = Math.floor(safeSeconds / 3600);
+      const minutes = Math.floor((safeSeconds % 3600) / 60);
+      const remainingSeconds = safeSeconds % 60;
+      if (hours > 0) {
+        return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+      }
+      return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+    }
+
+    function formatReadoutValue(value) {
+      if (value === null || value === undefined || value === "") {
+        return "";
+      }
+      const number = Number(value);
+      if (Number.isFinite(number)) {
+        if (Math.abs(number) >= 1000 || (Math.abs(number) < 0.01 && number !== 0)) {
+          return number.toPrecision(4);
+        }
+        return number.toFixed(3).replace(/\.?0+$/, "");
+      }
+      return String(value);
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function connectGpsBridge() {
+      if (!window.qt || !window.qt.webChannelTransport || typeof QWebChannel === "undefined") {
+        return;
+      }
+      new QWebChannel(window.qt.webChannelTransport, (channel) => {
+        gpsBridge = channel.objects.gpsBridge || null;
+      });
+    }
+
+    function callGpsBridge(method, value) {
+      if (!gpsBridge || typeof gpsBridge[method] !== "function") {
+        return false;
+      }
+      gpsBridge[method](value);
+      return true;
     }
 
     function debugMapState() {
@@ -319,6 +512,19 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         ribbonVertexCount,
         guideVertexCount,
         cameraMode: activeCameraMode,
+        cursor: {
+          index: currentCursor.index,
+          row: currentCursor.row,
+          elapsedSeconds: currentCursor.elapsedSeconds,
+          durationSeconds: currentCursor.durationSeconds,
+          values: Array.isArray(currentCursor.values) ? currentCursor.values.length : 0
+        },
+        playback: {
+          enabled: timelineEnabled,
+          playing: !!currentCursor.playing,
+          speed: currentCursor.speed,
+          durationSeconds: timelineDurationSeconds
+        },
         camera: map ? {
           zoom: map.getZoom(),
           pitch: map.getPitch(),
@@ -413,6 +619,163 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         return null;
       }
       return [Number(point.lon), Number(point.lat)];
+    }
+
+    function allPathPoints() {
+      return pathParts.flatMap((part) => Array.isArray(part) ? part : []);
+    }
+
+    function nearestPointForElapsed(elapsedSeconds) {
+      const points = allPathPoints();
+      if (!points.length) {
+        return null;
+      }
+      let nearest = points[0];
+      let nearestDistance = Math.abs(Number(nearest.elapsedSeconds || 0) - elapsedSeconds);
+      points.forEach((point) => {
+        const distance = Math.abs(Number(point.elapsedSeconds || 0) - elapsedSeconds);
+        if (distance < nearestDistance) {
+          nearest = point;
+          nearestDistance = distance;
+        }
+      });
+      return nearest;
+    }
+
+    function interpolatedPointForElapsed(elapsedSeconds) {
+      const target = Number(elapsedSeconds);
+      if (!Number.isFinite(target)) {
+        return nearestPointForElapsed(0);
+      }
+      for (const part of pathParts) {
+        if (!Array.isArray(part) || !part.length) {
+          continue;
+        }
+        const first = part[0];
+        const last = part[part.length - 1];
+        const firstElapsed = Number(first.elapsedSeconds || 0);
+        const lastElapsed = Number(last.elapsedSeconds || firstElapsed);
+        if (target < firstElapsed || target > lastElapsed) {
+          continue;
+        }
+        for (let index = 0; index < part.length - 1; index += 1) {
+          const left = part[index];
+          const right = part[index + 1];
+          const leftElapsed = Number(left.elapsedSeconds || 0);
+          const rightElapsed = Number(right.elapsedSeconds || leftElapsed);
+          if (target < leftElapsed || target > rightElapsed) {
+            continue;
+          }
+          const span = rightElapsed - leftElapsed;
+          const amount = span > 0 ? (target - leftElapsed) / span : 0;
+          const nearest = amount <= 0.5 ? left : right;
+          return {
+            lat: Number(left.lat) + (Number(right.lat) - Number(left.lat)) * amount,
+            lon: Number(left.lon) + (Number(right.lon) - Number(left.lon)) * amount,
+            alt: Number(left.alt || 0) + (Number(right.alt || 0) - Number(left.alt || 0)) * amount,
+            elapsedSeconds: target,
+            row: nearest.row
+          };
+        }
+        return nearestPointForElapsed(target);
+      }
+      return nearestPointForElapsed(target);
+    }
+
+    function updatePlaybackControls() {
+      if (!playbackOverlay || !playbackSlider || !playbackCurrent || !playbackDuration || !playPauseButton) {
+        return;
+      }
+      playbackOverlay.hidden = !timelineEnabled;
+      const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || 0);
+      const elapsed = clampNumber(currentCursor.elapsedSeconds, 0, duration || 0);
+      const sliderValue = duration > 0 ? Math.round((elapsed / duration) * 1000) : 0;
+      playbackSlider.value = String(sliderValue);
+      playbackCurrent.textContent = formatElapsed(elapsed);
+      playbackDuration.textContent = formatElapsed(duration);
+      playPauseButton.textContent = currentCursor.playing ? "Pause" : "Play";
+      if (playbackSpeed) {
+        playbackSpeed.value = String(currentCursor.speed || 1);
+      }
+    }
+
+    function renderCurrentReadout(projected) {
+      if (!currentPointReadout || !projected) {
+        if (currentPointReadout) {
+          currentPointReadout.hidden = true;
+        }
+        return;
+      }
+      const values = Array.isArray(currentCursor.values) ? currentCursor.values : [];
+      const rows = values
+        .filter((entry) => entry && entry.label)
+        .map((entry) => (
+          `<div class="readoutRow"><span class="readoutLabel">${escapeHtml(entry.label)}</span>` +
+          `<span class="readoutValue">${escapeHtml(formatReadoutValue(entry.value))}</span></div>`
+        ));
+      currentPointReadout.innerHTML =
+        `<div class="readoutTitle">${formatElapsed(currentCursor.elapsedSeconds || 0)} | Row ${currentCursor.row || 1}</div>` +
+        rows.join("");
+      const left = Math.max(8, Math.min(window.innerWidth - 280, projected.x + 12));
+      const top = Math.max(8, Math.min(window.innerHeight - 160, projected.y - 76));
+      currentPointReadout.style.left = `${left}px`;
+      currentPointReadout.style.top = `${top}px`;
+      currentPointReadout.hidden = false;
+    }
+
+    function drawCurrentCursorMarker() {
+      if (!flightCanvasContext || !map) {
+        return false;
+      }
+      const point = interpolatedPointForElapsed(currentCursor.elapsedSeconds || 0);
+      const projected = point ? projectedPoint(point, true) : null;
+      if (!projected) {
+        renderCurrentReadout(null);
+        return false;
+      }
+      flightCanvasContext.save();
+      flightCanvasContext.fillStyle = "#f2c94c";
+      flightCanvasContext.strokeStyle = "#111827";
+      flightCanvasContext.lineWidth = 3;
+      flightCanvasContext.beginPath();
+      flightCanvasContext.arc(projected.x, projected.y, 9, 0, Math.PI * 2);
+      flightCanvasContext.fill();
+      flightCanvasContext.stroke();
+      flightCanvasContext.strokeStyle = "#ffffff";
+      flightCanvasContext.lineWidth = 2;
+      flightCanvasContext.beginPath();
+      flightCanvasContext.moveTo(projected.x - 13, projected.y);
+      flightCanvasContext.lineTo(projected.x + 13, projected.y);
+      flightCanvasContext.moveTo(projected.x, projected.y - 13);
+      flightCanvasContext.lineTo(projected.x, projected.y + 13);
+      flightCanvasContext.stroke();
+      flightCanvasContext.restore();
+      renderCurrentReadout(projected);
+      return true;
+    }
+
+    function setCursor(cursor) {
+      const next = cursor || {};
+      const duration = Number.isFinite(Number(next.durationSeconds))
+        ? Math.max(0, Number(next.durationSeconds))
+        : timelineDurationSeconds;
+      currentCursor = Object.assign({}, currentCursor, {
+        index: Number.isFinite(Number(next.index)) ? Number(next.index) : currentCursor.index,
+        row: Number.isFinite(Number(next.row)) ? Number(next.row) : currentCursor.row,
+        elapsedSeconds: clampNumber(next.elapsedSeconds, 0, duration || timelineDurationSeconds || 0),
+        durationSeconds: duration,
+        playing: next.playing === undefined ? currentCursor.playing : !!next.playing,
+        speed: Number.isFinite(Number(next.speed)) ? Number(next.speed) : currentCursor.speed,
+        values: Array.isArray(next.values) ? next.values : currentCursor.values
+      });
+      updatePlaybackControls();
+      scheduleFlightCanvasDraw();
+      debugMapState();
+      return true;
+    }
+
+    function setPlayback(playback) {
+      return setCursor(Object.assign({}, playback || {}, { values: currentCursor.values }));
     }
 
     function extrusionCoordinatesForSegment(leftPoint, rightPoint, widthMeters) {
@@ -987,6 +1350,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         drawn = true;
       });
 
+      drawn = drawCurrentCursorMarker() || drawn;
       canvasPathReady = drawn && drawFallbackPath;
       debugMapState();
       return drawn;
@@ -1284,10 +1648,37 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       return true;
     }
 
+    function bindPlaybackControls() {
+      updatePlaybackControls();
+      if (!timelineEnabled) {
+        return;
+      }
+      if (playPauseButton) {
+        playPauseButton.addEventListener("click", () => {
+          callGpsBridge("setPlaying", !currentCursor.playing);
+        });
+      }
+      if (playbackSpeed) {
+        playbackSpeed.addEventListener("change", () => {
+          callGpsBridge("setSpeed", Number(playbackSpeed.value) || 1);
+        });
+      }
+      if (playbackSlider) {
+        playbackSlider.addEventListener("input", () => {
+          const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || 0);
+          const elapsed = duration > 0 ? (Number(playbackSlider.value) / 1000) * duration : 0;
+          setCursor({ elapsedSeconds: elapsed, durationSeconds: duration, values: currentCursor.values });
+          callGpsBridge("seekElapsed", elapsed);
+        });
+      }
+    }
+
     function initMapLibreFlightMap() {
       if (!window.maplibregl) {
         throw new Error("MapLibre library failed to load");
       }
+      connectGpsBridge();
+      bindPlaybackControls();
       const startPoint = flightData.points[0];
       const endPoint = flightData.points[flightData.points.length - 1];
       initialBearing = calculateBearing(startPoint, endPoint);
@@ -1340,6 +1731,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         try {
           addFlightLayers();
           renderLegend();
+          setCursor(currentCursor);
           fitFlightBounds();
           setCameraMode("orbit", { animate: false, fit: false });
           refreshMapViewport();
@@ -1360,6 +1752,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       fit: fitFlightBounds,
       refresh: refreshMapViewport,
       setCameraMode,
+      setCursor,
+      setPlayback,
       getState: debugMapState
     };
 
