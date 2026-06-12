@@ -66,6 +66,20 @@ def write_coordinate_sample_with_separate_altitude(path: Path) -> None:
     )
 
 
+def write_coordinate_sample_with_missing_altitude(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS,GPS alt(m)",
+                '2026-01-01,12:00:00,"39.0000,-75.0000",',
+                '2026-01-01,12:00:01,"39.0005,-75.0005",105',
+                '2026-01-01,12:00:02,"39.0010,-75.0010",',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_split_coordinate_sample(path: Path) -> None:
     # Nonstandard column names should still be recognized when their numeric
     # ranges clearly match latitude and longitude.
@@ -151,6 +165,20 @@ def write_no_gps_sample(path: Path) -> None:
     )
 
 
+def write_gps_course_only_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,TxBat(V),Pot1,GPS course(°),Current(A),Altitude(m)",
+                "2026-01-01,12:00:00,7.6,12,359.8,0.2,10",
+                "2026-01-01,12:00:01,7.5,13,359.9,0.3,11",
+                "2026-01-01,12:00:02,7.4,14,359.9,0.1,12",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def write_library_blob(path: Path, size: int) -> None:
     path.write_text("x" * size, encoding="utf-8")
 
@@ -209,6 +237,19 @@ def test_load_log_pairs_coordinate_string_gps_with_separate_gps_altitude(tmp_pat
     assert [point["alt"] for point in payload["points"][:3]] == pytest.approx([100.0, 105.0, 112.0])
 
 
+def test_gps_map_payload_serializes_missing_altitude_as_zero(tmp_path: Path) -> None:
+    path = tmp_path / "string_gps_missing_alt.csv"
+    write_coordinate_sample_with_missing_altitude(path)
+
+    log = load_log(path)
+    payload = build_gps_map_payload(log)
+    html = build_gps_map_html(log)
+
+    assert payload["status"] == "ok"
+    assert [point["alt"] for point in payload["points"]] == pytest.approx([0.0, 105.0, 0.0])
+    assert "maplibregl.Map" in html
+
+
 def test_load_log_detects_split_coordinate_columns_with_arbitrary_headings(tmp_path: Path) -> None:
     path = tmp_path / "split_gps.csv"
     write_split_coordinate_sample(path)
@@ -229,6 +270,16 @@ def test_load_log_detects_split_coordinate_columns_with_arbitrary_headings(tmp_p
     assert list(trace.y[:2]) == pytest.approx([39.0, 39.0005])
     assert gps.layout.scene.xaxis.title.text == "Easting"
     assert gps.layout.scene.yaxis.title.text == "Northing"
+
+
+def test_load_log_does_not_invent_gps_from_gps_course_only(tmp_path: Path) -> None:
+    path = tmp_path / "gps_course_only.csv"
+    write_gps_course_only_sample(path)
+
+    log = load_log(path)
+
+    assert log.gps_columns is None
+    assert log.info.has_gps is False
 
 
 def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) -> None:
@@ -310,8 +361,10 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "const flightCanvas = document.getElementById(\"flightCanvas\");" in html
     assert "canvasPathReady" in html
     assert "function drawFlightCanvas()" in html
+    assert "function scheduleFlightCanvasDraw()" in html
     assert "map.project(coordinate)" in html
-    assert "[\"move\", \"zoom\", \"rotate\", \"pitch\", \"resize\", \"render\"]" in html
+    assert "[\"move\", \"zoom\", \"rotate\", \"pitch\", \"resize\"]" in html
+    assert "[\"move\", \"zoom\", \"rotate\", \"pitch\", \"resize\", \"render\"]" not in html
     assert "const altitudeStats = flightData.altitudeStats || {};" in html
     assert "function altitudeRenderMeters(point)" in html
     assert "function buildElevationRenderData()" in html

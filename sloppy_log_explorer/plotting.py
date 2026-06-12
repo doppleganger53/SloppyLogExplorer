@@ -52,10 +52,12 @@ def _coerce_float(value: object) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, Real):
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     if isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
+            return number if math.isfinite(number) else None
         except ValueError:
             return None
     return None

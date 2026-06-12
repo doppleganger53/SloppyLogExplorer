@@ -185,6 +185,10 @@ class GpsPathWidget(QWidget):
         self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
         self._page: QWebEnginePage | None = None
+        self._pending_viewport_fit = False
+        self._viewport_refresh_timer = QTimer(self)
+        self._viewport_refresh_timer.setSingleShot(True)
+        self._viewport_refresh_timer.timeout.connect(self._run_scheduled_viewport_refresh)
         self.setMinimumHeight(420)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -235,12 +239,21 @@ class GpsPathWidget(QWidget):
         page.runJavaScript(f"window.sloppyGpsMap ? window.sloppyGpsMap.refresh({options}) : false;")
 
     def _schedule_viewport_refresh(self, fit: bool = False) -> None:
-        if not self._web_engine:
+        try:
+            web_engine = self._web_engine
+            timer = self._viewport_refresh_timer
+        except (AttributeError, RuntimeError):
             return
-        # MapLibre needs a few layout passes before fit/resize calls become
-        # stable, so retry the viewport update after the page settles.
-        for delay in (0, 150, 600):
-            QTimer.singleShot(delay, lambda fit=fit: self.refresh_viewport(fit=fit))
+        if not web_engine:
+            return
+        self._pending_viewport_fit = self._pending_viewport_fit or fit
+        if not timer.isActive():
+            timer.start(90)
+
+    def _run_scheduled_viewport_refresh(self) -> None:
+        fit = self._pending_viewport_fit
+        self._pending_viewport_fit = False
+        self.refresh_viewport(fit=fit)
 
     def _map_page_loaded(self, ok: bool) -> None:
         if ok:

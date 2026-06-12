@@ -275,6 +275,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     let activeCameraMode = "orbit";
     let elevationMatrixSource = "";
     let elevationRenderArgKeys = [];
+    let canvasDrawFrame = null;
+    let viewportRefreshFrame = null;
 
     function finiteNumber(value) {
       return value !== null && value !== "" && Number.isFinite(Number(value));
@@ -907,6 +909,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     }
 
     function drawFlightCanvas() {
+      canvasDrawFrame = null;
       if (!flightCanvas || !flightCanvasContext || !map || !resizeFlightCanvas()) {
         canvasPathReady = false;
         debugMapState();
@@ -987,6 +990,13 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       canvasPathReady = drawn && drawFallbackPath;
       debugMapState();
       return drawn;
+    }
+
+    function scheduleFlightCanvasDraw() {
+      if (canvasDrawFrame !== null) {
+        return;
+      }
+      canvasDrawFrame = window.requestAnimationFrame(drawFlightCanvas);
     }
 
     function calculateBounds(points) {
@@ -1255,14 +1265,18 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       if (options && options.fit) {
         fitFlightBounds();
       }
-      drawFlightCanvas();
+      scheduleFlightCanvasDraw();
       if (typeof map.triggerRepaint === "function") {
         map.triggerRepaint();
       }
       debugMapState();
-      window.requestAnimationFrame(() => {
+      if (viewportRefreshFrame !== null) {
+        return true;
+      }
+      viewportRefreshFrame = window.requestAnimationFrame(() => {
+        viewportRefreshFrame = null;
         map.resize();
-        drawFlightCanvas();
+        scheduleFlightCanvasDraw();
         if (typeof map.triggerRepaint === "function") {
           map.triggerRepaint();
         }
@@ -1313,8 +1327,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           }
         });
       }
-      ["move", "zoom", "rotate", "pitch", "resize", "render"].forEach((eventName) => {
-        map.on(eventName, drawFlightCanvas);
+      ["move", "zoom", "rotate", "pitch", "resize"].forEach((eventName) => {
+        map.on(eventName, scheduleFlightCanvasDraw);
       });
 
       map.on("error", (event) => {

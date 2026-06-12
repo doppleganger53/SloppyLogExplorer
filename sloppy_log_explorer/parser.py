@@ -441,9 +441,13 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
     has_name_hint = _has_coordinate_name_hint(lat_column) or _has_coordinate_name_hint(lon_column)
     lat_span = float((usable[lat_column].dropna().max() - usable[lat_column].dropna().min()))
     lon_span = float((usable[lon_column].dropna().max() - usable[lon_column].dropna().min()))
-    # Reject wide-spanning pairs without a label hint; those are often generic
+    # Without a coordinate-like label, low-range telemetry such as pack voltage,
+    # switches, or pots can masquerade as a plausible lat/lon pair.
+    if not has_name_hint:
+        return None
+    # Reject wide-spanning pairs even with weak labels; those are often generic
     # telemetry channels rather than an actual position trace.
-    if not has_name_hint and (lat_span > 5.0 or lon_span > 5.0):
+    if lat_span > 5.0 or lon_span > 5.0:
         return None
     alt = (
         _find_named_column(list(usable), ("alt",))
