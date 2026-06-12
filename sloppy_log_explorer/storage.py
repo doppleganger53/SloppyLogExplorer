@@ -117,7 +117,10 @@ class AppStore:
     def add_battery(self, name: str, cells: int) -> int:
         cur = self.conn.execute("insert into batteries(name, cells) values(?, ?)", (name, cells))
         self.conn.commit()
-        return int(cur.lastrowid)
+        lastrowid = cur.lastrowid
+        if lastrowid is None:
+            raise RuntimeError("battery insert did not return a row id")
+        return lastrowid
 
     def list_batteries(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("select * from batteries order by active desc, name collate nocase").fetchall()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from typing import Iterable, cast
 
 import numpy as np
 import pandas as pd
@@ -12,7 +12,11 @@ from .models import CursorValue, InternalResistanceResult, LoadedLog
 
 
 def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
-    return pd.to_numeric(df[column], errors="coerce")
+    series = df[column]
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    numeric = pd.to_numeric(series, errors="coerce")
+    return pd.Series(numeric, index=series.index)
 
 
 # Keep the most useful telemetry channels near the top of the UI so the first
@@ -141,15 +145,18 @@ def calculate_internal_resistance(
     voltage = _numeric_series(df, voltage_column)
     current = _numeric_series(df, current_column)
     data = pd.DataFrame({"voltage": voltage, "current": current}).dropna()
-    data = data[data["current"].abs() > 0.5]
+    data = cast(pd.DataFrame, data[data["current"].abs() > 0.5])
     if len(data) < 8 or data["current"].max() - data["current"].min() < 1.0:
         return None
 
+    current_values = _numeric_series(data, "current")
+    voltage_values = _numeric_series(data, "voltage")
+
     # Voltage drop versus current should slope downward; the negative sign
     # converts that fitted slope into a positive milliohm estimate.
-    slope, _intercept = np.polyfit(data["current"].to_numpy(), data["voltage"].to_numpy(), 1)
+    slope, _intercept = np.polyfit(np.asarray(current_values, dtype=float), np.asarray(voltage_values, dtype=float), 1)
     pack_milliohm = max(0.0, -float(slope) * 1000.0)
-    cell_count = cells or guess_cell_count(data["voltage"])
+    cell_count = cells or guess_cell_count(voltage_values)
     cell_milliohm = pack_milliohm / max(1, cell_count)
     if not math.isfinite(pack_milliohm) or pack_milliohm <= 0:
         return None
@@ -162,8 +169,8 @@ def calculate_internal_resistance(
         samples=len(data),
         voltage_column=voltage_column,
         current_column=current_column,
-        current_range=(float(data["current"].min()), float(data["current"].max())),
-        voltage_range=(float(data["voltage"].min()), float(data["voltage"].max())),
+        current_range=(float(current_values.min()), float(current_values.max())),
+        voltage_range=(float(voltage_values.min()), float(voltage_values.max())),
     )
 
 
@@ -201,7 +208,7 @@ def basic_stats(df: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, flo
     for col in columns:
         if col not in df.columns:
             continue
-        series = pd.to_numeric(df[col], errors="coerce").dropna()
+        series = _numeric_series(df, col).dropna()
         if series.empty:
             continue
         stats[col] = {

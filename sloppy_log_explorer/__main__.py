@@ -6,6 +6,7 @@ import sys
 import tempfile
 import traceback
 from pathlib import Path
+from typing import cast
 
 from PyQt6.QtWidgets import QApplication
 
@@ -46,7 +47,8 @@ def _validate_log(path: str) -> None:
         raise ValueError(f"No numeric telemetry columns found in {path}")
     fig = build_telemetry_figure(log, columns, selected_index=0)
     rendered = figure_html(fig, bridge=True)
-    if not fig.data:
+    trace_count = len(cast(tuple[object, ...], fig.data))
+    if trace_count == 0:
         raise ValueError(f"No graph traces rendered for {path}")
     if "QWebChannel" not in rendered:
         raise ValueError("Rendered telemetry HTML is missing the Qt bridge")
@@ -56,7 +58,7 @@ def _validate_log(path: str) -> None:
             raise ValueError("Rendered GPS map HTML is missing MapLibre or OpenStreetMap raster tiles")
     message = (
         f"validated {log.info.name}: rows={log.info.rows} "
-        f"columns={log.info.columns} traces={len(fig.data)} duration={log.info.duration_seconds:.2f}s"
+        f"columns={log.info.columns} traces={trace_count} duration={log.info.duration_seconds:.2f}s"
     )
     print(message)
     _write_validation_log(message)

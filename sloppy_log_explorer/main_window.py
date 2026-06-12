@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import html
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QAction, QColor, QDesktopServices
+from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -690,7 +691,7 @@ class MainWindow(QMainWindow):
             self.refresh_plots()
             self.status.showMessage(f"Loaded {path.name}")
         except Exception as exc:
-            QMessageBox.warning(self, "Log load failed", str(exc))
+            QMessageBox.warning(self, "Log load failed", traceback.format_exc())
 
     def populate_columns(self, *_args) -> None:
         self.column_table.blockSignals(True)
@@ -1215,6 +1216,6 @@ class MainWindow(QMainWindow):
             value /= 1024.0
         raise ValueError("Size value is too large to format")
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
         self.store.close()
-        super().closeEvent(event)
+        super().closeEvent(a0)

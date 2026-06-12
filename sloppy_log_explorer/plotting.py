@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
+from numbers import Real
+from typing import Any, TypedDict
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -45,11 +48,30 @@ def _axis_name(index: int) -> str:
     return "y" if index == 0 else f"y{index + 1}"
 
 
+def _coerce_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Real):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _is_finite_number(value: object) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
+    number = _coerce_float(value)
+    return number is not None and math.isfinite(number)
+
+
+def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    series = df[column]
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    numeric = pd.to_numeric(series, errors="coerce")
+    return pd.Series(numeric, index=series.index)
 
 
 def _clean_hex_color(value: str | None, fallback: str) -> str:
@@ -71,25 +93,25 @@ def _gps_distance_km(left_lat: float, left_lon: float, right_lat: float, right_l
     return 2.0 * earth_radius_km * math.asin(min(1.0, math.sqrt(a)))
 
 
+class GpsPoint(TypedDict):
+    lat: float
+    lon: float
+    alt: float
+    row: int
+    value: float | None
+
+
 def _is_origin_placeholder(lat: float, lon: float) -> bool:
     return abs(lat) <= GPS_ORIGIN_EPSILON and abs(lon) <= GPS_ORIGIN_EPSILON
 
 
 def _gps_jump_is_plausible(
-    left: dict[str, object],
-    right: dict[str, object],
+    left: GpsPoint,
+    right: GpsPoint,
     left_time: object | None = None,
     right_time: object | None = None,
 ) -> bool:
-    try:
-        left_lat = float(left["lat"])
-        left_lon = float(left["lon"])
-        right_lat = float(right["lat"])
-        right_lon = float(right["lon"])
-    except (KeyError, TypeError, ValueError):
-        return False
-
-    distance_km = _gps_distance_km(left_lat, left_lon, right_lat, right_lon)
+    distance_km = _gps_distance_km(left["lat"], left["lon"], right["lat"], right["lon"])
     if distance_km <= 0.0:
         return True
 
@@ -98,7 +120,7 @@ def _gps_jump_is_plausible(
     return distance_km <= MAX_GPS_JUMP_KM
 
 
-GpsCandidate = tuple[dict[str, object], object]
+GpsCandidate = tuple[GpsPoint, object]
 
 
 def _gps_candidates_are_plausible(left: GpsCandidate, right: GpsCandidate) -> bool:
@@ -246,7 +268,7 @@ def build_telemetry_figure(
                 )
             )
 
-    layout: dict[str, object] = {
+    layout: dict[str, Any] = {
         "template": "plotly_dark" if dark else "plotly",
         "paper_bgcolor": "#1f242b" if dark else "#ffffff",
         "plot_bgcolor": "#171a20" if dark else "#ffffff",
@@ -292,12 +314,12 @@ def build_telemetry_figure(
     for col in columns:
         if col not in primary.dataframe.columns:
             continue
-        series = pd.to_numeric(primary.dataframe[col], errors="coerce")
+        series = _numeric_series(primary.dataframe, col)
         minimum = series.min()
         maximum = series.max()
         if pd.isna(minimum) or pd.isna(maximum):
             continue
-        stats_lines.append(f"{col}: min {minimum:.2f} | max {maximum:.2f}")
+        stats_lines.append(f"{col}: min {float(minimum):.2f} | max {float(maximum):.2f}")
     if stats_lines:
         # Min/max annotations are intentionally compact because they are only a
         # quick readout, not a full statistics table.
@@ -325,14 +347,15 @@ def build_telemetry_figure(
     return fig
 
 
-def _telemetry_x_values(log: LoadedLog, time_mode: str) -> list[object]:
+def _telemetry_x_values(log: LoadedLog, time_mode: str) -> Sequence[pd.Timestamp | float]:
     if time_mode == "absolute" and log.time is not None and log.time.notna().any():
         return list(log.time.ffill().bfill())
     if time_mode == "relative_time" and log.time is not None and log.time.notna().any():
         # Keep the axis formatted like a clock while shifting the series to a
         # stable epoch anchor so relative timestamps still render cleanly.
-        start = log.time.ffill().bfill().iloc[0]
-        return list(pd.Timestamp("1970-01-01") + (log.time.ffill().bfill() - start))
+        time_series = log.time.ffill().bfill()
+        start = time_series.iloc[0]
+        return list(pd.Timestamp("1970-01-01") + (time_series - start))
     return relative_seconds(log)
 
 
@@ -356,7 +379,7 @@ def build_gps_figure(log: LoadedLog | None, color_column: str | None = None, dar
     df = log.dataframe
     # Use altitude as the z-axis when available; otherwise fall back to sample
     # order so the 3D trace still has a meaningful depth dimension.
-    z = pd.to_numeric(df[gps.altitude], errors="coerce") if gps.altitude else list(range(len(df)))
+    z = _numeric_series(df, gps.altitude) if gps.altitude and gps.altitude in df.columns else list(range(len(df)))
     lat_title = gps.latitude_label or gps.latitude
     lon_title = gps.longitude_label or gps.longitude
     alt_title = gps.altitude_label or gps.altitude or "Sample"
@@ -423,42 +446,40 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         return _empty_gps_payload("No GPS latitude/longitude columns detected.")
 
     df = log.dataframe
-    lat_values = pd.to_numeric(df[gps.latitude], errors="coerce")
-    lon_values = pd.to_numeric(df[gps.longitude], errors="coerce")
+    lat_values = _numeric_series(df, gps.latitude)
+    lon_values = _numeric_series(df, gps.longitude)
     time_values = list(log.time) if log.time is not None else [None] * len(df)
     if gps.altitude and gps.altitude in df.columns:
-        alt_values = pd.to_numeric(df[gps.altitude], errors="coerce")
+        alt_values = _numeric_series(df, gps.altitude)
         altitude_label = gps.altitude_label or gps.altitude
     else:
         alt_values = pd.Series([0.0] * len(df), index=df.index, dtype="float64")
         altitude_label = "Altitude"
 
     color_column = options.color_column if options.color_column in df.columns else None
-    color_values = pd.to_numeric(df[color_column], errors="coerce") if color_column else None
+    color_values = _numeric_series(df, color_column) if color_column else None
     candidate_points: list[GpsCandidate] = []
     for row_index in range(len(df)):
-        lat = lat_values.iloc[row_index]
-        lon = lon_values.iloc[row_index]
-        if not (_is_finite_number(lat) and _is_finite_number(lon)):
+        lat = _coerce_float(lat_values.iloc[row_index])
+        lon = _coerce_float(lon_values.iloc[row_index])
+        if lat is None or lon is None:
             continue
-        lat = float(lat)
-        lon = float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             continue
         # Drop zeroed placeholders before they can pollute bounds or create a
         # fake jump at the start of the flight.
         if _is_origin_placeholder(lat, lon):
             continue
-        alt = alt_values.iloc[row_index]
-        point: dict[str, object] = {
+        alt = _coerce_float(alt_values.iloc[row_index])
+        point: GpsPoint = {
             "lat": lat,
             "lon": lon,
-            "alt": float(alt) if _is_finite_number(alt) else 0.0,
+            "alt": alt if alt is not None else 0.0,
             "row": row_index + 1,
+            "value": None,
         }
         if color_values is not None:
-            value = color_values.iloc[row_index]
-            point["value"] = float(value) if _is_finite_number(value) else None
+            point["value"] = _coerce_float(color_values.iloc[row_index])
         candidate_points.append((point, time_values[row_index] if row_index < len(time_values) else None))
 
     if len(candidate_points) < 2:
@@ -487,11 +508,15 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     if not rendered_parts:
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
 
-    points = [dict(point) for part in rendered_parts for point, _ in part]
+    points: list[GpsPoint] = [point for part in rendered_parts for point, _ in part]
 
     start_color = _clean_hex_color(options.start_color, GpsGradientOptions.start_color)
     end_color = _clean_hex_color(options.end_color, GpsGradientOptions.end_color)
-    valid_values = [float(point["value"]) for point in points if point.get("value") is not None]
+    valid_values: list[float] = []
+    for point in points:
+        value = point["value"]
+        if value is not None:
+            valid_values.append(value)
     minimum: float | None = None
     maximum: float | None = None
     if color_column and valid_values:
@@ -499,11 +524,15 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             minimum = min(valid_values)
             maximum = max(valid_values)
         else:
-            minimum = float(options.range_min) if _is_finite_number(options.range_min) else min(valid_values)
-            maximum = float(options.range_max) if _is_finite_number(options.range_max) else max(valid_values)
+            range_min = _coerce_float(options.range_min)
+            range_max = _coerce_float(options.range_max)
+            minimum = range_min if range_min is not None and math.isfinite(range_min) else min(valid_values)
+            maximum = range_max if range_max is not None and math.isfinite(range_max) else max(valid_values)
             if maximum < minimum:
                 minimum, maximum = maximum, minimum
-    midpoint = float(options.midpoint) if _is_finite_number(options.midpoint) else None
+    midpoint = _coerce_float(options.midpoint)
+    if midpoint is not None and not math.isfinite(midpoint):
+        midpoint = None
 
     segments: list[dict[str, object]] = []
     path_parts_json: list[list[dict[str, object]]] = []
@@ -513,7 +542,11 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         for left, right in zip(part, part[1:]):
             left_point, left_time = left
             right_point, right_time = right
-            segment_values = [float(point["value"]) for point in (left_point, right_point) if point.get("value") is not None]
+            segment_values: list[float] = []
+            for point in (left_point, right_point):
+                value = point["value"]
+                if value is not None:
+                    segment_values.append(value)
             segment_value = sum(segment_values) / len(segment_values) if segment_values else None
             if minimum is not None and maximum is not None and segment_value is not None:
                 amount = _gradient_position(segment_value, minimum, maximum, midpoint=midpoint, reverse=options.reverse)
@@ -529,16 +562,16 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
                     "left": dict(left_point),
                     "right": dict(right_point),
                     "positions": [
-                        float(left_point["lon"]),
-                        float(left_point["lat"]),
-                        float(left_point["alt"]),
-                        float(right_point["lon"]),
-                        float(right_point["lat"]),
-                        float(right_point["alt"]),
+                        left_point["lon"],
+                        left_point["lat"],
+                        left_point["alt"],
+                        right_point["lon"],
+                        right_point["lat"],
+                        right_point["alt"],
                     ],
                     "color": color,
-                    "startRow": int(left_point["row"]),
-                    "endRow": int(right_point["row"]),
+                    "startRow": left_point["row"],
+                    "endRow": right_point["row"],
                     "value": segment_value,
                 }
             )
@@ -562,7 +595,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             "highColor": high_color,
         }
 
-    valid_altitudes = [float(point["alt"]) for point in points if _is_finite_number(point.get("alt"))]
+    valid_altitudes = [point["alt"] for point in points if math.isfinite(point["alt"])]
     altitude_minimum = min(valid_altitudes) if valid_altitudes else 0.0
     altitude_maximum = max(valid_altitudes) if valid_altitudes else 0.0
 

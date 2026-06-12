@@ -6,6 +6,7 @@ import os
 import json
 import tempfile
 from pathlib import Path
+from typing import cast
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
@@ -102,6 +103,7 @@ class TelemetryPlotWidget(QWidget):
         self.dark = True
         self.interaction_mode = "pan"
         self.time_mode = "absolute"
+        self._view: QWebEngineView | QTextEdit
         self.setMinimumHeight(420)
 
         layout = QVBoxLayout(self)
@@ -109,12 +111,15 @@ class TelemetryPlotWidget(QWidget):
         self._web_engine = _use_web_engine()
         if self._web_engine:
             self._view = QWebEngineView(self)
+            page = self._view.page()
+            if page is None:
+                raise RuntimeError("QWebEngineView.page() returned None")
             self._bridge = _PlotBridge()
             self._bridge.index_selected.connect(self.index_selected)
             self._bridge.index_stepped.connect(self.index_stepped)
-            self._channel = QWebChannel(self._view.page())
+            self._channel = QWebChannel(page)
             self._channel.registerObject("plotBridge", self._bridge)
-            self._view.page().setWebChannel(self._channel)
+            page.setWebChannel(self._channel)
         else:
             self._view = QTextEdit(self)
             self._view.setReadOnly(True)
@@ -177,7 +182,9 @@ class GpsPathWidget(QWidget):
         self.log: LoadedLog | None = None
         self.options = GpsGradientOptions()
         self.dark = True
+        self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
+        self._page: QWebEnginePage | None = None
         self.setMinimumHeight(420)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -185,8 +192,11 @@ class GpsPathWidget(QWidget):
         if self._web_engine:
             self._view = QWebEngineView(self)
             self._page = QWebEnginePage(_persistent_web_profile(), self._view)
-            self._page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-            self._page.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings = self._page.settings()
+            if settings is None:
+                raise RuntimeError("QWebEnginePage.settings() returned None")
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
             self._page.loadFinished.connect(self._map_page_loaded)
             self._view.setPage(self._page)
         else:
@@ -209,17 +219,20 @@ class GpsPathWidget(QWidget):
             # always reads the latest payload and can access local assets.
             previous_path = self._html_path
             self._html_path = _write_temp_html(html, "gps-map-")
-            self._view.setUrl(QUrl.fromLocalFile(str(self._html_path)))
+            cast(QWebEngineView, self._view).setUrl(QUrl.fromLocalFile(str(self._html_path)))
             _remove_file(previous_path)
             self._schedule_viewport_refresh(fit=True)
         else:
             self._view.setHtml(html)
 
     def refresh_viewport(self, fit: bool = False) -> None:
-        if not self._web_engine or not hasattr(self, "_page"):
+        if not self._web_engine:
+            return
+        page = self._page
+        if page is None:
             return
         options = json.dumps({"fit": fit})
-        self._page.runJavaScript(f"window.sloppyGpsMap ? window.sloppyGpsMap.refresh({options}) : false;")
+        page.runJavaScript(f"window.sloppyGpsMap ? window.sloppyGpsMap.refresh({options}) : false;")
 
     def _schedule_viewport_refresh(self, fit: bool = False) -> None:
         if not self._web_engine:
@@ -233,15 +246,15 @@ class GpsPathWidget(QWidget):
         if ok:
             self._schedule_viewport_refresh(fit=True)
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
+    def showEvent(self, a0) -> None:
+        super().showEvent(a0)
         self._schedule_viewport_refresh(fit=True)
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
+    def resizeEvent(self, a0) -> None:
+        super().resizeEvent(a0)
         self._schedule_viewport_refresh(fit=False)
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0) -> None:
         _remove_file(self._html_path)
         self._html_path = None
-        super().closeEvent(event)
+        super().closeEvent(a0)

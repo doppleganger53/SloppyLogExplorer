@@ -32,6 +32,20 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _coerce_numeric_series(series: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    numeric = pd.to_numeric(series, errors="coerce")
+    return pd.Series(numeric, index=series.index)
+
+
+def _coerce_datetime_series(series: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    parsed = pd.to_datetime(series, errors="coerce")
+    return pd.Series(parsed, index=series.index)
+
+
 def _deduplicate_columns(columns: list[str]) -> list[str]:
     counts: dict[str, int] = {}
     result: list[str] = []
@@ -74,7 +88,7 @@ def _read_ragged_csv(path: Path) -> pd.DataFrame:
             elif len(row) > width:
                 row = row[:width]
             rows.append(row)
-    return pd.DataFrame(rows, columns=_deduplicate_columns(header))
+    return pd.DataFrame(rows, columns=pd.Index(_deduplicate_columns(header)))
 
 
 def _read_csv(path: Path) -> pd.DataFrame:
@@ -93,24 +107,23 @@ def _detect_time(df: pd.DataFrame) -> pd.Series | None:
     if date_cols and time_cols:
         # Prefer a combined date/time parse when both fields exist because many
         # logs split the timestamp across two columns.
-        series = pd.to_datetime(
+        series = _coerce_datetime_series(
             df[date_cols[0]].astype(str).str.strip() + " " + df[time_cols[0]].astype(str).str.strip(),
-            errors="coerce",
         )
         if series.notna().any():
             return series
 
     for col in time_cols + date_cols:
         raw = df[col]
-        parsed = pd.to_datetime(raw, errors="coerce")
+        parsed = _coerce_datetime_series(raw)
         if parsed.notna().sum() >= max(1, len(df) // 3):
             return parsed
-        numeric = pd.to_numeric(raw, errors="coerce")
+        numeric = _coerce_numeric_series(raw)
         if numeric.notna().sum() >= max(1, len(df) // 3):
             # Some exports store elapsed seconds as a bare number; convert them
             # to timestamps anchored at the Unix epoch so Plotly can format them.
             base = pd.Timestamp("1970-01-01")
-            return base + pd.to_timedelta(numeric.fillna(0), unit="s")
+            return pd.Series(base + pd.to_timedelta(numeric.fillna(0), unit="s"), index=numeric.index)
 
     return None
 
@@ -143,7 +156,7 @@ def _numeric_columns(df: pd.DataFrame, time: pd.Series | None) -> list[str]:
     for col in df.columns:
         if time is not None and ("date" in col.lower() or "time" in col.lower()):
             continue
-        converted = pd.to_numeric(df[col], errors="coerce")
+        converted = _coerce_numeric_series(df[col])
         if converted.notna().any():
             # Coerce in place so downstream plotting and GPS heuristics can use
             # a stable numeric dtype instead of re-parsing each column later.
@@ -256,7 +269,7 @@ def _parse_coordinate_text(text: str) -> tuple[float, float, float | None] | Non
 
 
 def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | None:
-    valid = pd.to_numeric(series, errors="coerce").dropna()
+    valid = _coerce_numeric_series(series).dropna()
     if len(valid) < 2:
         return None
     if axis == "lat":
@@ -355,7 +368,7 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
 def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
     usable: dict[str, pd.Series] = {}
     for column in numeric_columns:
-        series = pd.to_numeric(df[column], errors="coerce")
+        series = _coerce_numeric_series(df[column])
         valid = series.dropna()
         if len(valid) < 2:
             continue
