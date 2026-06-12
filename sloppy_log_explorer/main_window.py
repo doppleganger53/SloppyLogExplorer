@@ -775,10 +775,9 @@ class MainWindow(QMainWindow):
     def commit_column_selection(self) -> None:
         cols = self.selected_columns()
         self.store.set_setting("selected_columns", cols)
-        # The GPS color picker depends on the visible parameter list, so refresh
-        # it before repainting the plots.
-        self.populate_gps_color_combo()
-        self.refresh_plots()
+        self.update_summary()
+        self.refresh_graph()
+        self.update_info_panel()
 
     def update_summary(self) -> None:
         if self.current_log is None:

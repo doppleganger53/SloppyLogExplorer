@@ -710,6 +710,50 @@ def test_gps_color_selector_uses_all_numeric_parameters(tmp_path: Path, monkeypa
     app.quit()
 
 
+def test_telemetry_selection_does_not_refresh_gps_map_for_gps_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    gps_refreshes: list[object] = []
+    graph_refreshes: list[list[str]] = []
+
+    def record_gps_refresh(*args, **kwargs) -> None:
+        gps_refreshes.append((args, kwargs))
+
+    def record_graph_refresh(log, columns, **kwargs) -> None:
+        graph_refreshes.append(list(columns))
+
+    monkeypatch.setattr(window.gps_view, "set_path", record_gps_refresh)
+    monkeypatch.setattr(window.graph_view, "set_plot", record_graph_refresh)
+
+    item = next(
+        window.column_table.item(row, 0)
+        for row in range(window.column_table.rowCount())
+        if window.column_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == "VFAS(V)"
+    )
+    item.setCheckState(Qt.CheckState.Unchecked)
+
+    assert "VFAS(V)" not in window.selected_columns()
+    assert gps_refreshes == []
+    assert graph_refreshes
+    assert all("VFAS(V)" not in columns for columns in graph_refreshes)
+
+    window.close()
+    app.quit()
+
+
 def test_gps_tab_has_no_map_mode_selector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_root = tmp_path / "appdata"
     monkeypatch.setenv("APPDATA", str(app_root))
