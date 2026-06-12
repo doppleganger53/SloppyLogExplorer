@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
-    QWidget,
+    QWidget
 )
 
 from .analysis import (
@@ -79,7 +79,12 @@ class MainWindow(QMainWindow):
         self._restore_state()
 
     def _build_actions(self) -> None:
-        file_menu = self.menuBar().addMenu("File")
+        menu_bar = self.menuBar()
+        if menu_bar is None:
+            raise RuntimeError("Failed to get menu bar")    
+        file_menu =  menu_bar.addMenu("File")
+        if file_menu is None:
+            raise RuntimeError("Failed to create File menu")
         open_log = QAction("Open Log...", self)
         open_log.triggered.connect(self.open_log_dialog)
         file_menu.addAction(open_log)
@@ -89,23 +94,31 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
-        view_menu = self.menuBar().addMenu("View")
-        self.grid_action = QAction("Show Grid", self, checkable=True)
+        view_menu = menu_bar.addMenu("View")
+        if view_menu is None:
+            raise RuntimeError("Failed to create View menu")
+        self.grid_action = QAction("Show Grid", self)
+        self.grid_action.setCheckable(True)
         self.grid_action.setChecked(True)
         self.grid_action.triggered.connect(self.refresh_plots)
         view_menu.addAction(self.grid_action)
-        self.dark_action = QAction("Dark Theme", self, checkable=True)
+        self.dark_action = QAction("Dark Theme", self)
+        self.dark_action.setCheckable(True)
         self.dark_action.setChecked(True)
         self.dark_action.triggered.connect(self.toggle_theme)
         view_menu.addAction(self.dark_action)
         view_menu.addSeparator()
         view_menu.addAction("Reset Telemetry View", self.reset_telemetry_view)
 
-        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu = menu_bar.addMenu("Tools")
+        if tools_menu is None:
+            raise RuntimeError("Failed to create Tools menu")
         tools_menu.addAction("Scan Sync Candidates", self.scan_sync)
         tools_menu.addAction("Generate Voice Pack", self.generate_voice_pack)
 
-        help_menu = self.menuBar().addMenu("Help")
+        help_menu = menu_bar.addMenu("Help")
+        if help_menu is None:
+            raise RuntimeError("Failed to create Help menu")
         help_menu.addAction("About", self.about)
 
     def _build_ui(self) -> None:
@@ -133,6 +146,8 @@ class MainWindow(QMainWindow):
         self.library_tree = QTreeWidget()
         self.library_tree.setHeaderLabels(["Model / Log", "Logs", "Latest", "Size"])
         header = self.library_tree.header()
+        if header is None:
+            raise RuntimeError("Failed to get library tree header")
         for column in range(4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         header.setSectionsClickable(True)
@@ -391,9 +406,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.alias_table = QTableWidget(0, 2)
         self.alias_table.setHorizontalHeaderLabels(["Hardware switch/file", "Radio alias/UI label"])
-        header = self.alias_table.horizontalHeader()
-        if header is not None:
-            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.alias_table)
         layout.addWidget(self.alias_table)
         self.tabs.addTab(tab, "Switch Aliases")
@@ -642,6 +655,8 @@ class MainWindow(QMainWindow):
 
     def library_header_clicked(self, column: int) -> None:
         header = self.library_tree.header()
+        if header is None:
+            return
         current_column = header.sortIndicatorSection()
         current_order = header.sortIndicatorOrder()
         if current_column == column:
