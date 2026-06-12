@@ -8,7 +8,6 @@
 
 ## other
 
-- crash when selecting telemetry item in log with gps data
 - lazy loading in general, improve startup speed, only parse / load what is necessary for currently displayed
 - normalize file size in library display to MBs with one decimal point
 - sortable file list
