@@ -1,3 +1,5 @@
+"""Plotly chart and GPS map rendering helpers."""
+
 from __future__ import annotations
 
 import math
@@ -34,6 +36,8 @@ DEFAULT_PATH_COLOR = "#55d977"
 MISSING_VALUE_COLOR = "#9ca3af"
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 MAX_GPS_JUMP_KM = 1000.0
+# A tiny origin tolerance catches placeholder zeros without rejecting genuine
+# coordinates that are only close to zero.
 GPS_ORIGIN_EPSILON = 1e-9
 
 
@@ -89,6 +93,8 @@ def _gps_jump_is_plausible(
     if distance_km <= 0.0:
         return True
 
+    # Keep the threshold deliberately wide so the path only splits on clearly
+    # invalid GPS jumps instead of on aggressive flight maneuvers.
     return distance_km <= MAX_GPS_JUMP_KM
 
 
@@ -105,6 +111,8 @@ def _drop_isolated_gps_outliers_once(candidates: list[GpsCandidate]) -> list[Gps
 
     filtered: list[GpsCandidate] = []
     for index, candidate in enumerate(candidates):
+        # Drop single bad samples at the edges or in the middle when both
+        # neighboring segments agree that the point is an outlier.
         previous_candidate = candidates[index - 1] if index > 0 else None
         next_candidate = candidates[index + 1] if index + 1 < len(candidates) else None
 
@@ -166,6 +174,8 @@ def _gradient_position(
     if maximum <= minimum:
         amount = 0.5
     elif midpoint is not None and minimum < midpoint < maximum:
+        # Split the gradient into two linear ramps so a requested midpoint gets
+        # an exact visual anchor instead of being approximated by interpolation.
         if value <= midpoint:
             amount = 0.5 * ((value - minimum) / (midpoint - minimum))
         else:
@@ -197,6 +207,8 @@ def build_telemetry_figure(
 ) -> go.Figure:
     fig = go.Figure()
     if primary is None:
+        # Empty state: return a styled placeholder figure so the widget still
+        # shows a meaningful prompt before a log is loaded.
         fig.update_layout(
             template="plotly_dark" if dark else "plotly",
             paper_bgcolor="#1f242b" if dark else "#ffffff",
@@ -257,6 +269,8 @@ def build_telemetry_figure(
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         }
         if idx > 0:
+            # Overlay secondary axes on the right edge so every selected
+            # telemetry channel keeps its own scale without shrinking the plot.
             axis.update(
                 {
                     "anchor": "free",
@@ -285,6 +299,8 @@ def build_telemetry_figure(
             continue
         stats_lines.append(f"{col}: min {minimum:.2f} | max {maximum:.2f}")
     if stats_lines:
+        # Min/max annotations are intentionally compact because they are only a
+        # quick readout, not a full statistics table.
         fig.add_annotation(
             x=0.01,
             y=0.99,
@@ -302,6 +318,8 @@ def build_telemetry_figure(
         )
 
     if selected_index is not None and x:
+        # Mark the currently selected sample so the plot aligns with the cursor
+        # panel and any compare-log delta readout.
         selected_index = max(0, min(selected_index, len(x) - 1))
         fig.add_vline(x=x[selected_index], line_width=2, line_color="#ffffff" if dark else "#1f2937", opacity=0.55)
     return fig
@@ -311,6 +329,8 @@ def _telemetry_x_values(log: LoadedLog, time_mode: str) -> list[object]:
     if time_mode == "absolute" and log.time is not None and log.time.notna().any():
         return list(log.time.ffill().bfill())
     if time_mode == "relative_time" and log.time is not None and log.time.notna().any():
+        # Keep the axis formatted like a clock while shifting the series to a
+        # stable epoch anchor so relative timestamps still render cleanly.
         start = log.time.ffill().bfill().iloc[0]
         return list(pd.Timestamp("1970-01-01") + (log.time.ffill().bfill() - start))
     return relative_seconds(log)
@@ -334,6 +354,8 @@ def build_gps_figure(log: LoadedLog | None, color_column: str | None = None, dar
         return fig
 
     df = log.dataframe
+    # Use altitude as the z-axis when available; otherwise fall back to sample
+    # order so the 3D trace still has a meaningful depth dimension.
     z = pd.to_numeric(df[gps.altitude], errors="coerce") if gps.altitude else list(range(len(df)))
     lat_title = gps.latitude_label or gps.latitude
     lon_title = gps.longitude_label or gps.longitude
@@ -423,6 +445,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         lon = float(lon)
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             continue
+        # Drop zeroed placeholders before they can pollute bounds or create a
+        # fake jump at the start of the flight.
         if _is_origin_placeholder(lat, lon):
             continue
         alt = alt_values.iloc[row_index]
@@ -440,6 +464,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     if len(candidate_points) < 2:
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
 
+    # Run the outlier pass before segmenting so isolated bad samples disappear
+    # instead of forcing an unnecessary path break.
     candidate_points = _drop_isolated_gps_outliers(candidate_points)
     if len(candidate_points) < 2:
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
@@ -451,6 +477,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         if _gps_jump_is_plausible(previous_point, point, previous_time, point_time):
             current_part.append((point, point_time))
         else:
+            # A large jump means the track probably restarted, so split the
+            # polyline instead of drawing a line across the gap.
             path_parts.append(current_part)
             current_part = [(point, point_time)]
     path_parts.append(current_part)
@@ -491,6 +519,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
                 amount = _gradient_position(segment_value, minimum, maximum, midpoint=midpoint, reverse=options.reverse)
                 color = _interpolate_hex_color(start_color, end_color, amount)
             elif color_column:
+                # If the user asked for a color column but this segment has no
+                # numeric value, show that gap explicitly instead of guessing.
                 color = MISSING_VALUE_COLOR
             else:
                 color = DEFAULT_PATH_COLOR
@@ -515,6 +545,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
 
     legend: dict[str, object] = {"enabled": False}
     if color_column and minimum is not None and maximum is not None:
+        # The map legend mirrors the chosen gradient so the user can interpret
+        # the color ramp without opening a separate settings dialog.
         low_color = end_color if options.reverse else start_color
         high_color = start_color if options.reverse else end_color
         legend = {
@@ -578,6 +610,8 @@ def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
     background = "#1f242b" if dark else "#ffffff"
     if not bridge:
         return f"<html><body style='margin:0;background:{background}'>{body}</body></html>"
+    # The bridge script is only injected for the Qt WebChannel path so the
+    # plot can forward clicks and keyboard navigation back to the main window.
     return f"""
 <html>
 <head>

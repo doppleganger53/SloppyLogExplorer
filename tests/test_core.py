@@ -51,6 +51,8 @@ def write_coordinate_sample(path: Path) -> None:
 
 
 def write_coordinate_sample_with_separate_altitude(path: Path) -> None:
+    # Exercise the parser path that extracts lat/lon from one field but keeps a
+    # separate numeric altitude column for the rendered map.
     path.write_text(
         "\n".join(
             [
@@ -65,6 +67,8 @@ def write_coordinate_sample_with_separate_altitude(path: Path) -> None:
 
 
 def write_split_coordinate_sample(path: Path) -> None:
+    # Nonstandard column names should still be recognized when their numeric
+    # ranges clearly match latitude and longitude.
     path.write_text(
         "\n".join(
             [
@@ -79,6 +83,8 @@ def write_split_coordinate_sample(path: Path) -> None:
 
 
 def write_cardinal_coordinate_sample(path: Path) -> None:
+    # Hemisphere suffixes/prefixes show up in some exports, so this sample
+    # checks that the parser understands signed cardinal notation.
     path.write_text(
         "\n".join(
             [
@@ -93,6 +99,8 @@ def write_cardinal_coordinate_sample(path: Path) -> None:
 
 
 def write_origin_placeholder_sample(path: Path) -> None:
+    # Some logs start or end with zeroed coordinates that should be ignored
+    # instead of drawing a bogus jump from the Gulf of Guinea.
     path.write_text(
         "\n".join(
             [
@@ -108,6 +116,8 @@ def write_origin_placeholder_sample(path: Path) -> None:
 
 
 def write_gps_outlier_sample(path: Path) -> None:
+    # This sample forces the outlier-pruning logic to discard isolated far-away
+    # points without breaking the normal flight path into extra parts.
     path.write_text(
         "\n".join(
             [
@@ -265,6 +275,9 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     payload = build_gps_map_payload(log, GpsGradientOptions(color_column="Current(A)"))
     html = build_gps_map_html(log, GpsGradientOptions(color_column="Current(A)"))
 
+    # This is a contract test for the generated payload and HTML template, so
+    # it checks both data shape and the renderer tokens the runtime validator
+    # depends on.
     assert payload["status"] == "ok"
     assert len(payload["points"]) == 9
     assert len(payload["segments"]) == len(payload["points"]) - 1

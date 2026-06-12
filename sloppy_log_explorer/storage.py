@@ -1,3 +1,5 @@
+"""Small SQLite-backed app state store."""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +10,8 @@ from typing import Any
 
 
 def app_data_dir() -> Path:
+    # Use the Windows roaming app-data folder when available so settings follow
+    # the user profile; fall back to a hidden home-directory cache elsewhere.
     base = os.environ.get("APPDATA")
     if base:
         root = Path(base) / "SloppyLogExplorer"
@@ -30,6 +34,8 @@ class AppStore:
 
     def _migrate(self) -> None:
         cur = self.conn.cursor()
+        # Create tables idempotently so the app can open an empty database or an
+        # older version without a separate migration tool.
         cur.executescript(
             """
             create table if not exists settings (
@@ -76,6 +82,8 @@ class AppStore:
         try:
             return json.loads(row["value"])
         except json.JSONDecodeError:
+            # Preserve legacy plain-text values if they were written before the
+            # store switched to JSON encoding.
             return row["value"]
 
     def set_setting(self, key: str, value: Any) -> None:
@@ -158,6 +166,8 @@ class AppStore:
         return [dict(row) for row in rows]
 
     def save_aliases(self, profile: str, aliases: dict[str, str]) -> None:
+        # Replace the profile atomically so deleted aliases disappear instead of
+        # lingering after a rename or a shorter edit pass.
         with self.conn:
             self.conn.execute("delete from aliases where profile = ?", (profile,))
             self.conn.executemany(
@@ -172,4 +182,3 @@ class AppStore:
     def alias_profiles(self) -> list[str]:
         rows = self.conn.execute("select distinct profile from aliases order by profile collate nocase").fetchall()
         return [row["profile"] for row in rows]
-

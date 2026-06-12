@@ -391,7 +391,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.alias_table = QTableWidget(0, 2)
         self.alias_table.setHorizontalHeaderLabels(["Hardware switch/file", "Radio alias/UI label"])
-        self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header = self.alias_table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.alias_table)
         layout.addWidget(self.alias_table)
         self.tabs.addTab(tab, "Switch Aliases")
@@ -481,6 +483,8 @@ class MainWindow(QMainWindow):
         color_column = self.gps_color_combo.currentText()
         has_color = bool(color_column and color_column != "(none)")
         auto_range = self.gps_auto_range_check.isChecked()
+        # Range controls only make sense when a numeric color column is active;
+        # the midpoint slider is a second-order option layered on top of that.
         self.gps_auto_range_check.setEnabled(has_color)
         self.gps_min_spin.setEnabled(has_color and not auto_range)
         self.gps_max_spin.setEnabled(has_color and not auto_range)
@@ -497,6 +501,8 @@ class MainWindow(QMainWindow):
         values = series.dropna()
         if values.empty:
             return
+        # Seed the manual range controls from the current data so the user can
+        # immediately switch off auto-range without getting blank defaults.
         minimum = float(values.min())
         maximum = float(values.max())
         midpoint = minimum + (maximum - minimum) / 2.0
@@ -552,6 +558,8 @@ class MainWindow(QMainWindow):
         )
 
     def _restore_state(self) -> None:
+        # Restore the library first so any saved last-log path can be resolved
+        # against the same root that was active in the previous session.
         last_library = self.store.get_setting("library_root")
         if last_library and Path(last_library).exists():
             self.load_library(Path(last_library))
@@ -608,6 +616,8 @@ class MainWindow(QMainWindow):
             parent.setData(1, Qt.ItemDataRole.UserRole, len(logs))
             parent.setData(2, Qt.ItemDataRole.UserRole, latest)
             parent.setData(3, Qt.ItemDataRole.UserRole, total_size)
+            # Store numeric sort keys separately from the visible labels so the
+            # tree can be re-sorted without reparsing formatted text.
             self.library_tree.addTopLevelItem(parent)
             for log in logs:
                 item = QTreeWidgetItem(
@@ -645,6 +655,8 @@ class MainWindow(QMainWindow):
             self.current_log = load_log(path, self.library_root)
             self.selected_index = 0
             self.store.set_setting("last_log", str(path))
+            # Every dependent widget needs a refresh because a new log changes
+            # the available columns, GPS choices, and saved notes target.
             self.initialize_selected_parameters()
             self.populate_columns()
             self.populate_gps_color_combo()
@@ -695,12 +707,16 @@ class MainWindow(QMainWindow):
         stored = set(self.store.get_setting("selected_columns", []))
         selected = stored & available
         if not selected:
+            # Fall back to a heuristic shortlist only when the previous
+            # selection no longer matches the current log.
             selected = set(suggest_display_columns(self.current_log.parameter_columns))
         self.selected_parameter_columns = selected
 
     def set_visible_columns_checked(self, checked: bool) -> None:
         if self.current_log is None:
             return
+        # Block signals while bulk-toggling to avoid a cascade of itemChanged
+        # callbacks for every row in the table.
         self.column_table.blockSignals(True)
         try:
             for row in range(self.column_table.rowCount()):
@@ -733,6 +749,8 @@ class MainWindow(QMainWindow):
     def commit_column_selection(self) -> None:
         cols = self.selected_columns()
         self.store.set_setting("selected_columns", cols)
+        # The GPS color picker depends on the visible parameter list, so refresh
+        # it before repainting the plots.
         self.populate_gps_color_combo()
         self.refresh_plots()
 
@@ -793,6 +811,8 @@ class MainWindow(QMainWindow):
         self.gps_color_combo.clear()
         self.gps_color_combo.addItem("(none)")
         if self.current_log is not None:
+            # Offer every numeric parameter here, not just selected plot
+            # channels, so the color ramp can use hidden telemetry fields too.
             for col in self.current_log.parameter_columns:
                 self.gps_color_combo.addItem(col)
         if current:
@@ -898,6 +918,8 @@ class MainWindow(QMainWindow):
     def refresh_batteries(self) -> None:
         batteries = self.store.list_batteries()
         self.battery_select.clear()
+        # Disable sorting while repopulating so row inserts do not keep moving
+        # the cursor around mid-update.
         self.battery_table.setSortingEnabled(False)
         self.battery_table.setRowCount(0)
         for battery in batteries:
@@ -1005,6 +1027,8 @@ class MainWindow(QMainWindow):
             return
         aliases = self.store.load_aliases(profile)
         if not aliases:
+            # Seed a fixed switch matrix so an empty profile still exposes the
+            # common radio switch names users are likely to edit.
             aliases = {switch: "" for switch in [f"S{i}" for i in range(1, 13)] + ["SA", "SB", "SC", "SD", "SE", "SF", "SG", "SH"]}
         self.alias_table.setSortingEnabled(False)
         self.alias_table.setRowCount(0)
@@ -1041,6 +1065,8 @@ class MainWindow(QMainWindow):
             text = self.voice_table.item(row, 0)
             filename = self.voice_table.item(row, 1)
             if text and filename and text.text().strip() and filename.text().strip():
+                # Ignore draft rows so partially entered voice-pack entries do
+                # not produce empty output files.
                 items.append(VoiceItem(text.text().strip(), filename.text().strip()))
         return items
 
@@ -1083,6 +1109,8 @@ class MainWindow(QMainWindow):
 
     def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
         items = [self.library_tree.topLevelItem(index) for index in range(self.library_tree.topLevelItemCount())]
+        # Capture expansion state before we rebuild the tree, otherwise Qt will
+        # collapse everything when the items are reinserted.
         expanded_state = {id(item): item.isExpanded() for item in items}
         while self.library_tree.topLevelItemCount():
             self.library_tree.takeTopLevelItem(0)
@@ -1119,6 +1147,8 @@ class MainWindow(QMainWindow):
     def _library_sort_key(self, item: QTreeWidgetItem, column: int, child_rows: bool = False) -> tuple[object, str]:
         label = str(item.text(0)).casefold()
         if column == 1:
+            # Model rows sort by their stored counts, while child rows fall back
+            # to the label because the count column is intentionally blank there.
             primary = label if child_rows else int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
         elif column == 2:
             primary = float(item.data(2, Qt.ItemDataRole.UserRole) or 0.0)

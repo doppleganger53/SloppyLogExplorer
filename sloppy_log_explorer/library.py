@@ -1,3 +1,5 @@
+"""Metadata-only scanning and grouping for log library trees."""
+
 from __future__ import annotations
 
 import os
@@ -11,6 +13,8 @@ from .parser import LOG_EXTENSIONS, _model_from_path
 def scan_library(root: str | Path) -> list[LibraryLogInfo]:
     root_path = Path(root)
     logs: list[LibraryLogInfo] = []
+    # Walk directories without opening file contents so large telemetry
+    # libraries stay fast and the scan can be used for indexing.
     for dirpath, dirnames, filenames in os.walk(root_path):
         dirnames.sort()
         filenames.sort()
@@ -32,6 +36,8 @@ def scan_library(root: str | Path) -> list[LibraryLogInfo]:
                     size=stat.st_size,
                 )
             )
+    # Stable ordering keeps the sidebar predictable: model groups first, then
+    # newest logs at the top of each group.
     logs.sort(key=lambda item: (item.model.lower(), -item.modified, item.name.lower()))
     return logs
 

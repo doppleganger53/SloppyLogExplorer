@@ -1,3 +1,5 @@
+"""Column heuristics and simple telemetry analysis helpers."""
+
 from __future__ import annotations
 
 import math
@@ -13,6 +15,8 @@ def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(df[column], errors="coerce")
 
 
+# Keep the most useful telemetry channels near the top of the UI so the first
+# plot selection usually produces a meaningful graph without manual curation.
 PREFERRED_DISPLAY_COLUMNS = [
     "VFAS(V)",
     "TRUE Current(A)",
@@ -60,6 +64,8 @@ def find_voltage_columns(columns: Iterable[str]) -> list[str]:
         if any(token in name for token in ("(v)", "volt", "vfas", "rxbat", "rxbatt", "bat1", "bat2", "adc")):
             voltage_columns.append(column)
 
+    # Score the common pack-voltage spellings ahead of more ambiguous voltage-
+    # related channels such as BEC or ADC readings.
     priorities = [
         ("vfas", 0),
         ("main voltage", 1),
@@ -86,6 +92,8 @@ def find_current_columns(columns: Iterable[str]) -> list[str]:
 
     def priority(column: str) -> tuple[int, str]:
         name = column.lower().strip()
+        # Prefer true pack current channels before ESC, BEC, or servo currents
+        # because those are the values most likely to describe battery load.
         if "true current" in name:
             score = 0
         elif name in {"current(a)", "current (a)", "current"}:
@@ -107,6 +115,8 @@ def guess_cell_count(voltage: pd.Series) -> int:
     median = float(voltage.dropna().median()) if voltage.notna().any() else 0.0
     if median <= 0:
         return 1
+    # Divide by roughly one LiPo cell's nominal voltage to get a practical
+    # pack-size guess when the log does not provide an explicit cell count.
     return max(1, min(14, int(round(median / 3.8))))
 
 
@@ -135,6 +145,8 @@ def calculate_internal_resistance(
     if len(data) < 8 or data["current"].max() - data["current"].min() < 1.0:
         return None
 
+    # Voltage drop versus current should slope downward; the negative sign
+    # converts that fitted slope into a positive milliohm estimate.
     slope, _intercept = np.polyfit(data["current"].to_numpy(), data["voltage"].to_numpy(), 1)
     pack_milliohm = max(0.0, -float(slope) * 1000.0)
     cell_count = cells or guess_cell_count(data["voltage"])
@@ -164,6 +176,8 @@ def cursor_values(
     if primary.dataframe.empty:
         return []
     index = max(0, min(index, len(primary.dataframe) - 1))
+    # Compare logs can be shorter than the primary log, so clamp the cursor to
+    # the last available compare row instead of indexing past the end.
     compare_index = min(index, len(compare.dataframe) - 1) if compare is not None and not compare.dataframe.empty else None
     values: list[CursorValue] = []
     for col in columns:

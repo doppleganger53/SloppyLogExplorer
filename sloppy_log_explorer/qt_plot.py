@@ -1,3 +1,5 @@
+"""Qt widgets that render Plotly graphs and the GPS map."""
+
 from __future__ import annotations
 
 import os
@@ -30,6 +32,8 @@ class _PlotBridge(QObject):
 
 
 def _use_web_engine() -> bool:
+    # Offscreen validation and CLI runs use plain text instead of Qt WebEngine
+    # because the embedded browser is unnecessary and can fail headlessly.
     return os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
 
 
@@ -39,6 +43,8 @@ _WEB_PROFILE: QWebEngineProfile | None = None
 def _persistent_web_profile() -> QWebEngineProfile:
     global _WEB_PROFILE
     if _WEB_PROFILE is None:
+        # Persist cache/storage under the app data directory so map tiles and
+        # WebEngine state survive across launches instead of starting cold.
         root = app_data_dir() / "webengine"
         cache = root / "cache"
         storage = root / "storage"
@@ -57,6 +63,8 @@ def _persistent_web_profile() -> QWebEngineProfile:
 
 
 def _write_temp_html(html: str, prefix: str) -> Path:
+    # WebEngine loads the GPS map from a local file URL, so write a temporary
+    # HTML file into an app-owned directory rather than an anonymous temp file.
     html_dir = app_data_dir() / "rendered_html"
     html_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -147,6 +155,8 @@ class TelemetryPlotWidget(QWidget):
         self._render()
 
     def _render(self) -> None:
+        # The Plotly figure is rebuilt on every state change so compare traces,
+        # cursor selection, and display mode stay in sync with the main window.
         fig = build_telemetry_figure(
             self.log,
             self.columns,
@@ -195,6 +205,8 @@ class GpsPathWidget(QWidget):
         self.dark = dark
         html = build_gps_map_html(log, options=self.options, dark=dark)
         if self._web_engine:
+            # Regenerate the HTML file on each refresh so the embedded browser
+            # always reads the latest payload and can access local assets.
             previous_path = self._html_path
             self._html_path = _write_temp_html(html, "gps-map-")
             self._view.setUrl(QUrl.fromLocalFile(str(self._html_path)))
@@ -212,6 +224,8 @@ class GpsPathWidget(QWidget):
     def _schedule_viewport_refresh(self, fit: bool = False) -> None:
         if not self._web_engine:
             return
+        # MapLibre needs a few layout passes before fit/resize calls become
+        # stable, so retry the viewport update after the page settles.
         for delay in (0, 150, 600):
             QTimer.singleShot(delay, lambda fit=fit: self.refresh_viewport(fit=fit))
 

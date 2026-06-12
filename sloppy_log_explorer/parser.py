@@ -1,3 +1,5 @@
+"""Telemetry log loading plus time and GPS column heuristics."""
+
 from __future__ import annotations
 
 import re
@@ -9,6 +11,8 @@ import pandas as pd
 from .models import GpsColumns, LoadedLog, LogFileInfo
 
 LOG_EXTENSIONS = {".csv", ".log"}
+# GPS parsing uses helper columns internally so the rest of the app can work
+# with normalized numeric lat/lon values even when the source log is messy.
 _GPS_HELPER_LAT = "__gps_latitude"
 _GPS_HELPER_LON = "__gps_longitude"
 _GPS_HELPER_ALT = "__gps_altitude"
@@ -19,6 +23,8 @@ _COORDINATE_DECIMAL_RE = re.compile(
 
 
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Remove pandas' auto-generated placeholder columns from ragged exports and
+    # normalize names so later heuristics can compare them reliably.
     mask = df.columns.to_series().astype(str).str.match(r"^Unnamed", na=False)
     df = df.loc[:, ~mask]
     df = df.copy()
@@ -43,6 +49,8 @@ def _deduplicate_columns(columns: list[str]) -> list[str]:
 
 
 def _read_ragged_csv(path: Path) -> pd.DataFrame:
+    # FrSky-style exports sometimes have uneven rows or delimiter drift, so we
+    # fall back to the stdlib csv reader when pandas cannot infer the layout.
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         sample = handle.read(4096)
         handle.seek(0)
@@ -83,6 +91,8 @@ def _detect_time(df: pd.DataFrame) -> pd.Series | None:
     time_cols = [c for c in columns if "time" in lower[c]]
 
     if date_cols and time_cols:
+        # Prefer a combined date/time parse when both fields exist because many
+        # logs split the timestamp across two columns.
         series = pd.to_datetime(
             df[date_cols[0]].astype(str).str.strip() + " " + df[time_cols[0]].astype(str).str.strip(),
             errors="coerce",
@@ -97,6 +107,8 @@ def _detect_time(df: pd.DataFrame) -> pd.Series | None:
             return parsed
         numeric = pd.to_numeric(raw, errors="coerce")
         if numeric.notna().sum() >= max(1, len(df) // 3):
+            # Some exports store elapsed seconds as a bare number; convert them
+            # to timestamps anchored at the Unix epoch so Plotly can format them.
             base = pd.Timestamp("1970-01-01")
             return base + pd.to_timedelta(numeric.fillna(0), unit="s")
 
@@ -106,6 +118,8 @@ def _detect_time(df: pd.DataFrame) -> pd.Series | None:
 def _model_from_path(path: Path, library_root: Path | None = None) -> str:
     if library_root:
         try:
+            # When scanning a library, the first folder below the root usually
+            # names the aircraft/model better than the filename itself.
             rel = path.relative_to(library_root)
             if len(rel.parts) > 1:
                 return rel.parts[0]
@@ -118,6 +132,8 @@ def _model_from_path(path: Path, library_root: Path | None = None) -> str:
         name = parent.name
         if name.lower() not in {"logs", "log", "telemetry", "csv", "sd", "models"}:
             return name
+    # Fall back to a stem prefix so root-level export filenames still group
+    # sensibly even when there is no helpful directory structure.
     stem = path.stem
     return re.split(r"[-_ ]\d{4}", stem, maxsplit=1)[0] or "Unsorted"
 
@@ -129,6 +145,8 @@ def _numeric_columns(df: pd.DataFrame, time: pd.Series | None) -> list[str]:
             continue
         converted = pd.to_numeric(df[col], errors="coerce")
         if converted.notna().any():
+            # Coerce in place so downstream plotting and GPS heuristics can use
+            # a stable numeric dtype instead of re-parsing each column later.
             df[col] = converted
             numeric.append(col)
     return numeric
@@ -200,6 +218,7 @@ def _parse_coordinate_text(text: str) -> tuple[float, float, float | None] | Non
     cleaned = text.strip().strip("()[]{}").replace("−", "-")
     if not cleaned:
         return None
+    # Ignore strings that do not look like coordinate pairs/triples at all.
     if not any(sep in cleaned for sep in (",", ";", "|", "/")) and cleaned.count(" ") < 1:
         return None
 
@@ -251,6 +270,8 @@ def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | Non
         return None
 
     score = coverage * 10.0
+    # Column-name hints help disambiguate latitude/longitude lookalikes when
+    # the value ranges alone are not enough.
     score += _axis_name_bonus(column, axis)
     score += min(1.0, float(valid.abs().median()) / bound if bound else 0.0)
     return score
@@ -294,6 +315,8 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
         score += _axis_name_bonus(column, "lat")
         score += _axis_name_bonus(column, "lon")
         if best is None or score > best[0]:
+            # Keep the parsed coordinate column as the user-visible label while
+            # the helper columns carry the normalized numeric values.
             alt_series = pd.Series(alt_values, index=df.index, dtype="float64") if any(v is not None for v in alt_values) else pd.Series([pd.NA] * len(df), index=df.index)
             best = (score, column, lat_series, lon_series, alt_series, column)
 
@@ -345,6 +368,8 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
     if not usable:
         return None
 
+    # If there are obvious lat/lon names, trust them first before falling back
+    # to range-based scoring.
     lat_named = _find_named_column(list(usable), ("lat",)) or _find_named_column(list(usable), ("gps", "la"))
     lon_named = (
         _find_named_column(list(usable), ("lon",))
@@ -403,6 +428,8 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
     has_name_hint = _has_coordinate_name_hint(lat_column) or _has_coordinate_name_hint(lon_column)
     lat_span = float((usable[lat_column].dropna().max() - usable[lat_column].dropna().min()))
     lon_span = float((usable[lon_column].dropna().max() - usable[lon_column].dropna().min()))
+    # Reject wide-spanning pairs without a label hint; those are often generic
+    # telemetry channels rather than an actual position trace.
     if not has_name_hint and (lat_span > 5.0 or lon_span > 5.0):
         return None
     alt = (
@@ -421,6 +448,8 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
 
 
 def detect_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
+    # Try a single text column first because some radios export "lat,lon,alt"
+    # bundles; fall back to separate columns when that fails.
     gps = _detect_coordinate_string_gps(df, numeric_columns)
     if gps is not None:
         return gps
@@ -434,6 +463,8 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     time = _detect_time(df)
     numeric = _numeric_columns(df, time)
     df = df.copy()
+    # GPS detection can inject helper columns, so rerun the numeric pass after
+    # the detector has had a chance to normalize coordinate text.
     gps = detect_gps_columns(df, numeric)
     numeric = _numeric_columns(df, time)
     df = df.copy()
@@ -443,6 +474,8 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
         end = time.dropna().iloc[-1]
         duration = max(0.0, float((end - start).total_seconds()))
     else:
+        # When there is no usable timestamp, treat row count as a simple elapsed
+        # sample index so the UI still has a deterministic x-axis.
         start = None
         end = None
         duration = float(len(df) - 1) if len(df) else 0.0
@@ -464,6 +497,8 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
 
 def relative_seconds(log: LoadedLog) -> list[float]:
     if log.time is not None and log.time.notna().any():
+        # Forward/back fill gaps so the cursor and selection math stay monotonic
+        # even when the source log has sparse timestamp holes.
         clean = log.time.ffill().bfill()
         start = clean.iloc[0]
         return [max(0.0, float((value - start).total_seconds())) for value in clean]
