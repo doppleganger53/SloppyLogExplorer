@@ -176,7 +176,7 @@ class MainWindow(QMainWindow):
 
         self.column_table = QTableWidget(0, 2)
         self.column_table.setHorizontalHeaderLabels(["Show", "Parameter"])
-        self.column_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.column_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.column_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._configure_sortable_table(self.column_table)
         self.column_table.itemChanged.connect(self.column_changed)
@@ -354,13 +354,13 @@ class MainWindow(QMainWindow):
 
         self.battery_table = QTableWidget(0, 4)
         self.battery_table.setHorizontalHeaderLabels(["ID", "Name", "Cells", "Active"])
-        self.battery_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.battery_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.battery_table)
         layout.addWidget(self.battery_table, 1)
 
         self.history_table = QTableWidget(0, 6)
         self.history_table.setHorizontalHeaderLabels(["Battery", "Date", "Pack mOhm", "Cell mOhm", "Health", "Log"])
-        self.history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.history_table).setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.history_table)
         layout.addWidget(self.history_table, 2)
         self.tabs.addTab(tab, "Batteries")
@@ -386,7 +386,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         self.sync_table = QTableWidget(0, 4)
         self.sync_table.setHorizontalHeaderLabels(["Reason", "Relative Path", "Source", "Target"])
-        self.sync_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.sync_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.sync_table)
         layout.addWidget(self.sync_table)
         self.tabs.addTab(tab, "SD Sync")
@@ -406,7 +406,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.alias_table = QTableWidget(0, 2)
         self.alias_table.setHorizontalHeaderLabels(["Hardware switch/file", "Radio alias/UI label"])
-        self.alias_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.alias_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.alias_table)
         layout.addWidget(self.alias_table)
         self.tabs.addTab(tab, "Switch Aliases")
@@ -432,8 +432,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         self.voice_table = QTableWidget(0, 2)
         self.voice_table.setHorizontalHeaderLabels(["Text to be Spoken", "Target WAV Filename"])
-        self.voice_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.voice_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.voice_table).setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._horizontal_header(self.voice_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.voice_table)
         layout.addWidget(self.voice_table)
         self.tabs.addTab(tab, "Voice Pack")
@@ -544,14 +544,24 @@ class MainWindow(QMainWindow):
         )
 
     @staticmethod
-    def _configure_sortable_table(table: QTableWidget) -> None:
+    def _horizontal_header(table: QTableWidget) -> QHeaderView:
         header = table.horizontalHeader()
+        if header is None:
+            raise RuntimeError("QTableWidget did not provide a horizontal header")
+        return header
+
+    @staticmethod
+    def _configure_sortable_table(table: QTableWidget) -> None:
+        header = MainWindow._horizontal_header(table)
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         table.setSortingEnabled(True)
 
     def _apply_style(self) -> None:
-        QApplication.instance().setStyle("Fusion")
+        app = QApplication.instance()
+        if not isinstance(app, QApplication):
+            raise RuntimeError("No QApplication instance found")
+        app.setStyle("Fusion")
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #20242b; color: #e5e7eb; }
@@ -1123,30 +1133,46 @@ class MainWindow(QMainWindow):
         )
 
     def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
-        items = [self.library_tree.topLevelItem(index) for index in range(self.library_tree.topLevelItemCount())]
+        _my_library_tree = self.library_tree
+        if _my_library_tree is None:
+            raise RuntimeError("Library tree widget not found for sorting")
+        items: list[QTreeWidgetItem] = []
+        for index in range(_my_library_tree.topLevelItemCount()):
+            item = _my_library_tree.topLevelItem(index)
+            if item is None:
+                raise RuntimeError("Failed to retrieve library tree items for sorting")
+            items.append(item)
         # Capture expansion state before we rebuild the tree, otherwise Qt will
         # collapse everything when the items are reinserted.
         expanded_state = {id(item): item.isExpanded() for item in items}
-        while self.library_tree.topLevelItemCount():
-            self.library_tree.takeTopLevelItem(0)
+        while _my_library_tree.topLevelItemCount():
+            _my_library_tree.takeTopLevelItem(0)
 
         reverse = order == Qt.SortOrder.DescendingOrder
         items.sort(key=lambda item: self._library_sort_key(item, column), reverse=reverse)
 
-        self.library_tree.setUpdatesEnabled(False)
+        _my_library_tree.setUpdatesEnabled(False)
         try:
             for index, item in enumerate(items):
-                self.library_tree.insertTopLevelItem(index, item)
+                _my_library_tree.insertTopLevelItem(index, item)
                 self._sort_library_children(item, column, order)
             for item in items:
                 item.setExpanded(expanded_state.get(id(item), False))
         finally:
-            self.library_tree.setUpdatesEnabled(True)
+            _my_library_tree.setUpdatesEnabled(True)
 
-        self.library_tree.header().setSortIndicator(column, order)
+        header = _my_library_tree.header()
+        if header is None:
+            raise RuntimeError("Failed to get library tree header for sort indicator")
+        header.setSortIndicator(column, order)
 
     def _sort_library_children(self, item: QTreeWidgetItem, column: int, order: Qt.SortOrder) -> None:
-        children = [item.child(index) for index in range(item.childCount())]
+        children: list[QTreeWidgetItem] = []
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if child is None:
+                raise RuntimeError("Failed to retrieve library tree child items for sorting")
+            children.append(child)
         expanded_state = {id(child): child.isExpanded() for child in children}
         while item.childCount():
             item.takeChild(0)
@@ -1187,6 +1213,7 @@ class MainWindow(QMainWindow):
             if value < 1024.0 or unit == units[-1]:
                 return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
             value /= 1024.0
+        raise ValueError("Size value is too large to format")
 
     def closeEvent(self, event) -> None:
         self.store.close()
