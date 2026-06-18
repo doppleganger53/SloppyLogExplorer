@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import time
 import traceback
+from bisect import bisect_left
 from datetime import datetime
 from pathlib import Path
 
@@ -47,7 +48,7 @@ from .analysis import (
 )
 from .library import group_by_model, scan_library
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
-from .parser import load_log, nearest_index, relative_seconds
+from .parser import load_log, relative_seconds
 from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
@@ -416,6 +417,8 @@ class MainWindow(QMainWindow):
         self.sync_table = QTableWidget(0, 4)
         self.sync_table.setHorizontalHeaderLabels(["Reason", "Relative Path", "Source", "Target"])
         self._horizontal_header(self.sync_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.sync_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sync_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._configure_sortable_table(self.sync_table)
         layout.addWidget(self.sync_table)
         self.tabs.addTab(tab, "SD Sync")
@@ -608,6 +611,20 @@ class MainWindow(QMainWindow):
     def _gps_duration_seconds(self) -> float:
         return max(self.gps_timeline_seconds) if self.gps_timeline_seconds else 0.0
 
+    def _nearest_gps_index(self, elapsed_seconds: float) -> int:
+        if not self.gps_timeline_seconds:
+            return 0
+        insertion = bisect_left(self.gps_timeline_seconds, elapsed_seconds)
+        if insertion <= 0:
+            return 0
+        if insertion >= len(self.gps_timeline_seconds):
+            return len(self.gps_timeline_seconds) - 1
+        before = insertion - 1
+        after = insertion
+        if abs(self.gps_timeline_seconds[after] - elapsed_seconds) < abs(elapsed_seconds - self.gps_timeline_seconds[before]):
+            return after
+        return before
+
     def _gps_marker_columns(self) -> list[str]:
         if self.current_log is None:
             return []
@@ -664,7 +681,7 @@ class MainWindow(QMainWindow):
             return
         self.gps_playback_elapsed_seconds = max(0.0, min(float(elapsed_seconds), self._gps_duration_seconds()))
         self.set_selected_index(
-            nearest_index(self.current_log, self.gps_playback_elapsed_seconds),
+            self._nearest_gps_index(self.gps_playback_elapsed_seconds),
             sync_playback_elapsed=False,
         )
 
@@ -698,7 +715,7 @@ class MainWindow(QMainWindow):
             self.set_selected_index(len(self.current_log.dataframe) - 1, sync_playback_elapsed=False)
             self.set_gps_playback_playing(False)
             return
-        self.set_selected_index(nearest_index(self.current_log, next_elapsed), sync_playback_elapsed=False)
+        self.set_selected_index(self._nearest_gps_index(next_elapsed), sync_playback_elapsed=False)
 
     @staticmethod
     def _horizontal_header(table: QTableWidget) -> QHeaderView:
@@ -719,8 +736,9 @@ class MainWindow(QMainWindow):
         if not isinstance(app, QApplication):
             raise RuntimeError("No QApplication instance found")
         app.setStyle("Fusion")
-        self.setStyleSheet(
-            """
+        if self.dark_mode:
+            self.setStyleSheet(
+                """
             QMainWindow, QWidget { background: #20242b; color: #e5e7eb; }
             QMenuBar, QMenu, QStatusBar { background: #181b20; color: #e5e7eb; }
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
@@ -735,7 +753,25 @@ class MainWindow(QMainWindow):
             QTabBar::tab:selected { background: #2f80ed; color: white; }
             QLabel#summary { color: #aab2c0; font-size: 12px; }
             """
-        )
+            )
+        else:
+            self.setStyleSheet(
+                """
+            QMainWindow, QWidget { background: #f6f8fb; color: #1f2937; }
+            QMenuBar, QMenu, QStatusBar { background: #ffffff; color: #1f2937; border-bottom: 1px solid #d7dde7; }
+            QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
+            QPushButton:hover { background: #1f6fd4; }
+            QPushButton:checked { background: #185fc7; border: 1px solid #0f4fb0; padding: 6px 9px; }
+            QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget {
+                background: #ffffff; color: #1f2937; border: 1px solid #c9d2df; border-radius: 4px;
+            }
+            QHeaderView::section { background: #e8edf4; color: #1f2937; padding: 5px; border: 0; }
+            QTabWidget::pane { border: 1px solid #ccd5e1; }
+            QTabBar::tab { background: #e8edf4; color: #1f2937; padding: 8px 14px; }
+            QTabBar::tab:selected { background: #2f80ed; color: white; }
+            QLabel#summary { color: #586579; font-size: 12px; }
+            """
+            )
 
     def _restore_state(self) -> None:
         # Restore the library first so any saved last-log path can be resolved
@@ -1014,7 +1050,7 @@ class MainWindow(QMainWindow):
         if sync_playback_elapsed:
             self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
         self.update_info_panel()
-        self.refresh_graph()
+        self.graph_view.set_cursor_index(self.selected_index)
         self.sync_gps_cursor()
 
     def step_selected_index(self, delta: int) -> None:
@@ -1049,6 +1085,7 @@ class MainWindow(QMainWindow):
 
     def toggle_theme(self, *_args) -> None:
         self.dark_mode = self.dark_action.isChecked()
+        self._apply_style()
         self.refresh_plots()
 
     def set_telemetry_interaction_mode(self, mode: str) -> None:
@@ -1110,7 +1147,10 @@ class MainWindow(QMainWindow):
         self.battery_table.setSortingEnabled(False)
         self.battery_table.setRowCount(0)
         for battery in batteries:
-            self.battery_select.addItem(f"{battery['name']} ({battery['cells']}S)", battery["id"])
+            self.battery_select.addItem(
+                f"{battery['name']} ({battery['cells']}S)",
+                {"id": battery["id"], "cells": battery["cells"]},
+            )
             row = self.battery_table.rowCount()
             self.battery_table.insertRow(row)
             for col, key in enumerate(["id", "name", "cells", "active"]):
@@ -1146,18 +1186,36 @@ class MainWindow(QMainWindow):
     def calculate_battery_ir(self) -> None:
         if self.current_log is None:
             return
-        battery_id = self.battery_select.currentData()
-        if not battery_id:
+        battery_data = self.battery_select.currentData()
+        if not battery_data:
             QMessageBox.information(self, "No battery", "Add or select a battery first.")
             return
+        if isinstance(battery_data, dict):
+            battery_id = int(battery_data["id"])
+            cells = int(battery_data["cells"])
+        else:
+            battery_id = int(battery_data)
+            cells = None
         voltage = self.voltage_combo.currentText()
         current = self.current_combo.currentText()
-        result = calculate_internal_resistance(self.current_log.dataframe, voltage, current)
+        if (
+            not voltage
+            or not current
+            or voltage not in self.current_log.dataframe.columns
+            or current not in self.current_log.dataframe.columns
+        ):
+            QMessageBox.warning(
+                self,
+                "IR calculation failed",
+                "Select valid voltage and current columns before calculating battery IR.",
+            )
+            return
+        result = calculate_internal_resistance(self.current_log.dataframe, voltage, current, cells=cells)
         if result is None:
             QMessageBox.warning(self, "IR calculation failed", "The log does not contain enough voltage/current variation.")
             return
         self.store.add_battery_history(
-            int(battery_id),
+            battery_id,
             str(self.current_log.info.path),
             result.pack_milliohm,
             result.cell_milliohm,
@@ -1184,28 +1242,55 @@ class MainWindow(QMainWindow):
         self.sync_candidates = discover_sync_candidates(source, target)
         self.sync_table.setSortingEnabled(False)
         self.sync_table.setRowCount(0)
-        for candidate in self.sync_candidates:
+        for candidate_index, candidate in enumerate(self.sync_candidates):
             row = self.sync_table.rowCount()
             self.sync_table.insertRow(row)
             values = [candidate.reason, str(candidate.relative_path), str(candidate.source), str(candidate.target)]
             for col, value in enumerate(values):
-                self.sync_table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, candidate_index)
+                self.sync_table.setItem(row, col, item)
         self.sync_table.setSortingEnabled(True)
         self.status.showMessage(f"Found {len(self.sync_candidates)} sync candidates")
 
     def copy_sync_candidates(self) -> None:
-        copied = copy_candidates(self.sync_candidates)
+        selected_candidates = self._selected_sync_candidates()
+        if not selected_candidates:
+            QMessageBox.information(self, "No sync candidates selected", "Select one or more candidate rows before copying.")
+            return
+        copied = copy_candidates(selected_candidates)
         self.status.showMessage(f"Copied {copied} log files")
         if self.sync_target.text().strip():
             self.load_library(Path(self.sync_target.text().strip()))
 
-    def populate_alias_profiles(self) -> None:
+    def _selected_sync_candidates(self) -> list[SyncCandidate]:
+        selection_model = self.sync_table.selectionModel()
+        if selection_model is None:
+            return []
+        selected_rows = sorted({index.row() for index in selection_model.selectedRows()})
+        selected: list[SyncCandidate] = []
+        for row in selected_rows:
+            item = self.sync_table.item(row, 0)
+            if item is None:
+                continue
+            candidate_index = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(candidate_index, int):
+                continue
+            if 0 <= candidate_index < len(self.sync_candidates):
+                selected.append(self.sync_candidates[candidate_index])
+        return selected
+
+    def populate_alias_profiles(self, preferred_profile: str | None = None) -> None:
         self.alias_profile.blockSignals(True)
         self.alias_profile.clear()
         profiles = self.store.alias_profiles()
         if not profiles:
             profiles = ["Default"]
         self.alias_profile.addItems(profiles)
+        if preferred_profile:
+            index = self.alias_profile.findText(preferred_profile)
+            if index >= 0:
+                self.alias_profile.setCurrentIndex(index)
         self.alias_profile.blockSignals(False)
         self.load_alias_profile(self.alias_profile.currentText())
 
@@ -1235,7 +1320,7 @@ class MainWindow(QMainWindow):
             if hardware:
                 aliases[hardware.text()] = alias.text() if alias else ""
         self.store.save_aliases(profile, aliases)
-        self.populate_alias_profiles()
+        self.populate_alias_profiles(profile)
         self.status.showMessage(f"Saved alias profile {profile}")
 
     def add_voice_item(self) -> None:

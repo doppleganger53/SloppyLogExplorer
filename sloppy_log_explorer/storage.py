@@ -73,7 +73,17 @@ class AppStore:
             );
             """
         )
+        self._ensure_column("flights", "model", "text")
+        self._ensure_column("flights", "notes", "text default ''")
+        self._ensure_column("flights", "video_path", "text default ''")
+        self._ensure_column("flights", "updated_at", "text")
         self.conn.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        rows = self.conn.execute(f"pragma table_info({table})").fetchall()
+        if column in {row["name"] for row in rows}:
+            return
+        self.conn.execute(f"alter table {table} add column {column} {definition}")
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         row = self.conn.execute("select value from settings where key = ?", (key,)).fetchone()

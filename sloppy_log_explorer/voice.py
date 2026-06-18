@@ -86,6 +86,23 @@ def _placeholder_wav(path: Path, text: str) -> None:
         wav.writeframes(bytes(data))
 
 
+def _voice_target_path(output_path: Path, filename: str) -> Path | None:
+    clean = filename.strip()
+    if not clean:
+        return None
+    requested = Path(clean)
+    if requested.is_absolute() or len(requested.parts) != 1:
+        raise ValueError("Voice-pack filenames must be simple file names, not paths.")
+    if not clean.lower().endswith(".wav"):
+        clean += ".wav"
+    target = output_path / clean
+    output_root = output_path.resolve()
+    resolved_target = target.resolve()
+    if not resolved_target.is_relative_to(output_root):
+        raise ValueError("Voice-pack output path escaped the selected directory.")
+    return target
+
+
 def generate_voice_pack(items: list[VoiceItem], output_dir: str | Path) -> list[Path]:
     """Generate WAV files for the supplied voice items.
 
@@ -97,6 +114,14 @@ def generate_voice_pack(items: list[VoiceItem], output_dir: str | Path) -> list[
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    jobs: list[tuple[VoiceItem, Path]] = []
+    for item in items:
+        target = _voice_target_path(output_path, item.filename)
+        if target is not None:
+            jobs.append((item, target))
+    if not jobs:
+        return []
+
     created: list[Path] = []
     engine = None
     try:
@@ -111,17 +136,7 @@ def generate_voice_pack(items: list[VoiceItem], output_dir: str | Path) -> list[
         # result instead of surfacing those local environment problems here.
         engine = None
 
-    for item in items:
-        filename = item.filename.strip()
-        if not filename:
-            # A row without a target filename cannot be written safely; skipping
-            # mirrors the table workflow where users can leave draft rows blank.
-            continue
-        if not filename.lower().endswith(".wav"):
-            # The UI allows concise names, but the generated artifacts should be
-            # explicit WAV files for radio/import tooling.
-            filename += ".wav"
-        target = output_path / filename
+    for item, target in jobs:
         if engine is not None:
             engine.save_to_file(item.text, str(target))
             # pyttsx3 queues speech requests; `runAndWait()` flushes each file so

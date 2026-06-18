@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from html import escape
 import math
 import re
 from collections.abc import Sequence
@@ -9,7 +10,9 @@ from numbers import Real
 from typing import Any, TypedDict
 
 import pandas as pd
+import plotly
 import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs
 
 from .gps_map_renderer import (
     ALTITUDE_EXAGGERATION,
@@ -23,6 +26,7 @@ from .gps_map_renderer import (
 )
 from .models import GpsGradientOptions, LoadedLog
 from .parser import relative_seconds
+from .storage import app_data_dir
 
 COLORS = [
     "#2f80ed",
@@ -38,14 +42,49 @@ COLORS = [
 DEFAULT_PATH_COLOR = "#55d977"
 MISSING_VALUE_COLOR = "#9ca3af"
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+MAX_TELEMETRY_TRACE_POINTS = 12000
+MAX_RENDERED_TELEMETRY_TRACES = 24
+MAX_VISIBLE_TELEMETRY_AXES = 6
+MAX_VISIBLE_LEGEND_ITEMS = 12
+MAX_STATS_ANNOTATION_ROWS = 12
 MAX_GPS_JUMP_KM = 1000.0
 # A tiny origin tolerance catches placeholder zeros without rejecting genuine
 # coordinates that are only close to zero.
 GPS_ORIGIN_EPSILON = 1e-9
 
 
+def _plotly_js_uri() -> str:
+    asset_dir = app_data_dir() / "assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    script_path = asset_dir / f"plotly-{plotly.__version__}.min.js"
+    if not script_path.exists() or script_path.stat().st_size == 0:
+        script_path.write_text(get_plotlyjs(), encoding="utf-8")
+    return script_path.as_uri()
+
+
+def _plotly_script_tag() -> str:
+    return f'<script src="{escape(_plotly_js_uri(), quote=True)}"></script>'
+
+
 def _axis_name(index: int) -> str:
     return "y" if index == 0 else f"y{index + 1}"
+
+
+def _sample_indices(length: int, maximum: int = MAX_TELEMETRY_TRACE_POINTS) -> list[int]:
+    if length <= 0:
+        return []
+    if length <= maximum:
+        return list(range(length))
+    step = math.ceil(length / maximum)
+    indices = list(range(0, length, step))
+    if indices[-1] != length - 1:
+        indices.append(length - 1)
+    return indices
+
+
+def _sample_numeric_values(series: pd.Series, indices: list[int]) -> list[object]:
+    values = pd.to_numeric(series, errors="coerce").to_numpy()
+    return [values[index] for index in indices]
 
 
 def _coerce_float(value: object) -> float | None:
@@ -243,31 +282,43 @@ def build_telemetry_figure(
         return fig
 
     x = _telemetry_x_values(primary, time_mode)
-    for idx, col in enumerate(columns):
+    primary_indices = _sample_indices(len(primary.dataframe))
+    primary_x = [x[index] for index in primary_indices] if primary_indices else []
+    trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
+    plotted_columns = columns[:MAX_RENDERED_TELEMETRY_TRACES]
+    hidden_trace_count = max(0, len(columns) - len(plotted_columns))
+    for idx, col in enumerate(plotted_columns):
         if col not in primary.dataframe.columns:
             continue
         color = COLORS[idx % len(COLORS)]
         axis = _axis_name(idx)
         fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=pd.to_numeric(primary.dataframe[col], errors="coerce"),
+            trace_class(
+                x=primary_x,
+                y=_sample_numeric_values(_numeric_series(primary.dataframe, col), primary_indices),
+                customdata=primary_indices,
                 name=col,
                 mode="lines",
                 line={"color": color, "width": 2},
                 yaxis=axis,
+                showlegend=idx < MAX_VISIBLE_LEGEND_ITEMS,
             )
         )
         if compare is not None and col in compare.dataframe.columns:
+            compare_indices = _sample_indices(len(compare.dataframe))
+            compare_x_values = _telemetry_x_values(compare, time_mode)
+            compare_trace_class = go.Scattergl if len(compare_indices) > 2000 else go.Scatter
             fig.add_trace(
-                go.Scatter(
-                    x=_telemetry_x_values(compare, time_mode),
-                    y=pd.to_numeric(compare.dataframe[col], errors="coerce"),
+                compare_trace_class(
+                    x=[compare_x_values[index] for index in compare_indices],
+                    y=_sample_numeric_values(_numeric_series(compare.dataframe, col), compare_indices),
+                    customdata=compare_indices,
                     name=f"{col} compare",
                     mode="lines",
                     line={"color": color, "width": 1.5, "dash": "dash"},
                     yaxis=axis,
                     opacity=0.75,
+                    showlegend=idx < MAX_VISIBLE_LEGEND_ITEMS,
                 )
             )
 
@@ -277,7 +328,12 @@ def build_telemetry_figure(
         "plot_bgcolor": "#171a20" if dark else "#ffffff",
         "hovermode": "x unified",
         "dragmode": interaction_mode if interaction_mode in {"pan", "zoom"} else "pan",
-        "margin": {"l": 58, "r": 64 + max(0, len(columns) - 1) * 44, "t": 30, "b": 46},
+        "margin": {
+            "l": 58,
+            "r": 64 + min(max(0, len(plotted_columns) - 1), MAX_VISIBLE_TELEMETRY_AXES - 1) * 44,
+            "t": 30,
+            "b": 46,
+        },
         "legend": {"orientation": "h", "y": 1.08, "x": 0},
         "xaxis": {
             "title": "Time" if time_mode == "absolute" and primary.time is not None else "Elapsed time",
@@ -285,25 +341,34 @@ def build_telemetry_figure(
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         },
     }
-    for idx, col in enumerate(columns):
+    for idx, col in enumerate(plotted_columns):
         axis_key = "yaxis" if idx == 0 else f"yaxis{idx + 1}"
+        axis_is_visible = idx < MAX_VISIBLE_TELEMETRY_AXES
         axis = {
-            "title": {"text": col, "font": {"color": COLORS[idx % len(COLORS)]}},
+            "title": {
+                "text": col if axis_is_visible else "",
+                "font": {"color": COLORS[idx % len(COLORS)]},
+            },
             "tickfont": {"color": COLORS[idx % len(COLORS)]},
+            "showticklabels": axis_is_visible,
             "showgrid": show_grid and idx == 0,
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         }
         if idx > 0:
             # Overlay secondary axes on the right edge so every selected
-            # telemetry channel keeps its own scale without shrinking the plot.
+            # telemetry channel keeps its own scale. Only the first few axes
+            # are visible; beyond that, the labels hurt readability more than
+            # they help.
             axis.update(
                 {
                     "anchor": "free",
                     "overlaying": "y",
                     "side": "right",
-                    "position": min(0.98, 0.86 + idx * 0.045),
+                    "position": min(0.98, 0.86 + min(idx, MAX_VISIBLE_TELEMETRY_AXES - 1) * 0.045),
                 }
             )
+        if not axis_is_visible:
+            axis.update({"ticks": "", "showgrid": False, "zeroline": False})
         layout[axis_key] = axis
     fig.update_layout(**layout)
     if not fig.data:
@@ -324,6 +389,10 @@ def build_telemetry_figure(
             continue
         stats_lines.append(f"{col}: min {float(minimum):.2f} | max {float(maximum):.2f}")
     if stats_lines:
+        visible_stats_lines = stats_lines[:MAX_STATS_ANNOTATION_ROWS]
+        hidden_stats_count = len(stats_lines) - len(visible_stats_lines)
+        if hidden_stats_count:
+            visible_stats_lines.append(f"+ {hidden_stats_count} more selected")
         # Min/max annotations are intentionally compact because they are only a
         # quick readout, not a full statistics table.
         fig.add_annotation(
@@ -333,9 +402,25 @@ def build_telemetry_figure(
             yref="paper",
             xanchor="left",
             yanchor="top",
-            text="<b>Min / Max</b><br>" + "<br>".join(stats_lines),
+            text="<b>Min / Max</b><br>" + "<br>".join(visible_stats_lines),
             showarrow=False,
             align="left",
+            bordercolor="rgba(255,255,255,0.18)" if dark else "rgba(0,0,0,0.2)",
+            borderwidth=1,
+            bgcolor="rgba(0,0,0,0.58)" if dark else "rgba(255,255,255,0.86)",
+            font={"size": 12},
+        )
+    if hidden_trace_count:
+        fig.add_annotation(
+            x=0.99,
+            y=0.99,
+            xref="paper",
+            yref="paper",
+            xanchor="right",
+            yanchor="top",
+            text=f"Showing first {len(plotted_columns)} of {len(columns)} selected",
+            showarrow=False,
+            align="right",
             bordercolor="rgba(255,255,255,0.18)" if dark else "rgba(0,0,0,0.2)",
             borderwidth=1,
             bgcolor="rgba(0,0,0,0.58)" if dark else "rgba(255,255,255,0.86)",
@@ -656,18 +741,20 @@ def build_gps_map_html(
 
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
     body = fig.to_html(
-        include_plotlyjs="cdn",
+        include_plotlyjs=False,
         full_html=False,
         config={"responsive": True, "scrollZoom": True, "displaylogo": False},
     )
     background = "#1f242b" if dark else "#ffffff"
+    plotly_script = _plotly_script_tag()
     if not bridge:
-        return f"<html><body style='margin:0;background:{background}'>{body}</body></html>"
+        return f"<html><head>{plotly_script}</head><body style='margin:0;background:{background}'>{body}</body></html>"
     # The bridge script is only injected for the Qt WebChannel path so the
     # plot can forward clicks and keyboard navigation back to the main window.
     return f"""
 <html>
 <head>
+  {plotly_script}
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <style>html,body{{height:100%;margin:0;background:{background};overflow:hidden}}</style>
 </head>
@@ -686,7 +773,9 @@ function bindPlot() {{
   if (!plot) return;
   plot.on('plotly_click', function(data) {{
     if (!bridge || !data.points || !data.points.length) return;
-    bridge.selectIndex(data.points[0].pointIndex);
+    const point = data.points[0];
+    const selected = Number.isFinite(point.customdata) ? point.customdata : point.pointIndex;
+    bridge.selectIndex(selected);
   }});
   document.addEventListener('keydown', function(event) {{
     if (!bridge) return;

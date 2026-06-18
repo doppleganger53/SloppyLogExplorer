@@ -292,8 +292,13 @@ def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | Non
 
 def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
     best: tuple[float, str, pd.Series, pd.Series, pd.Series, str] | None = None
+    numeric_set = set(numeric_columns)
     for column in df.columns:
+        if column in numeric_set:
+            continue
         series = df[column]
+        if not _series_has_coordinate_text_sample(series):
+            continue
         lat_values: list[float] = []
         lon_values: list[float] = []
         alt_values: list[float | None] = []
@@ -322,7 +327,8 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
         lat_series = pd.Series(lat_values, index=df.index, dtype="float64")
         lon_series = pd.Series(lon_values, index=df.index, dtype="float64")
         valid = lat_series.between(-90, 90) & lon_series.between(-180, 180)
-        if valid.sum() < 2:
+        non_origin = valid & ((lat_series.abs() > 1e-9) | (lon_series.abs() > 1e-9))
+        if non_origin.sum() < 2:
             continue
         score = parsed_count
         score += _axis_name_bonus(column, "lat")
@@ -365,9 +371,31 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
     )
 
 
+def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame, sample_size: int = 200) -> bool:
+    if isinstance(series, pd.DataFrame):
+        series = pd.Series(series.to_numpy()[:, 0], index=series.index)
+    parsed = 0
+    checked = 0
+    for value in series:
+        if pd.isna(value):
+            continue
+        checked += 1
+        if _parse_coordinate_text(str(value)) is not None:
+            parsed += 1
+            if parsed >= 2:
+                return True
+        if checked >= sample_size:
+            break
+    return False
+
+
 def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
+    coordinate_candidates = [column for column in numeric_columns if _has_coordinate_name_hint(column)]
+    if len(coordinate_candidates) < 2:
+        return None
+
     usable: dict[str, pd.Series] = {}
-    for column in numeric_columns:
+    for column in coordinate_candidates:
         series = _coerce_numeric_series(df[column])
         valid = series.dropna()
         if len(valid) < 2:
@@ -393,11 +421,12 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
         lat_series = usable[lat_named]
         lon_series = usable[lon_named]
         valid = lat_series.between(-90, 90) & lon_series.between(-180, 180)
-        if valid.sum() >= 2:
+        non_origin = valid & ((lat_series.abs() > 1e-9) | (lon_series.abs() > 1e-9))
+        if non_origin.sum() >= 2:
             alt = (
-                _find_named_column(list(usable), ("alt",))
-                or _find_named_column(list(usable), ("height",))
-                or _find_named_column(list(usable), ("gps", "z"))
+                _find_named_column(numeric_columns, ("alt",))
+                or _find_named_column(numeric_columns, ("height",))
+                or _find_named_column(numeric_columns, ("gps", "z"))
             )
             return GpsColumns(
                 latitude=lat_named,
@@ -438,21 +467,20 @@ def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> G
         return None
 
     _, lat_column, lon_column = best
-    has_name_hint = _has_coordinate_name_hint(lat_column) or _has_coordinate_name_hint(lon_column)
+    lat_non_origin = (usable[lat_column].abs() > 1e-9) | (usable[lon_column].abs() > 1e-9)
+    lat_lon_valid = usable[lat_column].between(-90, 90) & usable[lon_column].between(-180, 180)
+    if (lat_non_origin & lat_lon_valid).sum() < 2:
+        return None
     lat_span = float((usable[lat_column].dropna().max() - usable[lat_column].dropna().min()))
     lon_span = float((usable[lon_column].dropna().max() - usable[lon_column].dropna().min()))
-    # Without a coordinate-like label, low-range telemetry such as pack voltage,
-    # switches, or pots can masquerade as a plausible lat/lon pair.
-    if not has_name_hint:
-        return None
     # Reject wide-spanning pairs even with weak labels; those are often generic
     # telemetry channels rather than an actual position trace.
     if lat_span > 5.0 or lon_span > 5.0:
         return None
     alt = (
-        _find_named_column(list(usable), ("alt",))
-        or _find_named_column(list(usable), ("height",))
-        or _find_named_column(list(usable), ("gps", "z"))
+        _find_named_column(numeric_columns, ("alt",))
+        or _find_named_column(numeric_columns, ("height",))
+        or _find_named_column(numeric_columns, ("gps", "z"))
     )
     return GpsColumns(
         latitude=lat_column,

@@ -14,7 +14,7 @@ from .models import CursorValue, InternalResistanceResult, LoadedLog
 def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     series = df[column]
     if isinstance(series, pd.DataFrame):
-        series = series.iloc[:, 0]
+        series = pd.Series(series.to_numpy()[:, 0], index=series.index)
     numeric = pd.to_numeric(series, errors="coerce")
     return pd.Series(numeric, index=series.index)
 
