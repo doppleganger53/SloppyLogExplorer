@@ -51,6 +51,16 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
     html = figure_html(fig, bridge=True)
     if "plotly" not in html.lower() or "qwebchannel" not in html.lower():
         raise AssertionError("telemetry HTML is missing Plotly or the Qt bridge")
+    required_plot_tokens = [
+        "plotly_relayout",
+        "xaxis.range[0]",
+        "xaxis.range[1]",
+        "xaxis.autorange",
+        "setXRange",
+    ]
+    missing_plot_tokens = [token for token in required_plot_tokens if token not in html]
+    if missing_plot_tokens:
+        raise AssertionError(f"telemetry HTML is missing visible x-range bridge tokens: {missing_plot_tokens}")
 
     compare = load_log(compare_path, library_root) if compare_path else log
     common = [column for column in selected if column in compare.dataframe.columns]
@@ -131,6 +141,11 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
             "getState: debugMapState",
             "window.__sloppyDebugMapState = state",
             "document.body.dataset.mapState = state.state",
+            "timeline.startElapsedSeconds",
+            "timeline.endElapsedSeconds",
+            "scopeStartSeconds",
+            "scopeEndSeconds",
+            "selectedElapsedSeconds",
         ]
         missing = [token for token in required_map_tokens if token not in gps_html]
         if missing:

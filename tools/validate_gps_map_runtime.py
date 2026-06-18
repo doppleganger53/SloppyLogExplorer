@@ -129,7 +129,18 @@ def validate_gps_map_runtime(
     if not log.info.has_gps:
         raise AssertionError(f"{log_path} does not contain detected GPS coordinates")
 
-    options = GpsGradientOptions(color_column=color_column)
+    duration_seconds = float(log.info.duration_seconds or 0.0)
+    scope_start_seconds = 2.0 if duration_seconds >= 2.0 else 0.0
+    scope_end_seconds = 5.0 if duration_seconds >= 5.0 else duration_seconds
+    if scope_end_seconds <= scope_start_seconds:
+        scope_start_seconds = 0.0
+        scope_end_seconds = duration_seconds
+
+    options = GpsGradientOptions(
+        color_column=color_column,
+        scope_start_seconds=scope_start_seconds,
+        scope_end_seconds=scope_end_seconds,
+    )
     html_path = state_root / "gps-map-runtime.html"
     # Write the HTML to disk so the page exercises the same file:// loading
     # path that the desktop widget uses.
@@ -177,7 +188,8 @@ def validate_gps_map_runtime(
         page,
         (
             "window.sloppyGpsMap.setCursor({"
-            "index:3,row:4,elapsedSeconds:3,durationSeconds:8,playing:false,speed:2,"
+            f"index:3,row:4,elapsedSeconds:3,durationSeconds:{scope_end_seconds - scope_start_seconds},"
+            f"scopeStartSeconds:{scope_start_seconds},scopeEndSeconds:{scope_end_seconds},playing:false,speed:2,"
             "values:[{label:'Current(A)',value:30},{label:'Alt(m)',value:16}]"
             "}); true;"
         ),
@@ -198,6 +210,19 @@ def validate_gps_map_runtime(
     if float(playback.get("speed") or 0) != 2.0:
         view.close()
         raise AssertionError(f"GPS map playback state did not preserve requested speed: {cursor_state}")
+    timeline = cursor_state.get("timeline")
+    if not isinstance(timeline, dict):
+        view.close()
+        raise AssertionError(f"GPS map timeline scope state was not reported: {cursor_state}")
+    if abs(float(timeline.get("startElapsedSeconds") or 0) - scope_start_seconds) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map timeline start did not match scoped range: {cursor_state}")
+    if abs(float(timeline.get("endElapsedSeconds") or 0) - scope_end_seconds) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map timeline end did not match scoped range: {cursor_state}")
+    if abs(float(cursor.get("selectedElapsedSeconds") or 0) - 3.0) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map cursor did not report the selected elapsed time: {cursor_state}")
 
     _run_js(
         page,
@@ -237,6 +262,10 @@ def validate_gps_map_runtime(
         "html": str(html_path),
         "screenshot": str(output),
         "loaded": True,
+        "scope": {
+            "start": scope_start_seconds,
+            "end": scope_end_seconds,
+        },
         "initial": initial_state,
         "afterCursor": cursor_state,
         "afterCamera": after_camera_state,

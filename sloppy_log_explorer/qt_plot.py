@@ -22,6 +22,7 @@ from .storage import app_data_dir
 class _PlotBridge(QObject):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
+    x_range_changed = pyqtSignal(object, object)
 
     @pyqtSlot(int)
     def selectIndex(self, index: int) -> None:
@@ -30,6 +31,10 @@ class _PlotBridge(QObject):
     @pyqtSlot(int)
     def stepIndex(self, delta: int) -> None:
         self.index_stepped.emit(delta)
+
+    @pyqtSlot(object, object)
+    def setXRange(self, start: object, end: object) -> None:
+        self.x_range_changed.emit(start, end)
 
 
 class _GpsBridge(QObject):
@@ -110,6 +115,7 @@ def _remove_file(path: Path | None) -> None:
 class TelemetryPlotWidget(QWidget):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
+    x_range_changed = pyqtSignal(object, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -121,6 +127,7 @@ class TelemetryPlotWidget(QWidget):
         self.dark = True
         self.interaction_mode = "pan"
         self.time_mode = "absolute"
+        self.x_range: tuple[object, object] | None = None
         self._view: QWebEngineView | QTextEdit
         self.setMinimumHeight(420)
 
@@ -135,6 +142,7 @@ class TelemetryPlotWidget(QWidget):
             self._bridge = _PlotBridge()
             self._bridge.index_selected.connect(self.index_selected)
             self._bridge.index_stepped.connect(self.index_stepped)
+            self._bridge.x_range_changed.connect(self.x_range_changed)
             self._channel = QWebChannel(page)
             self._channel.registerObject("plotBridge", self._bridge)
             page.setWebChannel(self._channel)
@@ -153,6 +161,7 @@ class TelemetryPlotWidget(QWidget):
         dark: bool = True,
         interaction_mode: str | None = None,
         time_mode: str | None = None,
+        x_range: tuple[object, object] | None = None,
     ) -> None:
         self.log = log
         self.compare = compare
@@ -164,6 +173,7 @@ class TelemetryPlotWidget(QWidget):
             self.interaction_mode = interaction_mode
         if time_mode:
             self.time_mode = time_mode
+        self.x_range = x_range
         self._render()
 
     def set_interaction_mode(self, mode: str) -> None:
@@ -189,6 +199,7 @@ class TelemetryPlotWidget(QWidget):
             dark=self.dark,
             interaction_mode=self.interaction_mode,
             time_mode=self.time_mode,
+            x_range=self.x_range,
         )
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)
         self._view.setHtml(html)

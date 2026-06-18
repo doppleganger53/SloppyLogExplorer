@@ -364,8 +364,17 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       : 12;
     const timeline = flightData.timeline || {};
     const timelineEnabled = !!timeline.enabled;
+    const timelineStartElapsedSeconds = Number.isFinite(Number(timeline.startElapsedSeconds))
+      ? Math.max(0, Number(timeline.startElapsedSeconds))
+      : 0;
+    const timelineEndElapsedSeconds = Number.isFinite(Number(timeline.endElapsedSeconds))
+      ? Math.max(timelineStartElapsedSeconds, Number(timeline.endElapsedSeconds))
+      : timelineStartElapsedSeconds;
     const timelineDurationSeconds = Number.isFinite(Number(timeline.durationSeconds))
       ? Math.max(0, Number(timeline.durationSeconds))
+      : Math.max(0, timelineEndElapsedSeconds - timelineStartElapsedSeconds);
+    const timelineRows = Number.isFinite(Number(timeline.rows))
+      ? Math.max(0, Math.floor(Number(timeline.rows)))
       : 0;
     const pathRibbonWidthMeters = 24;
     const legendContainer = document.getElementById("legend");
@@ -401,8 +410,10 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     let currentCursor = {
       index: 0,
       row: 1,
-      elapsedSeconds: 0,
+      elapsedSeconds: timelineStartElapsedSeconds,
       durationSeconds: timelineDurationSeconds,
+      scopeStartSeconds: timelineStartElapsedSeconds,
+      scopeEndSeconds: timelineEndElapsedSeconds,
       playing: false,
       speed: 1,
       values: []
@@ -493,11 +504,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         "flight-markers"
       ];
       const pathReady = extrusionLayerReady || elevationLayerReady || canvasPathReady;
-      const state = {
-        ready: flightLayersAdded && pathReady,
-        state: flightLayersAdded && pathReady ? "ready" : (elevationLayerError ? "degraded" : "loading"),
-        initialized: !!map,
-        styleLoaded: !!(map && map.isStyleLoaded && map.isStyleLoaded()),
+        const state = {
+          ready: flightLayersAdded && pathReady,
+          state: flightLayersAdded && pathReady ? "ready" : (elevationLayerError ? "degraded" : "loading"),
+          initialized: !!map,
+          styleLoaded: !!(map && map.isStyleLoaded && map.isStyleLoaded()),
         points: Array.isArray(flightData.points) ? flightData.points.length : 0,
         segments: Array.isArray(flightData.segments) ? flightData.segments.length : 0,
         pathParts: pathParts.length,
@@ -516,7 +527,10 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           index: currentCursor.index,
           row: currentCursor.row,
           elapsedSeconds: currentCursor.elapsedSeconds,
+          selectedElapsedSeconds: currentCursor.elapsedSeconds,
           durationSeconds: currentCursor.durationSeconds,
+          scopeStartSeconds: currentCursor.scopeStartSeconds,
+          scopeEndSeconds: currentCursor.scopeEndSeconds,
           values: Array.isArray(currentCursor.values) ? currentCursor.values.length : 0
         },
         playback: {
@@ -524,6 +538,13 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           playing: !!currentCursor.playing,
           speed: currentCursor.speed,
           durationSeconds: timelineDurationSeconds
+        },
+        timeline: {
+          enabled: timelineEnabled,
+          durationSeconds: timelineDurationSeconds,
+          startElapsedSeconds: timelineStartElapsedSeconds,
+          endElapsedSeconds: timelineEndElapsedSeconds,
+          rows: timelineRows
         },
         camera: map ? {
           zoom: map.getZoom(),
@@ -687,9 +708,15 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         return;
       }
       playbackOverlay.hidden = !timelineEnabled;
-      const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || 0);
-      const elapsed = clampNumber(currentCursor.elapsedSeconds, 0, duration || 0);
-      const sliderValue = duration > 0 ? Math.round((elapsed / duration) * 1000) : 0;
+      const scopeStart = Number.isFinite(Number(currentCursor.scopeStartSeconds))
+        ? Number(currentCursor.scopeStartSeconds)
+        : timelineStartElapsedSeconds;
+      const scopeEnd = Number.isFinite(Number(currentCursor.scopeEndSeconds))
+        ? Number(currentCursor.scopeEndSeconds)
+        : timelineEndElapsedSeconds;
+      const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || Math.max(0, scopeEnd - scopeStart));
+      const elapsed = clampNumber(currentCursor.elapsedSeconds, scopeStart, scopeEnd);
+      const sliderValue = duration > 0 ? Math.round(((elapsed - scopeStart) / duration) * 1000) : 0;
       playbackSlider.value = String(sliderValue);
       playbackCurrent.textContent = formatElapsed(elapsed);
       playbackDuration.textContent = formatElapsed(duration);
@@ -756,14 +783,25 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
 
     function setCursor(cursor) {
       const next = cursor || {};
+      const scopeStart = Number.isFinite(Number(next.scopeStartSeconds))
+        ? Number(next.scopeStartSeconds)
+        : timelineStartElapsedSeconds;
+      const scopeEnd = Number.isFinite(Number(next.scopeEndSeconds))
+        ? Number(next.scopeEndSeconds)
+        : timelineEndElapsedSeconds;
       const duration = Number.isFinite(Number(next.durationSeconds))
         ? Math.max(0, Number(next.durationSeconds))
-        : timelineDurationSeconds;
+        : Math.max(0, scopeEnd - scopeStart);
+      const elapsed = next.elapsedSeconds === undefined
+        ? currentCursor.elapsedSeconds
+        : clampNumber(next.elapsedSeconds, scopeStart, scopeEnd);
       currentCursor = Object.assign({}, currentCursor, {
         index: Number.isFinite(Number(next.index)) ? Number(next.index) : currentCursor.index,
         row: Number.isFinite(Number(next.row)) ? Number(next.row) : currentCursor.row,
-        elapsedSeconds: clampNumber(next.elapsedSeconds, 0, duration || timelineDurationSeconds || 0),
+        elapsedSeconds: elapsed,
         durationSeconds: duration,
+        scopeStartSeconds: scopeStart,
+        scopeEndSeconds: scopeEnd,
         playing: next.playing === undefined ? currentCursor.playing : !!next.playing,
         speed: Number.isFinite(Number(next.speed)) ? Number(next.speed) : currentCursor.speed,
         values: Array.isArray(next.values) ? next.values : currentCursor.values
@@ -1665,9 +1703,21 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       }
       if (playbackSlider) {
         playbackSlider.addEventListener("input", () => {
-          const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || 0);
-          const elapsed = duration > 0 ? (Number(playbackSlider.value) / 1000) * duration : 0;
-          setCursor({ elapsedSeconds: elapsed, durationSeconds: duration, values: currentCursor.values });
+          const scopeStart = Number.isFinite(Number(currentCursor.scopeStartSeconds))
+            ? Number(currentCursor.scopeStartSeconds)
+            : timelineStartElapsedSeconds;
+          const scopeEnd = Number.isFinite(Number(currentCursor.scopeEndSeconds))
+            ? Number(currentCursor.scopeEndSeconds)
+            : timelineEndElapsedSeconds;
+          const duration = Math.max(0, Number(currentCursor.durationSeconds || timelineDurationSeconds) || Math.max(0, scopeEnd - scopeStart));
+          const elapsed = duration > 0 ? scopeStart + (Number(playbackSlider.value) / 1000) * duration : scopeStart;
+          setCursor({
+            elapsedSeconds: elapsed,
+            durationSeconds: duration,
+            scopeStartSeconds: scopeStart,
+            scopeEndSeconds: scopeEnd,
+            values: currentCursor.values
+          });
           callGpsBridge("seekElapsed", elapsed);
         });
       }

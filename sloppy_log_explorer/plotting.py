@@ -229,6 +229,7 @@ def build_telemetry_figure(
     dark: bool = True,
     interaction_mode: str = "pan",
     time_mode: str = "absolute",
+    x_range: Sequence[object] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if primary is None:
@@ -306,6 +307,8 @@ def build_telemetry_figure(
             )
         layout[axis_key] = axis
     fig.update_layout(**layout)
+    if x_range is not None and len(x_range) == 2:
+        fig.update_xaxes(range=list(x_range))
     if not fig.data:
         fig.add_annotation(text="Select telemetry parameters to plot.", showarrow=False)
     if time_mode == "absolute" and primary.time is not None:
@@ -360,6 +363,25 @@ def _telemetry_x_values(log: LoadedLog, time_mode: str) -> Sequence[pd.Timestamp
         start = time_series.iloc[0]
         return list(pd.Timestamp("1970-01-01") + (time_series - start))
     return relative_seconds(log)
+
+
+def _normalise_elapsed_scope(
+    scope_start_seconds: float | None,
+    scope_end_seconds: float | None,
+    duration_seconds: float,
+) -> tuple[float, float] | None:
+    start = _coerce_float(scope_start_seconds)
+    end = _coerce_float(scope_end_seconds)
+    if start is None or end is None or not math.isfinite(start) or not math.isfinite(end):
+        return None
+    if end < start:
+        start, end = end, start
+    duration = max(0.0, float(duration_seconds))
+    start = max(0.0, min(start, duration))
+    end = max(0.0, min(end, duration))
+    if end < start:
+        start, end = end, start
+    return start, end
 
 
 def build_gps_figure(log: LoadedLog | None, color_column: str | None = None, dark: bool = True) -> go.Figure:
@@ -460,6 +482,12 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     lon_values = _numeric_series(df, gps.longitude)
     time_values = list(log.time) if log.time is not None else [None] * len(df)
     elapsed_values = relative_seconds(log)
+    scope = _normalise_elapsed_scope(
+        options.scope_start_seconds,
+        options.scope_end_seconds,
+        max(elapsed_values) if elapsed_values else 0.0,
+    )
+    scope_active = scope is not None
     if gps.altitude and gps.altitude in df.columns:
         alt_values = _numeric_series(df, gps.altitude)
         altitude_label = gps.altitude_label or gps.altitude
@@ -471,6 +499,9 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     color_values = _numeric_series(df, color_column) if color_column else None
     candidate_points: list[GpsCandidate] = []
     for row_index in range(len(df)):
+        elapsed = elapsed_values[row_index] if row_index < len(elapsed_values) else float(row_index)
+        if scope is not None and not (scope[0] <= elapsed <= scope[1]):
+            continue
         lat = _coerce_float(lat_values.iloc[row_index])
         lon = _coerce_float(lon_values.iloc[row_index])
         if lat is None or lon is None:
@@ -487,7 +518,7 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             "lon": lon,
             "alt": alt if alt is not None else 0.0,
             "row": row_index + 1,
-            "elapsedSeconds": elapsed_values[row_index] if row_index < len(elapsed_values) else float(row_index),
+            "elapsedSeconds": elapsed,
             "value": None,
         }
         if color_values is not None:
@@ -495,13 +526,23 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         candidate_points.append((point, time_values[row_index] if row_index < len(time_values) else None))
 
     if len(candidate_points) < 2:
-        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+        message = (
+            "No GPS samples fall within the visible telemetry range."
+            if scope_active
+            else "GPS data was detected, but fewer than two valid coordinate rows were found."
+        )
+        return _empty_gps_payload(message)
 
     # Run the outlier pass before segmenting so isolated bad samples disappear
     # instead of forcing an unnecessary path break.
     candidate_points = _drop_isolated_gps_outliers(candidate_points)
     if len(candidate_points) < 2:
-        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+        message = (
+            "No GPS samples fall within the visible telemetry range."
+            if scope_active
+            else "GPS data was detected, but fewer than two valid coordinate rows were found."
+        )
+        return _empty_gps_payload(message)
 
     path_parts: list[list[GpsCandidate]] = []
     current_part: list[GpsCandidate] = [candidate_points[0]]
@@ -518,7 +559,12 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
 
     rendered_parts = [part for part in path_parts if len(part) >= 2]
     if not rendered_parts:
-        return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
+        message = (
+            "No GPS samples fall within the visible telemetry range."
+            if scope_active
+            else "GPS data was detected, but fewer than two valid coordinate rows were found."
+        )
+        return _empty_gps_payload(message)
 
     points: list[GpsPoint] = [point for part in rendered_parts for point, _ in part]
 
@@ -610,7 +656,9 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     valid_altitudes = [point["alt"] for point in points if math.isfinite(point["alt"])]
     altitude_minimum = min(valid_altitudes) if valid_altitudes else 0.0
     altitude_maximum = max(valid_altitudes) if valid_altitudes else 0.0
-    timeline_end = max(elapsed_values) if elapsed_values else 0.0
+    timeline_start = scope[0] if scope is not None else 0.0
+    timeline_end = scope[1] if scope is not None else (max(elapsed_values) if elapsed_values else 0.0)
+    timeline_duration = max(0.0, timeline_end - timeline_start)
 
     return {
         "status": "ok",
@@ -621,10 +669,10 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "legend": legend,
         "timeline": {
             "enabled": bool(points),
-            "durationSeconds": timeline_end,
-            "startElapsedSeconds": 0.0,
+            "durationSeconds": timeline_duration,
+            "startElapsedSeconds": timeline_start,
             "endElapsedSeconds": timeline_end,
-            "rows": len(df),
+            "rows": len(points),
         },
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
@@ -681,12 +729,50 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 function plotDiv() {{
   return document.querySelector('.plotly-graph-div');
 }}
+let xRangeTimer = null;
+let pendingXRange = {{start: null, end: null}};
+function scheduleXRange(start, end) {{
+  pendingXRange = {{start: start, end: end}};
+  if (xRangeTimer) {{
+    clearTimeout(xRangeTimer);
+  }}
+  xRangeTimer = setTimeout(function() {{
+    xRangeTimer = null;
+    if (!bridge || typeof bridge.setXRange !== 'function') {{
+      return;
+    }}
+    bridge.setXRange(pendingXRange.start, pendingXRange.end);
+  }}, 90);
+}}
+function emitRelayoutRange(event) {{
+  if (!event || typeof event !== 'object') {{
+    return;
+  }}
+  if (event['xaxis.autorange'] === true) {{
+    scheduleXRange(null, null);
+    return;
+  }}
+  if (Array.isArray(event['xaxis.range'])) {{
+    const range = event['xaxis.range'];
+    scheduleXRange(range[0] ?? null, range[1] ?? null);
+    return;
+  }}
+  if (Object.prototype.hasOwnProperty.call(event, 'xaxis.range[0]') || Object.prototype.hasOwnProperty.call(event, 'xaxis.range[1]')) {{
+    scheduleXRange(
+      Object.prototype.hasOwnProperty.call(event, 'xaxis.range[0]') ? event['xaxis.range[0]'] : null,
+      Object.prototype.hasOwnProperty.call(event, 'xaxis.range[1]') ? event['xaxis.range[1]'] : null
+    );
+  }}
+}}
 function bindPlot() {{
   const plot = plotDiv();
   if (!plot) return;
   plot.on('plotly_click', function(data) {{
     if (!bridge || !data.points || !data.points.length) return;
     bridge.selectIndex(data.points[0].pointIndex);
+  }});
+  plot.on('plotly_relayout', function(event) {{
+    emitRelayoutRange(event);
   }});
   document.addEventListener('keydown', function(event) {{
     if (!bridge) return;

@@ -12,7 +12,7 @@ from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.plotting import build_gps_figure, build_gps_map_html, build_gps_map_payload, build_telemetry_figure, figure_html
-from sloppy_log_explorer.qt_plot import GpsPathWidget
+from sloppy_log_explorer.qt_plot import GpsPathWidget, TelemetryPlotWidget, _PlotBridge
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 
 
@@ -579,6 +579,247 @@ def test_gps_webengine_widget_updates_cursor_without_reloading_map() -> None:
     assert '"elapsedSeconds": 3.0' in fake_widget._page.scripts[-1]
 
 
+def test_plot_bridge_emits_visible_x_range_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+
+    bridge = _PlotBridge()
+    ranges: list[tuple[object, object]] = []
+    bridge.x_range_changed.connect(lambda start, end: ranges.append((start, end)))
+
+    bridge.setXRange("2026-01-01 12:00:02", "2026-01-01 12:00:05")
+
+    assert ranges == [("2026-01-01 12:00:02", "2026-01-01 12:00:05")]
+
+    widget = TelemetryPlotWidget()
+    widget_ranges: list[tuple[object, object]] = []
+    widget.x_range_changed.connect(lambda start, end: widget_ranges.append((start, end)))
+    widget.x_range_changed.emit(1, 2)
+
+    assert widget_ranges == [(1, 2)]
+
+    widget.close()
+    app.quit()
+
+
+def test_telemetry_figure_applies_x_range_and_relayout_tokens(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"], selected_index=1, x_range=(2.0, 5.0))
+    html = figure_html(fig, bridge=True)
+
+    assert list(fig.layout.xaxis.range) == [2.0, 5.0]
+    assert "plotly_relayout" in html
+    assert "xaxis.range[0]" in html
+    assert "xaxis.range[1]" in html
+    assert "xaxis.autorange" in html
+    assert "setXRange" in html
+
+
+def test_gps_map_payload_scopes_to_visible_elapsed_range(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    payload = build_gps_map_payload(
+        log,
+        GpsGradientOptions(
+            color_column="Current(A)",
+            scope_start_seconds=2.0,
+            scope_end_seconds=5.0,
+        ),
+    )
+
+    assert payload["status"] == "ok"
+    assert [point["row"] for point in payload["points"]] == [3, 4, 5, 6]
+    assert [point["elapsedSeconds"] for point in payload["points"]] == pytest.approx([2.0, 3.0, 4.0, 5.0])
+    assert len(payload["segments"]) == 3
+    assert payload["timeline"] == {
+        "enabled": True,
+        "durationSeconds": 3.0,
+        "startElapsedSeconds": 2.0,
+        "endElapsedSeconds": 5.0,
+        "rows": 4,
+    }
+
+
+def test_gps_map_payload_reports_no_gps_samples_inside_an_empty_scope(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    payload = build_gps_map_payload(
+        log,
+        GpsGradientOptions(
+            scope_start_seconds=20.0,
+            scope_end_seconds=30.0,
+        ),
+    )
+
+    assert payload["status"] == "empty"
+    assert payload["points"] == []
+    assert payload["segments"] == []
+    assert "visible telemetry range" in payload["message"]
+    assert payload["timeline"] == {
+        "enabled": False,
+        "durationSeconds": 0.0,
+        "startElapsedSeconds": 0.0,
+        "endElapsedSeconds": 0.0,
+        "rows": 0,
+    }
+
+
+def test_main_window_visible_range_scopes_gps_and_clears_on_autorange(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.telemetry_time_mode = "relative"
+
+    graph_calls: list[dict[str, object]] = []
+    gps_path_calls: list[dict[str, object]] = []
+    cursor_payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        window.graph_view,
+        "set_plot",
+        lambda *args, **kwargs: graph_calls.append({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr(
+        window.gps_view,
+        "set_path",
+        lambda *args, **kwargs: gps_path_calls.append({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr(window.gps_view, "set_cursor", lambda payload: cursor_payloads.append(dict(payload)))
+
+    window.set_telemetry_visible_x_range(2.0, 5.0)
+
+    assert window.telemetry_visible_elapsed_range == (2.0, 5.0)
+    assert window.selected_index == 2
+    assert len(gps_path_calls) == 1
+    assert graph_calls[-1]["kwargs"]["x_range"] == (2.0, 5.0)
+    assert cursor_payloads[-1]["scopeStartSeconds"] == pytest.approx(2.0)
+    assert cursor_payloads[-1]["scopeEndSeconds"] == pytest.approx(5.0)
+    assert cursor_payloads[-1]["durationSeconds"] == pytest.approx(3.0)
+
+    graph_calls_before = len(graph_calls)
+    gps_path_calls_before = len(gps_path_calls)
+    window.set_selected_index(4)
+
+    assert window.selected_index == 4
+    assert len(gps_path_calls) == gps_path_calls_before
+    assert len(graph_calls) == graph_calls_before + 1
+    assert graph_calls[-1]["kwargs"]["x_range"] == (2.0, 5.0)
+
+    window.set_telemetry_visible_x_range(None, None)
+
+    assert window.telemetry_visible_elapsed_range is None
+    assert len(gps_path_calls) == gps_path_calls_before + 1
+    assert graph_calls[-1]["kwargs"]["x_range"] is None
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_absolute_visible_range_maps_to_elapsed_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.telemetry_time_mode = "absolute"
+
+    graph_calls: list[dict[str, object]] = []
+    gps_path_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        window.graph_view,
+        "set_plot",
+        lambda *args, **kwargs: graph_calls.append({"args": args, "kwargs": kwargs}),
+    )
+    monkeypatch.setattr(
+        window.gps_view,
+        "set_path",
+        lambda *args, **kwargs: gps_path_calls.append({"args": args, "kwargs": kwargs}),
+    )
+
+    window.set_telemetry_visible_x_range("2026-01-01 12:00:02", "2026-01-01 12:00:05")
+
+    assert window.telemetry_visible_elapsed_range == (2.0, 5.0)
+    assert window.selected_index == 2
+    assert len(gps_path_calls) == 1
+    assert tuple(value.isoformat() for value in graph_calls[-1]["kwargs"]["x_range"]) == (
+        "2026-01-01T12:00:02",
+        "2026-01-01T12:00:05",
+    )
+
+    window.close()
+    app.quit()
+
+
+def test_gps_playback_stops_at_scoped_timeline_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    import sloppy_log_explorer.main_window as main_window_module
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.set_telemetry_visible_x_range(2.0, 3.0)
+
+    cursor_payloads: list[dict[str, object]] = []
+    monkeypatch.setattr(window.gps_view, "set_cursor", lambda payload: cursor_payloads.append(dict(payload)))
+    ticks = iter([100.0, 100.25, 101.5])
+    monkeypatch.setattr(main_window_module.time, "perf_counter", lambda: next(ticks))
+
+    window.set_gps_playback_speed(1.0)
+    window.set_gps_playback_playing(True)
+    window.gps_playback_tick()
+    assert window.gps_playback_playing is True
+    window.gps_playback_tick()
+
+    assert window.gps_playback_playing is False
+    assert window.selected_index == 3
+    assert cursor_payloads[-1]["row"] == 4
+    assert cursor_payloads[-1]["elapsedSeconds"] == pytest.approx(3.0)
+    assert cursor_payloads[-1]["playing"] is False
+    assert cursor_payloads[-1]["scopeStartSeconds"] == pytest.approx(2.0)
+    assert cursor_payloads[-1]["scopeEndSeconds"] == pytest.approx(3.0)
+
+    window.set_gps_playback_playing(False)
+    window.close()
+    app.quit()
+
+
 def test_gps_map_payload_colors_segments_with_manual_gradient(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
@@ -851,6 +1092,8 @@ def test_gps_marker_value_selectors_drive_cursor_payload(
     assert payload["row"] == 4
     assert payload["elapsedSeconds"] == pytest.approx(3.0)
     assert payload["durationSeconds"] == pytest.approx(8.0)
+    assert payload["scopeStartSeconds"] == pytest.approx(0.0)
+    assert payload["scopeEndSeconds"] == pytest.approx(8.0)
     assert payload["playing"] is False
     assert payload["speed"] == pytest.approx(1.0)
     assert payload["values"] == [
