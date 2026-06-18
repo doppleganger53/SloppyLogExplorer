@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import tempfile
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -212,7 +213,7 @@ def validate_ui(
 
     from sloppy_log_explorer.main_window import MainWindow
 
-    app = QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
     window.library_root = library_root
     window.load_log(log_path)

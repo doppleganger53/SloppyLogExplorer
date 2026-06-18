@@ -4,6 +4,7 @@ import html
 import math
 import time
 import traceback
+from bisect import bisect_left, bisect_right
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -693,11 +694,21 @@ class MainWindow(QMainWindow):
             start_elapsed, end_elapsed = end_elapsed, start_elapsed
         return start_elapsed, end_elapsed
 
-    def _scope_elapsed_values(self) -> list[float]:
-        if self.current_log is None:
-            return []
+    def _scope_row_bounds(self) -> tuple[int, int] | None:
+        if self.current_log is None or not self.gps_timeline_seconds:
+            return None
         start_elapsed, end_elapsed = self._gps_playback_scope_bounds()
-        return [elapsed for elapsed in self.gps_timeline_seconds if start_elapsed <= elapsed <= end_elapsed]
+        start_index = bisect_left(self.gps_timeline_seconds, start_elapsed)
+        end_index = bisect_right(self.gps_timeline_seconds, end_elapsed) - 1
+        max_index = len(self.gps_timeline_seconds) - 1
+
+        if start_index > end_index:
+            return None
+
+        return (
+            0 if start_index < 0 else min(start_index, max_index),
+            max(0, min(end_index, max_index)),
+        )
 
     def _clamp_index_to_elapsed_scope(self, index: int) -> int:
         if self.current_log is None:
@@ -705,23 +716,15 @@ class MainWindow(QMainWindow):
         if not self.gps_timeline_seconds:
             return max(0, min(index, len(self.current_log.dataframe) - 1))
         safe_index = max(0, min(index, len(self.gps_timeline_seconds) - 1))
-        scope_elapsed = self._scope_elapsed_values()
-        if not scope_elapsed:
+        bounds = self._scope_row_bounds()
+        if bounds is None:
             return safe_index
-        target_elapsed = self._gps_elapsed_for_index(safe_index)
-        scope_start, scope_end = self._gps_playback_scope_bounds()
-        if scope_start <= target_elapsed <= scope_end:
+        scope_start_row, scope_end_row = bounds
+        if scope_start_row <= safe_index <= scope_end_row:
             return safe_index
-        best_index = safe_index
-        best_distance = float("inf")
-        for candidate_index, elapsed in enumerate(self.gps_timeline_seconds):
-            if elapsed < scope_start or elapsed > scope_end:
-                continue
-            distance = abs(elapsed - target_elapsed)
-            if distance < best_distance:
-                best_distance = distance
-                best_index = candidate_index
-        return best_index
+        if safe_index < scope_start_row:
+            return scope_start_row
+        return scope_end_row
 
     @staticmethod
     def _ranges_match(left: tuple[float, float] | None, right: tuple[float, float] | None) -> bool:
