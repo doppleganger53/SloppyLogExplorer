@@ -922,10 +922,13 @@ def test_sync_ui_copies_only_selected_candidates(tmp_path: Path, monkeypatch: py
 def test_voice_pack_rejects_path_escape_filenames(tmp_path: Path) -> None:
     output = tmp_path / "voice"
 
-    with pytest.raises(ValueError, match="simple file names"):
-        generate_voice_pack([VoiceItem("hello", "..\\escaped")], output)
+    for filename in ("..\\escaped", "folder\\clip", "folder/clip"):
+        with pytest.raises(ValueError, match="simple file names"):
+            generate_voice_pack([VoiceItem("hello", filename)], output)
 
     assert not (tmp_path / "escaped.wav").exists()
+    assert not (output / "folder\\clip.wav").exists()
+    assert not (output / "clip.wav").exists()
 
 
 def test_load_log_infers_model_from_root_level_filename(tmp_path: Path) -> None:

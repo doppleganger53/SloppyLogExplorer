@@ -90,6 +90,8 @@ def _voice_target_path(output_path: Path, filename: str) -> Path | None:
     clean = filename.strip()
     if not clean:
         return None
+    if "/" in clean or "\\" in clean:
+        raise ValueError("Voice-pack filenames must be simple file names, not paths.")
     requested = Path(clean)
     if requested.is_absolute() or len(requested.parts) != 1:
         raise ValueError("Voice-pack filenames must be simple file names, not paths.")
