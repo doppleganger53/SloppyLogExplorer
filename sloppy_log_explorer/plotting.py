@@ -70,21 +70,45 @@ def _axis_name(index: int) -> str:
     return "y" if index == 0 else f"y{index + 1}"
 
 
-def _sample_indices(length: int, maximum: int = MAX_TELEMETRY_TRACE_POINTS) -> list[int]:
-    if length <= 0:
-        return []
-    if length <= maximum:
-        return list(range(length))
-    step = math.ceil(length / maximum)
-    indices = list(range(0, length, step))
-    if indices[-1] != length - 1:
-        indices.append(length - 1)
-    return indices
-
-
-def _sample_numeric_values(series: pd.Series, indices: list[int]) -> list[object]:
+def _sample_numeric_series(
+    series: pd.Series,
+    maximum: int = MAX_TELEMETRY_TRACE_POINTS,
+) -> tuple[list[int], list[object]]:
     values = pd.to_numeric(series, errors="coerce").to_numpy()
-    return [values[index] for index in indices]
+    length = len(values)
+    if length <= 0:
+        return [], []
+    if length <= maximum:
+        indices = list(range(length))
+        return indices, [values[index] for index in indices]
+
+    bucket_count = max(1, (maximum - 2) // 2)
+    bucket_size = max(1, math.ceil(length / bucket_count))
+    selected = {0, length - 1}
+    for start in range(0, length, bucket_size):
+        end = min(start + bucket_size, length)
+        min_index: int | None = None
+        max_index: int | None = None
+        min_value = math.inf
+        max_value = -math.inf
+        for index in range(start, end):
+            number = _coerce_float(values[index])
+            if number is None:
+                continue
+            if number < min_value:
+                min_value = number
+                min_index = index
+            if number > max_value:
+                max_value = number
+                max_index = index
+        if min_index is None or max_index is None:
+            selected.add(start)
+        else:
+            selected.add(min_index)
+            selected.add(max_index)
+
+    indices = sorted(selected)
+    return indices, [values[index] for index in indices]
 
 
 def _coerce_float(value: object) -> float | None:
@@ -282,20 +306,20 @@ def build_telemetry_figure(
         return fig
 
     x = _telemetry_x_values(primary, time_mode)
-    primary_indices = _sample_indices(len(primary.dataframe))
-    primary_x = [x[index] for index in primary_indices] if primary_indices else []
-    trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
     plotted_columns = columns[:MAX_RENDERED_TELEMETRY_TRACES]
     hidden_trace_count = max(0, len(columns) - len(plotted_columns))
     for idx, col in enumerate(plotted_columns):
         if col not in primary.dataframe.columns:
             continue
+        primary_indices, primary_values = _sample_numeric_series(_numeric_series(primary.dataframe, col))
+        primary_x = [x[index] for index in primary_indices] if primary_indices else []
+        trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
         color = COLORS[idx % len(COLORS)]
         axis = _axis_name(idx)
         fig.add_trace(
             trace_class(
                 x=primary_x,
-                y=_sample_numeric_values(_numeric_series(primary.dataframe, col), primary_indices),
+                y=primary_values,
                 customdata=primary_indices,
                 name=col,
                 mode="lines",
@@ -305,13 +329,13 @@ def build_telemetry_figure(
             )
         )
         if compare is not None and col in compare.dataframe.columns:
-            compare_indices = _sample_indices(len(compare.dataframe))
+            compare_indices, compare_values = _sample_numeric_series(_numeric_series(compare.dataframe, col))
             compare_x_values = _telemetry_x_values(compare, time_mode)
             compare_trace_class = go.Scattergl if len(compare_indices) > 2000 else go.Scatter
             fig.add_trace(
                 compare_trace_class(
                     x=[compare_x_values[index] for index in compare_indices],
-                    y=_sample_numeric_values(_numeric_series(compare.dataframe, col), compare_indices),
+                    y=compare_values,
                     customdata=compare_indices,
                     name=f"{col} compare",
                     mode="lines",

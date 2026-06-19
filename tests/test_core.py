@@ -1399,6 +1399,32 @@ def test_large_telemetry_figure_downsamples_and_preserves_source_indexes(tmp_pat
     assert trace.customdata[-1] == 13049
 
 
+def test_large_telemetry_downsampling_preserves_spikes_and_dropouts(tmp_path: Path) -> None:
+    path = tmp_path / "large_spike.csv"
+    rows = ["Time,VFAS(V),Current(A)"]
+    for index in range(13050):
+        voltage = 16.0
+        current = 20.0
+        if index == 12001:
+            voltage = 4.2
+        if index == 12003:
+            current = 130.0
+        rows.append(f"{index},{voltage},{current}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"])
+    voltage_trace = fig.data[0]
+    current_trace = fig.data[1]
+
+    assert 12001 in voltage_trace.customdata
+    assert 4.2 in voltage_trace.y
+    assert 12003 in current_trace.customdata
+    assert 130.0 in current_trace.y
+    assert len(voltage_trace.x) <= 12000
+    assert len(current_trace.x) <= 12000
+
+
 def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> None:
     path = tmp_path / "many_columns.csv"
     columns = [f"C{index}" for index in range(40)]
