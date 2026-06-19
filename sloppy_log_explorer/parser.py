@@ -297,7 +297,7 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
         if column in numeric_set:
             continue
         series = df[column]
-        if not _series_has_coordinate_text_sample(series):
+        if not _has_coordinate_name_hint(column) and not _series_has_coordinate_text_sample(series):
             continue
         lat_values: list[float] = []
         lon_values: list[float] = []
