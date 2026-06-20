@@ -1369,7 +1369,11 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select output directory")
         if not path:
             return
-        created = generate_voice_pack(items, path)
+        try:
+            created = generate_voice_pack(items, path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Voice pack", str(exc))
+            return
         self.status.showMessage(f"Generated {len(created)} WAV files")
 
     def about(self) -> None:

@@ -376,7 +376,8 @@ def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame, sample_
         series = pd.Series(series.to_numpy()[:, 0], index=series.index)
     parsed = 0
     checked = 0
-    for value in series:
+    iterator = iter(series)
+    for value in iterator:
         if pd.isna(value):
             continue
         checked += 1
@@ -386,6 +387,16 @@ def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame, sample_
                 return True
         if checked >= sample_size:
             break
+    # If no GPS-like coordinates were found in the initial startup/status rows,
+    # keep scanning the remaining rows so late-emitted coordinate strings can
+    # still be discovered in unhinted text columns.
+    for value in iterator:
+        if pd.isna(value):
+            continue
+        if _parse_coordinate_text(str(value)) is not None:
+            parsed += 1
+            if parsed >= 2:
+                return True
     return False
 
 

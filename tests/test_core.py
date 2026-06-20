@@ -6,7 +6,7 @@ import sqlite3
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox
+from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
 from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
@@ -813,6 +813,28 @@ def test_load_log_detects_late_fix_coordinate_text_column(tmp_path: Path) -> Non
     assert log.gps_columns.latitude_label == "GPS (lat)"
 
 
+def test_load_log_detects_late_fix_coordinate_text_column_without_name_hint(tmp_path: Path) -> None:
+    path = tmp_path / "late_gps_status.csv"
+    rows = ["Time,Status,Voltage"]
+    for index in range(250):
+        rows.append(f"{index},No fix,{16.8 - index * 0.001:.3f}")
+    rows.extend(
+        [
+            "250,\"39.774389,-75.204944,20\",16.5",
+            "251,\"39.774450,-75.204900,21\",16.4",
+        ]
+    )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "Status (lat)"
+    assert log.gps_columns.longitude_label == "Status (lon)"
+    assert log.gps_columns.altitude_label == "Status (alt)"
+
+
 def test_internal_resistance_regression(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
@@ -989,6 +1011,35 @@ def test_voice_pack_rejects_path_escape_filenames(tmp_path: Path) -> None:
     assert not (tmp_path / "escaped.wav").exists()
     assert not (output / "folder\\clip.wav").exists()
     assert not (output / "clip.wav").exists()
+
+
+def test_generate_voice_pack_gui_shows_warning_for_path_like_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    output = tmp_path / "voice"
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, message: warnings.append(message))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_args, **_kwargs: str(output))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    window.voice_table.setRowCount(1)
+    window.voice_table.setItem(0, 0, QTableWidgetItem("armed"))
+    window.voice_table.setItem(0, 1, QTableWidgetItem("../armed"))
+
+    window.generate_voice_pack()
+
+    assert len(warnings) == 1
+    assert "simple file names" in warnings[0]
+    window.close()
+    app.quit()
 
 
 def test_load_log_infers_model_from_root_level_filename(tmp_path: Path) -> None:
