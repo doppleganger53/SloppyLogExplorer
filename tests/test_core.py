@@ -12,7 +12,14 @@ from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_v
 from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
-from sloppy_log_explorer.plotting import build_gps_figure, build_gps_map_html, build_gps_map_payload, build_telemetry_figure, figure_html
+from sloppy_log_explorer.plotting import (
+    _telemetry_trace_point_budget,
+    build_gps_figure,
+    build_gps_map_html,
+    build_gps_map_payload,
+    build_telemetry_figure,
+    figure_html,
+)
 from sloppy_log_explorer.qt_plot import GpsPathWidget, TelemetryPlotWidget
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 from sloppy_log_explorer.voice import VoiceItem, generate_voice_pack
@@ -584,6 +591,7 @@ def test_telemetry_webengine_widget_loads_plot_from_local_html_file(
     previous_path = tmp_path / "old-telemetry-plot.html"
     previous_path.write_text("old", encoding="utf-8")
     fake_widget._html_path = previous_path
+    fake_widget._current_trace_point_budget = lambda: TelemetryPlotWidget._current_trace_point_budget(fake_widget)
 
     monkeypatch.setattr("sloppy_log_explorer.qt_plot.app_data_dir", lambda: tmp_path)
 
@@ -598,6 +606,58 @@ def test_telemetry_webengine_widget_loads_plot_from_local_html_file(
     assert "plotly-" in html
     assert "cdn.plot.ly" not in html
     assert "QWebChannel" in html
+
+
+def test_telemetry_widget_passes_viewport_scaled_trace_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    class FakeView:
+        def __init__(self, width: int) -> None:
+            self._width = width
+            self.html: str | None = None
+
+        def width(self) -> int:
+            return self._width
+
+        def setHtml(self, html: str) -> None:
+            self.html = html
+
+    import plotly.graph_objects as go
+
+    budgets: list[int] = []
+
+    def fake_build_telemetry_figure(*_args, **kwargs):
+        budgets.append(kwargs["max_trace_points"])
+        return go.Figure()
+
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.build_telemetry_figure", fake_build_telemetry_figure)
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.figure_html", lambda *_args, **_kwargs: "<html></html>")
+
+    fake_view = FakeView(width=700)
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = False
+    fake_widget._view = fake_view
+    fake_widget.log = log
+    fake_widget.compare = None
+    fake_widget.columns = ["VFAS(V)"]
+    fake_widget.selected_index = 0
+    fake_widget.show_grid = True
+    fake_widget.dark = True
+    fake_widget.interaction_mode = "pan"
+    fake_widget.time_mode = "absolute"
+    fake_widget._html_path = None
+    fake_widget._current_trace_point_budget = lambda: TelemetryPlotWidget._current_trace_point_budget(fake_widget)
+
+    TelemetryPlotWidget._render(fake_widget)
+    fake_view._width = 4000
+    TelemetryPlotWidget._render(fake_widget)
+
+    assert budgets == [2312, 12000]
+    assert fake_view.html == "<html></html>"
 
 
 def test_gps_webengine_widget_refreshes_map_viewport() -> None:
@@ -1386,6 +1446,14 @@ def test_telemetry_html_uses_local_plotly_bundle(tmp_path: Path, monkeypatch: py
     assert "qrc:///qtwebchannel/qwebchannel.js" in html
 
 
+def test_telemetry_trace_point_budget_scales_with_plot_width() -> None:
+    assert _telemetry_trace_point_budget(None) == 12000
+    assert _telemetry_trace_point_budget(0) == 12000
+    assert _telemetry_trace_point_budget(100) == 2000
+    assert _telemetry_trace_point_budget(750) == 3000
+    assert _telemetry_trace_point_budget(5000) == 12000
+
+
 def test_large_telemetry_figure_downsamples_and_preserves_source_indexes(tmp_path: Path) -> None:
     path = tmp_path / "large.csv"
     rows = ["Time,VFAS(V)"]
@@ -1416,7 +1484,7 @@ def test_large_telemetry_downsampling_preserves_spikes_and_dropouts(tmp_path: Pa
     path.write_text("\n".join(rows), encoding="utf-8")
     log = load_log(path)
 
-    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"])
+    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"], max_trace_points=2000)
     voltage_trace = fig.data[0]
     current_trace = fig.data[1]
 
@@ -1424,8 +1492,8 @@ def test_large_telemetry_downsampling_preserves_spikes_and_dropouts(tmp_path: Pa
     assert 4.2 in voltage_trace.y
     assert 12003 in current_trace.customdata
     assert 130.0 in current_trace.y
-    assert len(voltage_trace.x) <= 12000
-    assert len(current_trace.x) <= 12000
+    assert len(voltage_trace.x) <= 2000
+    assert len(current_trace.x) <= 2000
 
 
 def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> None:

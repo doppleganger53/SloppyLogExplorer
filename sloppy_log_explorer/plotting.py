@@ -42,11 +42,18 @@ COLORS = [
 DEFAULT_PATH_COLOR = "#55d977"
 MISSING_VALUE_COLOR = "#9ca3af"
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-MAX_TELEMETRY_TRACE_POINTS = 12000
+MAX_TELEMETRY_TRACE_POINTS_HARD_CAP = 12000
+MIN_TELEMETRY_TRACE_POINTS = 2000
+TELEMETRY_SAMPLES_PER_PIXEL = 4
 MAX_RENDERED_TELEMETRY_TRACES = 24
 MAX_VISIBLE_TELEMETRY_AXES = 6
 MAX_VISIBLE_LEGEND_ITEMS = 12
 MAX_STATS_ANNOTATION_ROWS = 12
+TELEMETRY_MARGIN_LEFT = 58
+TELEMETRY_MARGIN_RIGHT_BASE = 64
+TELEMETRY_MARGIN_RIGHT_PER_AXIS = 44
+TELEMETRY_MARGIN_TOP = 30
+TELEMETRY_MARGIN_BOTTOM = 46
 MAX_GPS_JUMP_KM = 1000.0
 # A tiny origin tolerance catches placeholder zeros without rejecting genuine
 # coordinates that are only close to zero.
@@ -70,9 +77,22 @@ def _axis_name(index: int) -> str:
     return "y" if index == 0 else f"y{index + 1}"
 
 
+def _telemetry_right_margin(plotted_column_count: int) -> int:
+    return TELEMETRY_MARGIN_RIGHT_BASE + min(
+        max(0, plotted_column_count - 1), MAX_VISIBLE_TELEMETRY_AXES - 1
+    ) * TELEMETRY_MARGIN_RIGHT_PER_AXIS
+
+
+def _telemetry_trace_point_budget(plot_width_px: int | None) -> int:
+    if plot_width_px is None or plot_width_px <= 0:
+        return MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
+    budget = int(plot_width_px * TELEMETRY_SAMPLES_PER_PIXEL)
+    return max(MIN_TELEMETRY_TRACE_POINTS, min(MAX_TELEMETRY_TRACE_POINTS_HARD_CAP, budget))
+
+
 def _sample_numeric_series(
     series: pd.Series,
-    maximum: int = MAX_TELEMETRY_TRACE_POINTS,
+    maximum: int = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
 ) -> tuple[list[int], list[object]]:
     values = pd.to_numeric(series, errors="coerce").to_numpy()
     length = len(values)
@@ -292,6 +312,7 @@ def build_telemetry_figure(
     dark: bool = True,
     interaction_mode: str = "pan",
     time_mode: str = "absolute",
+    max_trace_points: int = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
 ) -> go.Figure:
     fig = go.Figure()
     if primary is None:
@@ -311,7 +332,9 @@ def build_telemetry_figure(
     for idx, col in enumerate(plotted_columns):
         if col not in primary.dataframe.columns:
             continue
-        primary_indices, primary_values = _sample_numeric_series(_numeric_series(primary.dataframe, col))
+        primary_indices, primary_values = _sample_numeric_series(
+            _numeric_series(primary.dataframe, col), maximum=max_trace_points
+        )
         primary_x = [x[index] for index in primary_indices] if primary_indices else []
         trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
         color = COLORS[idx % len(COLORS)]
@@ -329,7 +352,9 @@ def build_telemetry_figure(
             )
         )
         if compare is not None and col in compare.dataframe.columns:
-            compare_indices, compare_values = _sample_numeric_series(_numeric_series(compare.dataframe, col))
+            compare_indices, compare_values = _sample_numeric_series(
+                _numeric_series(compare.dataframe, col), maximum=max_trace_points
+            )
             compare_x_values = _telemetry_x_values(compare, time_mode)
             compare_trace_class = go.Scattergl if len(compare_indices) > 2000 else go.Scatter
             fig.add_trace(
@@ -353,10 +378,10 @@ def build_telemetry_figure(
         "hovermode": "x unified",
         "dragmode": interaction_mode if interaction_mode in {"pan", "zoom"} else "pan",
         "margin": {
-            "l": 58,
-            "r": 64 + min(max(0, len(plotted_columns) - 1), MAX_VISIBLE_TELEMETRY_AXES - 1) * 44,
-            "t": 30,
-            "b": 46,
+            "l": TELEMETRY_MARGIN_LEFT,
+            "r": _telemetry_right_margin(len(plotted_columns)),
+            "t": TELEMETRY_MARGIN_TOP,
+            "b": TELEMETRY_MARGIN_BOTTOM,
         },
         "legend": {"orientation": "h", "y": 1.08, "x": 0},
         "xaxis": {
