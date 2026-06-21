@@ -813,6 +813,28 @@ def test_load_log_detects_late_fix_coordinate_text_column(tmp_path: Path) -> Non
     assert log.gps_columns.latitude_label == "GPS (lat)"
 
 
+def test_load_log_detects_mixed_numeric_placeholder_coordinate_text_column(tmp_path: Path) -> None:
+    path = tmp_path / "mixed_gps.csv"
+    rows = ["Time,GPS,Voltage"]
+    for index in range(250):
+        rows.append(f"{index},0,{16.8 - index * 0.001:.3f}")
+    rows.extend(
+        [
+            "250,\"39.774389,-75.204944,20\",16.5",
+            "251,\"39.774450,-75.204900,21\",16.4",
+        ]
+    )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "GPS (lat)"
+    assert log.gps_columns.longitude_label == "GPS (lon)"
+    assert log.gps_columns.altitude_label == "GPS (alt)"
+
+
 def test_load_log_detects_late_fix_coordinate_text_column_without_name_hint(tmp_path: Path) -> None:
     path = tmp_path / "late_gps_status.csv"
     rows = ["Time,Status,Voltage"]

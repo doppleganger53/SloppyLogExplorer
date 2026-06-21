@@ -158,11 +158,23 @@ def _numeric_columns(df: pd.DataFrame, time: pd.Series | None) -> list[str]:
             continue
         converted = _coerce_numeric_series(df[col])
         if converted.notna().any():
+            if _should_preserve_coordinate_text_column(col, df[col], converted):
+                continue
             # Coerce in place so downstream plotting and GPS heuristics can use
             # a stable numeric dtype instead of re-parsing each column later.
             df[col] = converted
             numeric.append(col)
     return numeric
+
+
+def _should_preserve_coordinate_text_column(column: str, series: pd.Series | pd.DataFrame, converted: pd.Series) -> bool:
+    if not _has_coordinate_name_hint(column):
+        return False
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    raw_text = series.astype("string").str.strip()
+    has_unparsed_text = bool((series.notna() & raw_text.ne("") & converted.isna()).any())
+    return has_unparsed_text and _series_has_coordinate_text_sample(series)
 
 
 def _find_named_column(columns: list[str], includes: tuple[str, ...], excludes: tuple[str, ...] = ()) -> str | None:
