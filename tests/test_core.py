@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import os
+import sqlite3
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QHeaderView
+from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
 from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
-from sloppy_log_explorer.plotting import build_gps_figure, build_gps_map_html, build_gps_map_payload, build_telemetry_figure, figure_html
-from sloppy_log_explorer.qt_plot import GpsPathWidget
+from sloppy_log_explorer.plotting import (
+    _telemetry_trace_point_budget,
+    build_gps_figure,
+    build_gps_map_html,
+    build_gps_map_payload,
+    build_telemetry_figure,
+    figure_html,
+)
+from sloppy_log_explorer.qt_plot import GpsPathWidget, TelemetryPlotWidget
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
+from sloppy_log_explorer.voice import VoiceItem, generate_voice_pack
 
 
 def write_sample(path: Path) -> None:
@@ -123,6 +133,20 @@ def write_origin_placeholder_sample(path: Path) -> None:
                 "2026-01-01,12:00:01,39.0000,-75.0000,11",
                 "2026-01-01,12:00:02,39.0005,-75.0005,12",
                 "2026-01-01,12:00:03,0,0,13",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def write_origin_only_coordinate_sample(path: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS",
+                '2026-01-01,12:00:00,"0,0,10"',
+                '2026-01-01,12:00:01,"0,0,12"',
+                '2026-01-01,12:00:02,"0,0,14"',
             ]
         ),
         encoding="utf-8",
@@ -469,6 +493,16 @@ def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None
     assert payload["points"][-1]["lon"] == pytest.approx(-75.0005)
 
 
+def test_load_log_does_not_report_gps_for_origin_only_coordinate_strings(tmp_path: Path) -> None:
+    path = tmp_path / "origin_only.csv"
+    write_origin_only_coordinate_sample(path)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is False
+    assert log.gps_columns is None
+
+
 def test_gps_map_payload_skips_isolated_far_away_points(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_gps_outlier_sample(path)
@@ -522,6 +556,109 @@ def test_gps_webengine_widget_loads_map_from_local_html_file(tmp_path: Path, mon
     html = html_path.read_text(encoding="utf-8")
     assert "maplibregl.Map" in html
     assert "initialMapMode" not in html
+
+
+def test_telemetry_webengine_widget_loads_plot_from_local_html_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    class FakeView:
+        def __init__(self) -> None:
+            self.html: str | None = None
+            self.url = None
+
+        def setHtml(self, html: str) -> None:
+            self.html = html
+
+        def setUrl(self, url) -> None:
+            self.url = url
+
+    fake_view = FakeView()
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = True
+    fake_widget._view = fake_view
+    fake_widget.log = log
+    fake_widget.compare = None
+    fake_widget.columns = ["VFAS(V)"]
+    fake_widget.selected_index = 0
+    fake_widget.show_grid = True
+    fake_widget.dark = True
+    fake_widget.interaction_mode = "pan"
+    fake_widget.time_mode = "absolute"
+    previous_path = tmp_path / "old-telemetry-plot.html"
+    previous_path.write_text("old", encoding="utf-8")
+    fake_widget._html_path = previous_path
+    fake_widget._current_trace_point_budget = lambda: TelemetryPlotWidget._current_trace_point_budget(fake_widget)
+
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.app_data_dir", lambda: tmp_path)
+
+    TelemetryPlotWidget._render(fake_widget)
+
+    assert fake_view.html is None
+    assert fake_view.url is not None
+    assert not previous_path.exists()
+    html_path = Path(fake_view.url.toLocalFile())
+    assert html_path.exists()
+    html = html_path.read_text(encoding="utf-8")
+    assert "plotly-" in html
+    assert "cdn.plot.ly" not in html
+    assert "QWebChannel" in html
+
+
+def test_telemetry_widget_passes_viewport_scaled_trace_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    class FakeView:
+        def __init__(self, width: int) -> None:
+            self._width = width
+            self.html: str | None = None
+
+        def width(self) -> int:
+            return self._width
+
+        def setHtml(self, html: str) -> None:
+            self.html = html
+
+    import plotly.graph_objects as go
+
+    budgets: list[int] = []
+
+    def fake_build_telemetry_figure(*_args, **kwargs):
+        budgets.append(kwargs["max_trace_points"])
+        return go.Figure()
+
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.build_telemetry_figure", fake_build_telemetry_figure)
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot.figure_html", lambda *_args, **_kwargs: "<html></html>")
+
+    fake_view = FakeView(width=700)
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = False
+    fake_widget._view = fake_view
+    fake_widget.log = log
+    fake_widget.compare = None
+    fake_widget.columns = ["VFAS(V)"]
+    fake_widget.selected_index = 0
+    fake_widget.show_grid = True
+    fake_widget.dark = True
+    fake_widget.interaction_mode = "pan"
+    fake_widget.time_mode = "absolute"
+    fake_widget._html_path = None
+    fake_widget._current_trace_point_budget = lambda: TelemetryPlotWidget._current_trace_point_budget(fake_widget)
+
+    TelemetryPlotWidget._render(fake_widget)
+    fake_view._width = 4000
+    TelemetryPlotWidget._render(fake_widget)
+
+    assert budgets == [2312, 12000]
+    assert fake_view.html == "<html></html>"
 
 
 def test_gps_webengine_widget_refreshes_map_viewport() -> None:
@@ -629,6 +766,98 @@ def test_load_log_does_not_invent_gps_from_regular_telemetry(tmp_path: Path) -> 
     assert "No GPS latitude/longitude columns detected" in build_gps_map_html(log)
 
 
+def test_load_log_skips_coordinate_text_scan_for_numeric_non_gps_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sloppy_log_explorer.parser as parser_module
+
+    path = tmp_path / "numeric_no_gps.csv"
+    headers = ["Sample"] + [f"Sensor{i}" for i in range(20)]
+    rows = [",".join(headers)]
+    for row in range(100):
+        rows.append(",".join(str(row + column) for column in range(len(headers))))
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    calls = 0
+    real_parser = parser_module._parse_coordinate_text
+
+    def count_coordinate_parse(text: str):
+        nonlocal calls
+        calls += 1
+        return real_parser(text)
+
+    monkeypatch.setattr(parser_module, "_parse_coordinate_text", count_coordinate_parse)
+
+    log = load_log(path)
+
+    assert log.info.has_gps is False
+    assert calls == 0
+
+
+def test_load_log_detects_late_fix_coordinate_text_column(tmp_path: Path) -> None:
+    path = tmp_path / "late_gps.csv"
+    rows = ["Time,GPS,Voltage"]
+    for index in range(250):
+        rows.append(f"{index},No fix,{16.8 - index * 0.001:.3f}")
+    rows.extend(
+        [
+            "250,\"39.774389,-75.204944,20\",16.5",
+            "251,\"39.774450,-75.204900,21\",16.4",
+        ]
+    )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "GPS (lat)"
+
+
+def test_load_log_detects_mixed_numeric_placeholder_coordinate_text_column(tmp_path: Path) -> None:
+    path = tmp_path / "mixed_gps.csv"
+    rows = ["Time,GPS,Voltage"]
+    for index in range(250):
+        rows.append(f"{index},0,{16.8 - index * 0.001:.3f}")
+    rows.extend(
+        [
+            "250,\"39.774389,-75.204944,20\",16.5",
+            "251,\"39.774450,-75.204900,21\",16.4",
+        ]
+    )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "GPS (lat)"
+    assert log.gps_columns.longitude_label == "GPS (lon)"
+    assert log.gps_columns.altitude_label == "GPS (alt)"
+
+
+def test_load_log_detects_late_fix_coordinate_text_column_without_name_hint(tmp_path: Path) -> None:
+    path = tmp_path / "late_gps_status.csv"
+    rows = ["Time,Status,Voltage"]
+    for index in range(250):
+        rows.append(f"{index},No fix,{16.8 - index * 0.001:.3f}")
+    rows.extend(
+        [
+            "250,\"39.774389,-75.204944,20\",16.5",
+            "251,\"39.774450,-75.204900,21\",16.4",
+        ]
+    )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.info.has_gps is True
+    assert log.gps_columns is not None
+    assert log.gps_columns.latitude_label == "Status (lat)"
+    assert log.gps_columns.longitude_label == "Status (lon)"
+    assert log.gps_columns.altitude_label == "Status (alt)"
+
+
 def test_internal_resistance_regression(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
@@ -639,6 +868,95 @@ def test_internal_resistance_regression(tmp_path: Path) -> None:
     assert result is not None
     assert 20 <= result.pack_milliohm <= 40
     assert result.health in {"Good", "Fair"}
+
+
+def test_app_store_migrates_older_flight_table_with_no_video_path(tmp_path: Path) -> None:
+    from sloppy_log_explorer.storage import AppStore
+
+    db_path = tmp_path / "state.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.execute("create table flights (file_path text primary key, model text, notes text default '')")
+    conn.commit()
+    conn.close()
+
+    store = AppStore(db_path)
+    store.save_flight("flight.csv", "Panther", "good flight", "clip.mp4")
+    flight = store.get_flight("flight.csv")
+    store.close()
+
+    assert flight["notes"] == "good flight"
+    assert flight["video_path"] == "clip.mp4"
+
+
+def test_battery_ir_uses_selected_battery_cell_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    battery_id = window.store.add_battery("Six cell pack", 6)
+    window.refresh_batteries()
+    for index in range(window.battery_select.count()):
+        data = window.battery_select.itemData(index)
+        if isinstance(data, dict) and data["id"] == battery_id:
+            window.battery_select.setCurrentIndex(index)
+            break
+
+    window.calculate_battery_ir()
+
+    history = window.store.list_battery_history()
+    assert len(history) == 1
+    assert history[0]["cell_milliohm"] == pytest.approx(history[0]["pack_milliohm"] / 6)
+
+    window.close()
+    app.quit()
+
+
+def test_battery_ir_warns_when_voltage_or_current_columns_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "throttle.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,Throttle",
+                "2026-01-01,12:00:00,0",
+                "2026-01-01,12:00:01,25",
+                "2026-01-01,12:00:02,50",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, message: warnings.append(message))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.store.add_battery("Pack", 4)
+    window.refresh_batteries()
+
+    window.calculate_battery_ir()
+
+    assert warnings == ["Select valid voltage and current columns before calculating battery IR."]
+    assert window.store.list_battery_history() == []
+
+    window.close()
+    app.quit()
 
 
 def test_cursor_values_include_compare_delta(tmp_path: Path) -> None:
@@ -667,6 +985,84 @@ def test_sync_candidates_copy_newer_logs(tmp_path: Path) -> None:
 
     assert copied == 1
     assert (target / "flight.csv").exists()
+
+
+def test_sync_ui_copies_only_selected_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    write_sample(source / "first.csv")
+    write_sample(source / "second.csv")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.sync_source.setText(str(source))
+    window.sync_target.setText(str(target))
+    window.scan_sync()
+
+    assert window.sync_table.rowCount() == 2
+    window.sync_table.selectRow(0)
+    selected = window._selected_sync_candidates()
+    assert len(selected) == 1
+    copied_target = selected[0].target
+    skipped_targets = [candidate.target for candidate in window.sync_candidates if candidate.target != copied_target]
+
+    window.copy_sync_candidates()
+
+    assert copied_target.exists()
+    assert skipped_targets
+    assert all(not path.exists() for path in skipped_targets)
+
+    window.close()
+    app.quit()
+
+
+def test_voice_pack_rejects_path_escape_filenames(tmp_path: Path) -> None:
+    output = tmp_path / "voice"
+
+    for filename in ("..\\escaped", "folder\\clip", "folder/clip"):
+        with pytest.raises(ValueError, match="simple file names"):
+            generate_voice_pack([VoiceItem("hello", filename)], output)
+
+    assert not (tmp_path / "escaped.wav").exists()
+    assert not (output / "folder\\clip.wav").exists()
+    assert not (output / "clip.wav").exists()
+
+
+def test_generate_voice_pack_gui_shows_warning_for_path_like_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    output = tmp_path / "voice"
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, _title, message: warnings.append(message))
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *_args, **_kwargs: str(output))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    window.voice_table.setRowCount(1)
+    window.voice_table.setItem(0, 0, QTableWidgetItem("armed"))
+    window.voice_table.setItem(0, 1, QTableWidgetItem("../armed"))
+
+    window.generate_voice_pack()
+
+    assert len(warnings) == 1
+    assert "simple file names" in warnings[0]
+    window.close()
+    app.quit()
 
 
 def test_load_log_infers_model_from_root_level_filename(tmp_path: Path) -> None:
@@ -863,6 +1259,37 @@ def test_gps_marker_value_selectors_drive_cursor_payload(
     app.quit()
 
 
+def test_cursor_selection_updates_graph_cursor_without_full_plot_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    graph_refreshes: list[object] = []
+    cursor_updates: list[int] = []
+    monkeypatch.setattr(window, "refresh_graph", lambda: graph_refreshes.append(True))
+    monkeypatch.setattr(window.graph_view, "set_cursor_index", lambda index: cursor_updates.append(index))
+
+    window.set_selected_index(3)
+
+    assert window.selected_index == 3
+    assert cursor_updates == [3]
+    assert graph_refreshes == []
+
+    window.close()
+    app.quit()
+
+
 def test_gps_playback_tick_advances_synced_cursor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -898,6 +1325,27 @@ def test_gps_playback_tick_advances_synced_cursor(
     assert cursor_payloads[-1]["speed"] == pytest.approx(1.0)
 
     window.set_gps_playback_playing(False)
+    window.close()
+    app.quit()
+
+
+def test_gps_nearest_index_handles_non_monotonic_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.gps_timeline_seconds = [0.0, 10.0, 5.0]
+    window.gps_timeline_is_monotonic = False
+
+    assert window._nearest_gps_index(6.0) == 2
+    assert window._nearest_gps_index(9.0) == 1
+
     window.close()
     app.quit()
 
@@ -964,6 +1412,49 @@ def test_gps_tab_has_no_map_mode_selector(tmp_path: Path, monkeypatch: pytest.Mo
     assert not hasattr(window.gps_view, "set_mode")
 
     window.refresh_gps()
+
+    window.close()
+    app.quit()
+
+
+def test_dark_theme_toggle_updates_app_shell_stylesheet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    dark_stylesheet = window.styleSheet()
+
+    window.dark_action.setChecked(False)
+    window.toggle_theme()
+
+    assert window.dark_mode is False
+    assert window.styleSheet() != dark_stylesheet
+    assert "#f6f8fb" in window.styleSheet()
+
+    window.close()
+    app.quit()
+
+
+def test_saving_alias_profile_keeps_saved_profile_selected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.store.save_aliases("Alpha", {"SA": "Gear"})
+    window.populate_alias_profiles("Alpha")
+    window.alias_profile.setEditText("Zed")
+
+    window.save_alias_profile()
+
+    assert window.alias_profile.currentText() == "Zed"
 
     window.close()
     app.quit()
@@ -1038,6 +1529,108 @@ def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
     assert "QWebChannel" in html
     assert len(gps.data) == 1
     assert "maplibregl.Map" in gps_map
+
+
+def test_telemetry_html_uses_local_plotly_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    fig = build_telemetry_figure(None, [])
+    html = figure_html(fig, bridge=True)
+
+    assert "cdn.plot.ly" not in html
+    assert "plotly-" in html
+    assert "qrc:///qtwebchannel/qwebchannel.js" in html
+
+
+def test_telemetry_trace_point_budget_scales_with_plot_width() -> None:
+    assert _telemetry_trace_point_budget(None) == 12000
+    assert _telemetry_trace_point_budget(0) == 12000
+    assert _telemetry_trace_point_budget(100) == 2000
+    assert _telemetry_trace_point_budget(750) == 3000
+    assert _telemetry_trace_point_budget(5000) == 12000
+
+
+def test_large_telemetry_figure_downsamples_and_preserves_source_indexes(tmp_path: Path) -> None:
+    path = tmp_path / "large.csv"
+    rows = ["Time,VFAS(V)"]
+    for index in range(13050):
+        rows.append(f"{index},{16.8 - index * 0.0001:.4f}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)"])
+    trace = fig.data[0]
+
+    assert len(trace.x) <= 12001
+    assert list(trace.customdata[:2]) == [0, 2]
+    assert trace.customdata[-1] == 13049
+
+
+def test_large_telemetry_downsampling_preserves_spikes_and_dropouts(tmp_path: Path) -> None:
+    path = tmp_path / "large_spike.csv"
+    rows = ["Time,VFAS(V),Current(A)"]
+    for index in range(13050):
+        voltage = 16.0
+        current = 20.0
+        if index == 12001:
+            voltage = 4.2
+        if index == 12003:
+            current = 130.0
+        rows.append(f"{index},{voltage},{current}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)", "Current(A)"], max_trace_points=2000)
+    voltage_trace = fig.data[0]
+    current_trace = fig.data[1]
+
+    assert 12001 in voltage_trace.customdata
+    assert 4.2 in voltage_trace.y
+    assert 12003 in current_trace.customdata
+    assert 130.0 in current_trace.y
+    assert len(voltage_trace.x) <= 2000
+    assert len(current_trace.x) <= 2000
+
+
+def test_large_telemetry_downsampling_preserves_nan_gaps(tmp_path: Path) -> None:
+    path = tmp_path / "large_gap.csv"
+    rows = ["Time,VFAS(V)"]
+    for index in range(13050):
+        voltage = "" if index == 12002 else "16.0"
+        rows.append(f"{index},{voltage}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)"], max_trace_points=2000)
+    trace = fig.data[0]
+    source_indexes = list(trace.customdata)
+    assert 12002 in source_indexes
+    gap_position = source_indexes.index(12002)
+
+    assert math.isnan(float(trace.y[gap_position]))
+    assert len(trace.x) <= 2000
+
+
+def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> None:
+    path = tmp_path / "many_columns.csv"
+    columns = [f"C{index}" for index in range(40)]
+    rows = ["Time," + ",".join(columns)]
+    for row_index in range(5):
+        rows.append(f"{row_index}," + ",".join(str(row_index + column_index) for column_index in range(40)))
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, columns)
+    annotation = fig.layout.annotations[0]
+
+    assert len(fig.data) == 24
+    assert fig.layout.margin.r == 284
+    assert fig.layout.yaxis6.showticklabels is True
+    assert fig.layout.yaxis7.showticklabels is False
+    assert fig.data[11].showlegend is True
+    assert fig.data[12].showlegend is False
+    assert "+ 28 more selected" in annotation.text
+    assert "C19: min" not in annotation.text
+    assert "Showing first 24 of 40 selected" in fig.layout.annotations[1].text
 
 
 def test_real_log_validator_accepts_current_3d_map_contract(tmp_path: Path) -> None:

@@ -15,8 +15,20 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
 from .models import GpsGradientOptions, LoadedLog
-from .plotting import build_gps_map_html, build_telemetry_figure, figure_html
+from .plotting import (
+    MAX_RENDERED_TELEMETRY_TRACES,
+    MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
+    TELEMETRY_MARGIN_LEFT,
+    _telemetry_right_margin,
+    _telemetry_trace_point_budget,
+    _telemetry_x_values,
+    build_gps_map_html,
+    build_telemetry_figure,
+    figure_html,
+)
 from .storage import app_data_dir
+
+TELEMETRY_RESIZE_RERENDER_MS = 150
 
 
 class _PlotBridge(QObject):
@@ -107,6 +119,14 @@ def _remove_file(path: Path | None) -> None:
         pass
 
 
+def _json_plotly_value(value: Any) -> object:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
 class TelemetryPlotWidget(QWidget):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
@@ -122,6 +142,10 @@ class TelemetryPlotWidget(QWidget):
         self.interaction_mode = "pan"
         self.time_mode = "absolute"
         self._view: QWebEngineView | QTextEdit
+        self._page: QWebEnginePage | None = None
+        self._cursor_x_values: list[object] = []
+        self._html_path: Path | None = None
+        self._last_trace_point_budget = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
         self.setMinimumHeight(420)
 
         layout = QVBoxLayout(self)
@@ -129,9 +153,13 @@ class TelemetryPlotWidget(QWidget):
         self._web_engine = _use_web_engine()
         if self._web_engine:
             self._view = QWebEngineView(self)
-            page = self._view.page()
-            if page is None:
-                raise RuntimeError("QWebEngineView.page() returned None")
+            page = QWebEnginePage(_persistent_web_profile(), self._view)
+            settings = page.settings()
+            if settings is None:
+                raise RuntimeError("QWebEnginePage.settings() returned None")
+            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            self._view.setPage(page)
+            self._page = page
             self._bridge = _PlotBridge()
             self._bridge.index_selected.connect(self.index_selected)
             self._bridge.index_stepped.connect(self.index_stepped)
@@ -142,6 +170,9 @@ class TelemetryPlotWidget(QWidget):
             self._view = QTextEdit(self)
             self._view.setReadOnly(True)
         layout.addWidget(self._view)
+        self._resize_render_timer = QTimer(self)
+        self._resize_render_timer.setSingleShot(True)
+        self._resize_render_timer.timeout.connect(self._maybe_render_after_resize)
 
     def set_plot(
         self,
@@ -177,9 +208,38 @@ class TelemetryPlotWidget(QWidget):
     def reset_view(self) -> None:
         self._render()
 
+    def set_cursor_index(self, selected_index: int) -> None:
+        self.selected_index = selected_index
+        if self.log is None:
+            return
+        if not self._web_engine:
+            self._render()
+            return
+        page = self._page
+        if page is None:
+            return
+        if not self._cursor_x_values:
+            return
+        safe_index = max(0, min(selected_index, len(self._cursor_x_values) - 1))
+        x_value = _json_plotly_value(self._cursor_x_values[safe_index])
+        script = f"""
+(function() {{
+  const plot = document.querySelector('.plotly-graph-div');
+  if (!plot || !window.Plotly || !plot.layout || !Array.isArray(plot.layout.shapes) || !plot.layout.shapes.length) {{
+    return false;
+  }}
+  const x = {json.dumps(x_value, allow_nan=False)};
+  Plotly.relayout(plot, {{'shapes[0].x0': x, 'shapes[0].x1': x}});
+  return true;
+}})();
+"""
+        page.runJavaScript(script)
+
     def _render(self) -> None:
         # The Plotly figure is rebuilt on every state change so compare traces,
         # cursor selection, and display mode stay in sync with the main window.
+        self._cursor_x_values = list(_telemetry_x_values(self.log, self.time_mode)) if self.log is not None else []
+        trace_point_budget = self._current_trace_point_budget()
         fig = build_telemetry_figure(
             self.log,
             self.columns,
@@ -189,9 +249,53 @@ class TelemetryPlotWidget(QWidget):
             dark=self.dark,
             interaction_mode=self.interaction_mode,
             time_mode=self.time_mode,
+            max_trace_points=trace_point_budget,
         )
+        self._last_trace_point_budget = trace_point_budget
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)
-        self._view.setHtml(html)
+        if self._web_engine:
+            previous_path = self._html_path
+            self._html_path = _write_temp_html(html, "telemetry-plot-")
+            cast(QWebEngineView, self._view).setUrl(QUrl.fromLocalFile(str(self._html_path)))
+            _remove_file(previous_path)
+        else:
+            self._view.setHtml(html)
+
+    def _current_trace_point_budget(self) -> int:
+        try:
+            view_width = int(self._view.width())
+        except (AttributeError, RuntimeError, TypeError):
+            return MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
+        plotted_column_count = min(len(self.columns), MAX_RENDERED_TELEMETRY_TRACES)
+        plot_width = view_width - TELEMETRY_MARGIN_LEFT - _telemetry_right_margin(plotted_column_count)
+        return _telemetry_trace_point_budget(plot_width)
+
+    def _trace_point_budget_changed(self, next_budget: int) -> bool:
+        threshold = max(500, int(self._last_trace_point_budget * 0.10))
+        return abs(next_budget - self._last_trace_point_budget) >= threshold
+
+    def _schedule_resize_render(self) -> None:
+        if self.log is None or not self.columns:
+            return
+        next_budget = self._current_trace_point_budget()
+        if not self._trace_point_budget_changed(next_budget):
+            return
+        self._resize_render_timer.start(TELEMETRY_RESIZE_RERENDER_MS)
+
+    def _maybe_render_after_resize(self) -> None:
+        if self.log is None or not self.columns:
+            return
+        if self._trace_point_budget_changed(self._current_trace_point_budget()):
+            self._render()
+
+    def resizeEvent(self, a0) -> None:
+        super().resizeEvent(a0)
+        self._schedule_resize_render()
+
+    def closeEvent(self, a0) -> None:
+        _remove_file(self._html_path)
+        self._html_path = None
+        super().closeEvent(a0)
 
 
 class GpsPathWidget(QWidget):
