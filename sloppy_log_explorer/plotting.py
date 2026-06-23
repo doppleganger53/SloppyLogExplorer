@@ -103,17 +103,29 @@ def _sample_numeric_series(
         return indices, [values[index] for index in indices]
 
     bucket_count = max(1, (maximum - 2) // 2)
+    indices = _sample_numeric_indices(values, bucket_count)
+    if len(indices) > maximum:
+        bucket_count = max(1, (maximum - 2) // 3)
+        indices = _sample_numeric_indices(values, bucket_count)
+    return indices, [values[index] for index in indices]
+
+
+def _sample_numeric_indices(values: Any, bucket_count: int) -> list[int]:
+    length = len(values)
     bucket_size = max(1, math.ceil(length / bucket_count))
     selected = {0, length - 1}
     for start in range(0, length, bucket_size):
         end = min(start + bucket_size, length)
         min_index: int | None = None
         max_index: int | None = None
+        missing_index: int | None = None
         min_value = math.inf
         max_value = -math.inf
         for index in range(start, end):
             number = _coerce_float(values[index])
             if number is None:
+                if missing_index is None:
+                    missing_index = index
                 continue
             if number < min_value:
                 min_value = number
@@ -122,13 +134,15 @@ def _sample_numeric_series(
                 max_value = number
                 max_index = index
         if min_index is None or max_index is None:
-            selected.add(start)
+            if missing_index is not None:
+                selected.add(missing_index)
         else:
             selected.add(min_index)
             selected.add(max_index)
+            if missing_index is not None:
+                selected.add(missing_index)
 
-    indices = sorted(selected)
-    return indices, [values[index] for index in indices]
+    return sorted(selected)
 
 
 def _coerce_float(value: object) -> float | None:

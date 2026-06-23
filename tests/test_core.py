@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import os
 import sqlite3
@@ -1567,6 +1568,25 @@ def test_large_telemetry_downsampling_preserves_spikes_and_dropouts(tmp_path: Pa
     assert 130.0 in current_trace.y
     assert len(voltage_trace.x) <= 2000
     assert len(current_trace.x) <= 2000
+
+
+def test_large_telemetry_downsampling_preserves_nan_gaps(tmp_path: Path) -> None:
+    path = tmp_path / "large_gap.csv"
+    rows = ["Time,VFAS(V)"]
+    for index in range(13050):
+        voltage = "" if index == 12002 else "16.0"
+        rows.append(f"{index},{voltage}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["VFAS(V)"], max_trace_points=2000)
+    trace = fig.data[0]
+    source_indexes = list(trace.customdata)
+    assert 12002 in source_indexes
+    gap_position = source_indexes.index(12002)
+
+    assert math.isnan(float(trace.y[gap_position]))
+    assert len(trace.x) <= 2000
 
 
 def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> None:
