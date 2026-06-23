@@ -115,6 +115,23 @@ class RawLogTableModel(QAbstractTableModel):
         return None
 
 
+class _NumericSortableTableItem(QTableWidgetItem):
+    """Table item that sorts numerically by its stored raw value."""
+
+    def __init__(self, text: str, sort_value: float | int) -> None:
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if not isinstance(other, _NumericSortableTableItem):
+            return QTableWidgetItem.__lt__(self, other)
+        left = self._sort_value
+        right = other._sort_value
+        if left == right:
+            return QTableWidgetItem.__lt__(self, other)
+        return left < right
+
+
 class MainWindow(QMainWindow):
     library_sort_column = 2
 
@@ -355,10 +372,19 @@ class MainWindow(QMainWindow):
         self.populate_statistics_table()
 
     def _set_raw_log_dataframe(self, dataframe: pd.DataFrame | None) -> None:
-        self.raw_log_model.set_dataframe(dataframe)
+        visible_dataframe = self._source_facing_raw_columns(dataframe)
+        self.raw_log_model.set_dataframe(visible_dataframe)
         has_log = dataframe is not None
         self.raw_log_empty.setVisible(not has_log)
         self.raw_log_table.setVisible(has_log)
+
+    def _source_facing_raw_columns(self, dataframe: pd.DataFrame | None) -> pd.DataFrame | None:
+        if dataframe is None:
+            return None
+        visible_columns = [column for column in dataframe.columns if not str(column).startswith("__")]
+        if len(visible_columns) == len(dataframe.columns):
+            return dataframe
+        return dataframe[visible_columns]
 
     def _build_raw_log_tab(self) -> None:
         tab = QWidget()
@@ -1014,8 +1040,10 @@ class MainWindow(QMainWindow):
             self.load_flight_notes()
             self.refresh_plots()
             self.status.showMessage(f"Loaded {path.name}")
-        except Exception as exc:
-            self._set_raw_log_dataframe(None)
+        except Exception:
+            # Preserve the previous successful log on failure so the Raw Log tab
+            # stays aligned with the rest of the UI and does not temporarily
+            # disappear while the existing session is still valid.
             QMessageBox.warning(self, "Log load failed", traceback.format_exc())
 
     def populate_columns(self, *_args) -> None:
@@ -1096,7 +1124,7 @@ class MainWindow(QMainWindow):
 
             for stat_column, key in enumerate(("count", "min", "max", "mean", "std"), start=2):
                 value = stats[col][key]
-                item = QTableWidgetItem(self._format_stat_value(value))
+                item = _NumericSortableTableItem(self._format_stat_value(value), value)
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 item.setData(Qt.ItemDataRole.UserRole, value)
                 self.statistics_table.setItem(row, stat_column, item)

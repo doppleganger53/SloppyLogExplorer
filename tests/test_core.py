@@ -948,6 +948,17 @@ def test_app_store_migrates_older_flight_table_with_no_video_path(tmp_path: Path
     assert flight["video_path"] == "clip.mp4"
 
 
+def write_stats_numeric_sort_sample(path: Path) -> None:
+    rows = ["Date,Time,SmallValue,LargeValue"]
+    for index in range(11):
+        time = f"12:00:{index:02d}"
+        if index < 2:
+            rows.append(f"2026-01-01,{time},9,{100 + index}")
+        else:
+            rows.append(f"2026-01-01,{time},,{100 + index}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
 def test_raw_log_table_model_reports_shape_headers_and_display_values() -> None:
     from sloppy_log_explorer.main_window import RawLogTableModel
 
@@ -999,6 +1010,80 @@ def test_main_window_load_log_attaches_raw_log_model(tmp_path: Path, monkeypatch
     assert window.raw_log_model.dataframe is window.current_log.dataframe
     assert window.raw_log_empty.isHidden()
     assert not window.raw_log_table.isHidden()
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_raw_log_hides_gps_helper_columns_for_coordinate_string_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "string_gps.csv"
+    write_coordinate_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    raw_columns = list(window.raw_log_model.dataframe.columns)
+    loaded_columns = list(window.current_log.dataframe.columns) if window.current_log is not None else []
+
+    assert "__gps_latitude" in loaded_columns
+    assert "__gps_longitude" in loaded_columns
+    assert not any(column.startswith("__") for column in raw_columns)
+    assert raw_columns == ["Date", "Time", "GPS"]
+    assert window.raw_log_model.data(window.raw_log_model.index(1, 2), Qt.ItemDataRole.DisplayRole) == "39.0005,-75.0005,11"
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_load_log_failure_keeps_previous_raw_log_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    write_sample(first)
+    second.write_text("Date,Time,VFAS(V),Current(A)\n2026-01-01,12:00:00,INVALID", encoding="utf-8")
+
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[2] if len(args) > 2 else ""))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first)
+
+    raw_columns = list(window.raw_log_model.dataframe.columns)
+    first_summary = window.file_summary.text()
+    assert not window.raw_log_empty.isVisible()
+    assert not window.raw_log_table.isHidden()
+
+    def fail_load(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("parser failed")
+
+    monkeypatch.setattr("sloppy_log_explorer.main_window.load_log", fail_load)
+
+    window.load_log(second)
+
+    assert warnings
+    assert window.current_log is not None
+    assert window.current_log.info.path == first
+    assert list(window.raw_log_model.dataframe.columns) == raw_columns
+    assert window.raw_log_empty.isHidden() is True
+    assert window.raw_log_table.isHidden() is False
+    assert window.file_summary.text() == first_summary
 
     window.close()
     app.quit()
@@ -1131,6 +1216,29 @@ def test_loading_log_populates_statistics_table(tmp_path: Path, monkeypatch: pyt
     assert window.statistics_table.item(row, 2).text() == "9"
     assert window.statistics_table.item(row, 3).text() == "14.8"
     assert window.statistics_table.item(row, 4).text() == "16.8"
+
+    window.close()
+    app.quit()
+
+
+def test_statistics_numeric_columns_sort_numerically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "stats_sort.csv"
+    write_stats_numeric_sort_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    expected_order = ["SmallValue", "LargeValue"]
+    for column in range(2, 7):
+        window.statistics_table.sortItems(column, Qt.SortOrder.AscendingOrder)
+        assert _statistics_parameters(window) == expected_order
 
     window.close()
     app.quit()
