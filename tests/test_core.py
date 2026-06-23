@@ -4,6 +4,7 @@ import math
 from pathlib import Path
 import os
 import sqlite3
+from typing import Any, cast
 
 import pytest
 from PyQt6.QtCore import Qt
@@ -659,6 +660,30 @@ def test_telemetry_widget_passes_viewport_scaled_trace_budget(
 
     assert budgets == [2312, 12000]
     assert fake_view.html == "<html></html>"
+
+
+def test_telemetry_widget_clamps_narrow_trace_budget_before_budgeting() -> None:
+    class FakeView:
+        def width(self) -> int:
+            return 100
+
+    fake_widget = cast(Any, type("FakeTelemetryWidget", (), {})())
+    fake_widget._view = FakeView()
+    fake_widget.columns = [f"Sensor {index}" for index in range(24)]
+
+    assert TelemetryPlotWidget._current_trace_point_budget(fake_widget) == 2000
+
+
+def test_telemetry_widget_unknown_width_uses_hard_cap_trace_budget() -> None:
+    class FakeView:
+        def width(self) -> int:
+            raise RuntimeError("width not available")
+
+    fake_widget = cast(Any, type("FakeTelemetryWidget", (), {})())
+    fake_widget._view = FakeView()
+    fake_widget.columns = ["VFAS(V)"]
+
+    assert TelemetryPlotWidget._current_trace_point_budget(fake_widget) == 12000
 
 
 def test_gps_webengine_widget_refreshes_map_viewport() -> None:

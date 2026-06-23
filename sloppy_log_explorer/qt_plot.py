@@ -268,7 +268,7 @@ class TelemetryPlotWidget(QWidget):
             return MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
         plotted_column_count = min(len(self.columns), MAX_RENDERED_TELEMETRY_TRACES)
         plot_width = view_width - TELEMETRY_MARGIN_LEFT - _telemetry_right_margin(plotted_column_count)
-        return _telemetry_trace_point_budget(plot_width)
+        return _telemetry_trace_point_budget(max(1, plot_width))
 
     def _trace_point_budget_changed(self, next_budget: int) -> bool:
         threshold = max(500, int(self._last_trace_point_budget * 0.10))
