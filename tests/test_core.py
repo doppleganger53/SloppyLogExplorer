@@ -1329,6 +1329,27 @@ def test_gps_playback_tick_advances_synced_cursor(
     app.quit()
 
 
+def test_gps_nearest_index_handles_non_monotonic_timeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.gps_timeline_seconds = [0.0, 10.0, 5.0]
+    window.gps_timeline_is_monotonic = False
+
+    assert window._nearest_gps_index(6.0) == 2
+    assert window._nearest_gps_index(9.0) == 1
+
+    window.close()
+    app.quit()
+
+
 def test_telemetry_selection_does_not_refresh_gps_map_for_gps_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

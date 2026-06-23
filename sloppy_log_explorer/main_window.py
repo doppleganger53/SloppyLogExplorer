@@ -79,6 +79,7 @@ class MainWindow(QMainWindow):
         self.gps_playback_last_tick: float | None = None
         self.gps_playback_elapsed_seconds = 0.0
         self.gps_timeline_seconds: list[float] = []
+        self.gps_timeline_is_monotonic = True
         self.gps_marker_value_combos: list[QComboBox] = []
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
@@ -601,6 +602,9 @@ class MainWindow(QMainWindow):
         self.gps_playback_elapsed_seconds = 0.0
         self.gps_playback_timer.stop()
         self.gps_timeline_seconds = relative_seconds(self.current_log) if self.current_log is not None else []
+        self.gps_timeline_is_monotonic = all(
+            left <= right for left, right in zip(self.gps_timeline_seconds, self.gps_timeline_seconds[1:])
+        )
 
     def _gps_elapsed_for_index(self, index: int) -> float:
         if not self.gps_timeline_seconds:
@@ -614,6 +618,11 @@ class MainWindow(QMainWindow):
     def _nearest_gps_index(self, elapsed_seconds: float) -> int:
         if not self.gps_timeline_seconds:
             return 0
+        if not self.gps_timeline_is_monotonic:
+            return min(
+                range(len(self.gps_timeline_seconds)),
+                key=lambda index: abs(self.gps_timeline_seconds[index] - elapsed_seconds),
+            )
         insertion = bisect_left(self.gps_timeline_seconds, elapsed_seconds)
         if insertion <= 0:
             return 0
