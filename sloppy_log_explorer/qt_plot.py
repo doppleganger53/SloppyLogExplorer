@@ -139,7 +139,7 @@ class TelemetryPlotWidget(QWidget):
         self.selected_index = 0
         self.show_grid = True
         self.dark = True
-        self.interaction_mode = "pan"
+        self.interaction_mode = "zoom"
         self.time_mode = "absolute"
         self._view: QWebEngineView | QTextEdit
         self._page: QWebEnginePage | None = None
@@ -192,12 +192,13 @@ class TelemetryPlotWidget(QWidget):
         self.show_grid = show_grid
         self.dark = dark
         if interaction_mode:
-            self.interaction_mode = interaction_mode
+            self.interaction_mode = interaction_mode if interaction_mode in {"pan", "zoom"} else "zoom"
         if time_mode:
             self.time_mode = time_mode
         self._render()
 
     def set_interaction_mode(self, mode: str) -> None:
+        mode = mode if mode in {"pan", "zoom"} else "zoom"
         self.interaction_mode = mode
         self._render()
 

@@ -203,8 +203,8 @@ def cursor_values(
     return values
 
 
-def basic_stats(df: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, float]]:
-    stats: dict[str, dict[str, float]] = {}
+def basic_stats(df: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, float | int]]:
+    stats: dict[str, dict[str, float | int]] = {}
     for col in columns:
         if col not in df.columns:
             continue
@@ -212,6 +212,7 @@ def basic_stats(df: pd.DataFrame, columns: list[str]) -> dict[str, dict[str, flo
         if series.empty:
             continue
         stats[col] = {
+            "count": int(len(series)),
             "min": float(series.min()),
             "max": float(series.max()),
             "mean": float(series.mean()),
