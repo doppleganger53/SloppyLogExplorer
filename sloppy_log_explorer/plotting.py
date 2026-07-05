@@ -324,7 +324,7 @@ def build_telemetry_figure(
     selected_index: int | None = None,
     show_grid: bool = True,
     dark: bool = True,
-    interaction_mode: str = "pan",
+    interaction_mode: str = "zoom",
     time_mode: str = "absolute",
     max_trace_points: int = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
 ) -> go.Figure:
@@ -390,7 +390,7 @@ def build_telemetry_figure(
         "paper_bgcolor": "#1f242b" if dark else "#ffffff",
         "plot_bgcolor": "#171a20" if dark else "#ffffff",
         "hovermode": "x unified",
-        "dragmode": interaction_mode if interaction_mode in {"pan", "zoom"} else "pan",
+        "dragmode": interaction_mode if interaction_mode in {"pan", "zoom"} else "zoom",
         "margin": {
             "l": TELEMETRY_MARGIN_LEFT,
             "r": _telemetry_right_margin(len(plotted_columns)),
