@@ -6,11 +6,12 @@ import os
 import sqlite3
 from typing import Any, cast
 
+import pandas as pd
 import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
-from sloppy_log_explorer.analysis import calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
+from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
@@ -206,6 +207,28 @@ def write_gps_course_only_sample(path: Path) -> None:
 
 def write_library_blob(path: Path, size: int) -> None:
     path.write_text("x" * size, encoding="utf-8")
+
+
+def test_format_size_always_uses_binary_megabytes() -> None:
+    from sloppy_log_explorer.main_window import MainWindow
+
+    assert MainWindow._format_size(0) == "0.0 MB"
+    assert MainWindow._format_size(512) == "0.0 MB"
+    assert MainWindow._format_size(1024 * 1024) == "1.0 MB"
+    assert MainWindow._format_size(int(2.25 * 1024 * 1024)) == "2.2 MB"
+
+
+def test_basic_stats_reports_sample_count_and_numeric_values() -> None:
+    df = pd.DataFrame({"Voltage": [1.0, 2.0, None, 4.0], "Text": ["x", "y", "z", "w"]})
+
+    stats = basic_stats(df, ["Voltage", "Text", "Missing"])
+
+    assert list(stats) == ["Voltage"]
+    assert stats["Voltage"]["count"] == 3
+    assert stats["Voltage"]["min"] == pytest.approx(1.0)
+    assert stats["Voltage"]["max"] == pytest.approx(4.0)
+    assert stats["Voltage"]["mean"] == pytest.approx(7.0 / 3.0)
+    assert stats["Voltage"]["std"] == pytest.approx(1.5275252316519468)
 
 
 def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
@@ -610,6 +633,18 @@ def test_telemetry_webengine_widget_loads_plot_from_local_html_file(
     assert "QWebChannel" in html
 
 
+def test_telemetry_plot_widget_defaults_to_zoom(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setattr("sloppy_log_explorer.qt_plot._use_web_engine", lambda: False)
+
+    app = QApplication.instance() or QApplication([])
+    widget = TelemetryPlotWidget()
+
+    assert widget.interaction_mode == "zoom"
+
+    widget.deleteLater()
+
+
 def test_telemetry_widget_passes_viewport_scaled_trace_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -913,6 +948,166 @@ def test_app_store_migrates_older_flight_table_with_no_video_path(tmp_path: Path
     assert flight["video_path"] == "clip.mp4"
 
 
+def write_stats_numeric_sort_sample(path: Path) -> None:
+    rows = ["Date,Time,SmallValue,LargeValue"]
+    for index in range(11):
+        time = f"12:00:{index:02d}"
+        if index < 2:
+            rows.append(f"2026-01-01,{time},9,{100 + index}")
+        else:
+            rows.append(f"2026-01-01,{time},,{100 + index}")
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+def test_raw_log_table_model_reports_shape_headers_and_display_values() -> None:
+    from sloppy_log_explorer.main_window import RawLogTableModel
+
+    dataframe = pd.DataFrame(
+        {
+            "Time": ["12:00:00", "12:00:01"],
+            "VFAS(V)": [16.8, None],
+            "Mode": ["Armed", "Cruise"],
+        }
+    )
+
+    model = RawLogTableModel(dataframe)
+
+    assert model.rowCount() == 2
+    assert model.columnCount() == 3
+    assert model.headerData(0, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) == "Time"
+    assert model.headerData(1, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) == "VFAS(V)"
+    assert model.headerData(0, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole) == "1"
+    assert model.headerData(1, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole) == "2"
+    assert model.data(model.index(0, 0), Qt.ItemDataRole.DisplayRole) == "12:00:00"
+    assert model.data(model.index(1, 1), Qt.ItemDataRole.DisplayRole) == ""
+    assert model.data(model.index(1, 2), Qt.ItemDataRole.DisplayRole) == "Cruise"
+    assert model.data(model.index(1, 2), Qt.ItemDataRole.UserRole) is None
+
+
+def test_main_window_load_log_attaches_raw_log_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow, RawLogTableModel
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    tab_labels = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+    assert "Raw Log" in tab_labels
+    assert tab_labels.index("Raw Log") > tab_labels.index("Telemetry")
+    assert isinstance(window.raw_log_table.model(), RawLogTableModel)
+    assert window.raw_log_model.rowCount() == 9
+    assert window.raw_log_model.columnCount() == 7
+    assert window.raw_log_model.headerData(3, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) == "Current(A)"
+    assert window.raw_log_model.headerData(8, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole) == "9"
+    assert window.raw_log_model.data(window.raw_log_model.index(1, 3), Qt.ItemDataRole.DisplayRole) == "10.0"
+    assert window.raw_log_model.dataframe is window.current_log.dataframe
+    assert window.raw_log_empty.isHidden()
+    assert not window.raw_log_table.isHidden()
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_raw_log_hides_gps_helper_columns_for_coordinate_string_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "string_gps.csv"
+    write_coordinate_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    raw_columns = list(window.raw_log_model.dataframe.columns)
+    loaded_columns = list(window.current_log.dataframe.columns) if window.current_log is not None else []
+
+    assert "__gps_latitude" in loaded_columns
+    assert "__gps_longitude" in loaded_columns
+    assert not any(column.startswith("__") for column in raw_columns)
+    assert raw_columns == ["Date", "Time", "GPS"]
+    assert window.raw_log_model.data(window.raw_log_model.index(1, 2), Qt.ItemDataRole.DisplayRole) == "39.0005,-75.0005,11"
+
+    window.close()
+    app.quit()
+
+
+def test_main_window_load_log_failure_keeps_previous_raw_log_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    write_sample(first)
+    second.write_text("Date,Time,VFAS(V),Current(A)\n2026-01-01,12:00:00,INVALID", encoding="utf-8")
+
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warnings.append(args[2] if len(args) > 2 else ""))
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first)
+
+    raw_columns = list(window.raw_log_model.dataframe.columns)
+    first_summary = window.file_summary.text()
+    assert not window.raw_log_empty.isVisible()
+    assert not window.raw_log_table.isHidden()
+
+    def fail_load(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("parser failed")
+
+    monkeypatch.setattr("sloppy_log_explorer.main_window.load_log", fail_load)
+
+    window.load_log(second)
+
+    assert warnings
+    assert window.current_log is not None
+    assert window.current_log.info.path == first
+    assert list(window.raw_log_model.dataframe.columns) == raw_columns
+    assert window.raw_log_empty.isHidden() is True
+    assert window.raw_log_table.isHidden() is False
+    assert window.file_summary.text() == first_summary
+
+    window.close()
+    app.quit()
+
+
+def test_raw_log_table_model_attaches_large_dataframe_by_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sloppy_log_explorer import main_window as main_window_module
+    from sloppy_log_explorer.main_window import RawLogTableModel
+
+    def fail_table_item(*_args: object, **_kwargs: object) -> QTableWidgetItem:
+        raise AssertionError("RawLogTableModel should not create QTableWidgetItem cells")
+
+    monkeypatch.setattr(main_window_module, "QTableWidgetItem", fail_table_item)
+    dataframe = pd.DataFrame({"A": range(20_000), "B": range(20_000)})
+
+    model = RawLogTableModel()
+    model.set_dataframe(dataframe)
+
+    assert model.dataframe is dataframe
+    assert model.rowCount() == 20_000
+    assert model.columnCount() == 2
+    assert model.data(model.index(19_999, 1), Qt.ItemDataRole.DisplayRole) == "19999"
+
+
 def test_battery_ir_uses_selected_battery_cell_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_root = tmp_path / "appdata"
     monkeypatch.setenv("APPDATA", str(app_root))
@@ -979,6 +1174,144 @@ def test_battery_ir_warns_when_voltage_or_current_columns_are_missing(
 
     assert warnings == ["Select valid voltage and current columns before calculating battery IR."]
     assert window.store.list_battery_history() == []
+
+    window.close()
+    app.quit()
+
+
+def _statistics_row_for(window: Any, parameter: str) -> int:
+    for row in range(window.statistics_table.rowCount()):
+        item = window.statistics_table.item(row, 1)
+        if item is not None and item.text() == parameter:
+            return row
+    raise AssertionError(f"Statistics row not found for {parameter}")
+
+
+def _statistics_parameters(window: Any) -> list[str]:
+    parameters: list[str] = []
+    for row in range(window.statistics_table.rowCount()):
+        item = window.statistics_table.item(row, 1)
+        if item is not None:
+            parameters.append(item.text())
+    return parameters
+
+
+def test_loading_log_populates_statistics_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    assert window.tabs.tabText(1) == "Statistics"
+    row = _statistics_row_for(window, "VFAS(V)")
+    assert window.statistics_table.item(row, 0).checkState() == Qt.CheckState.Checked
+    assert window.statistics_table.item(row, 2).text() == "9"
+    assert window.statistics_table.item(row, 3).text() == "14.8"
+    assert window.statistics_table.item(row, 4).text() == "16.8"
+
+    window.close()
+    app.quit()
+
+
+def test_statistics_numeric_columns_sort_numerically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "stats_sort.csv"
+    write_stats_numeric_sort_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    expected_order = ["SmallValue", "LargeValue"]
+    for column in range(2, 7):
+        window.statistics_table.sortItems(column, Qt.SortOrder.AscendingOrder)
+        assert _statistics_parameters(window) == expected_order
+
+    window.close()
+    app.quit()
+
+
+def test_statistics_include_toggle_is_independent_from_telemetry_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.selected_parameter_columns = {"VFAS(V)"}
+    row = _statistics_row_for(window, "Current(A)")
+    include_item = window.statistics_table.item(row, 0)
+
+    include_item.setCheckState(Qt.CheckState.Unchecked)
+
+    assert "Current(A)" in window.statistics_excluded_columns
+    assert "Current(A)" not in _statistics_parameters(window)
+    assert window.selected_parameter_columns == {"VFAS(V)"}
+
+    window.reset_statistics_exclusions()
+
+    assert "Current(A)" not in window.statistics_excluded_columns
+    row = _statistics_row_for(window, "Current(A)")
+    assert window.statistics_table.item(row, 0).checkState() == Qt.CheckState.Checked
+
+    window.close()
+    app.quit()
+
+
+def test_statistics_exclusions_drop_columns_missing_from_new_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    write_sample(first)
+    second.write_text(
+        "\n".join(
+            [
+                "Date,Time,VFAS(V),Throttle",
+                "2026-01-01,12:00:00,16.8,10",
+                "2026-01-01,12:00:01,16.6,20",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first)
+    row = _statistics_row_for(window, "Current(A)")
+    window.statistics_table.item(row, 0).setCheckState(Qt.CheckState.Unchecked)
+
+    window.load_log(second)
+
+    assert "Current(A)" not in window.statistics_excluded_columns
+    _statistics_row_for(window, "Throttle")
 
     window.close()
     app.quit()
@@ -1184,9 +1517,13 @@ def test_library_tree_sorts_top_level_and_children_by_clicked_column_and_preserv
     alpha = next(item for item in top_level_items() if item.text(0) == "Alpha")
     beta = next(item for item in top_level_items() if item.text(0) == "Beta")
     gamma = next(item for item in top_level_items() if item.text(0) == "Gamma")
+    alpha_size = alpha_a.stat().st_size + alpha_b.stat().st_size + alpha_c.stat().st_size
     assert alpha.text(2) == window._format_timestamp(3000)
-    assert alpha.text(3) == window._format_size(alpha_a.stat().st_size + alpha_b.stat().st_size + alpha_c.stat().st_size)
+    assert alpha.text(3) == window._format_size(alpha_size)
+    assert alpha.data(3, Qt.ItemDataRole.UserRole) == alpha_size
     assert child_names("Alpha") == [alpha_b.name, alpha_c.name, alpha_a.name]
+    assert alpha.child(0).text(3) == window._format_size(alpha_b.stat().st_size)
+    assert alpha.child(0).data(3, Qt.ItemDataRole.UserRole) == alpha_b.stat().st_size
     alpha.setExpanded(True)
     gamma.setExpanded(True)
 
@@ -1551,9 +1888,46 @@ def test_plotting_supports_current_plotly_axis_schema(tmp_path: Path) -> None:
     assert len(fig.data) == 2
     assert fig.layout.yaxis.title.text == "VFAS(V)"
     assert fig.layout.yaxis2.title.text == "Current(A)"
+    assert fig.layout.dragmode == "zoom"
     assert "QWebChannel" in html
     assert len(gps.data) == 1
     assert "maplibregl.Map" in gps_map
+
+
+def test_telemetry_figure_honors_pan_and_falls_back_to_zoom(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    pan_fig = build_telemetry_figure(log, ["VFAS(V)"], interaction_mode="pan")
+    invalid_fig = build_telemetry_figure(log, ["VFAS(V)"], interaction_mode="select")
+
+    assert pan_fig.layout.dragmode == "pan"
+    assert invalid_fig.layout.dragmode == "zoom"
+
+
+def test_main_window_default_telemetry_drag_mode_is_zoom(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    assert window.telemetry_interaction_mode == "zoom"
+    assert window.telemetry_zoom_button.isChecked()
+    assert not window.telemetry_pan_button.isChecked()
+    assert window.graph_view.interaction_mode == "zoom"
+
+    window.set_telemetry_interaction_mode("pan")
+    assert window.telemetry_interaction_mode == "pan"
+    assert window.telemetry_pan_button.isChecked()
+    assert not window.telemetry_zoom_button.isChecked()
+
+    window.close()
+    app.quit()
 
 
 def test_telemetry_html_uses_local_plotly_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

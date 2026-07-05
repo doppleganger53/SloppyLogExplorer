@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QTabWidget,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -40,6 +41,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .analysis import (
+    basic_stats,
     calculate_internal_resistance,
     cursor_values,
     find_current_columns,
@@ -53,6 +55,81 @@ from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
 from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_csv
+
+
+class RawLogTableModel(QAbstractTableModel):
+    def __init__(self, dataframe: pd.DataFrame | None = None) -> None:
+        super().__init__()
+        self._dataframe = dataframe if dataframe is not None else pd.DataFrame()
+
+    @property
+    def dataframe(self) -> pd.DataFrame:
+        return self._dataframe
+
+    def set_dataframe(self, dataframe: pd.DataFrame | None) -> None:
+        self.beginResetModel()
+        self._dataframe = dataframe if dataframe is not None else pd.DataFrame()
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._dataframe)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent.isValid():
+            return 0
+        return len(self._dataframe.columns)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> str | None:
+        if role != Qt.ItemDataRole.DisplayRole or not index.isValid():
+            return None
+        row = index.row()
+        column = index.column()
+        if row < 0 or row >= len(self._dataframe) or column < 0 or column >= len(self._dataframe.columns):
+            return None
+        value = self._dataframe.iat[row, column]
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value)
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> str | None:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            if 0 <= section < len(self._dataframe.columns):
+                return str(self._dataframe.columns[section])
+            return None
+        if orientation == Qt.Orientation.Vertical:
+            if 0 <= section < len(self._dataframe):
+                return str(section + 1)
+            return None
+        return None
+
+
+class _NumericSortableTableItem(QTableWidgetItem):
+    """Table item that sorts numerically by its stored raw value."""
+
+    def __init__(self, text: str, sort_value: float | int) -> None:
+        super().__init__(text)
+        self._sort_value = sort_value
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if not isinstance(other, _NumericSortableTableItem):
+            return QTableWidgetItem.__lt__(self, other)
+        left = self._sort_value
+        right = other._sort_value
+        if left == right:
+            return QTableWidgetItem.__lt__(self, other)
+        return left < right
 
 
 class MainWindow(QMainWindow):
@@ -69,9 +146,10 @@ class MainWindow(QMainWindow):
         self.compare_log: LoadedLog | None = None
         self.selected_index = 0
         self.dark_mode = True
-        self.telemetry_interaction_mode = "pan"
+        self.telemetry_interaction_mode = "zoom"
         self.telemetry_time_mode = "absolute"
         self.selected_parameter_columns: set[str] = set()
+        self.statistics_excluded_columns: set[str] = set()
         self.gps_start_color = GpsGradientOptions.start_color
         self.gps_end_color = GpsGradientOptions.end_color
         self.gps_playback_playing = False
@@ -217,6 +295,8 @@ class MainWindow(QMainWindow):
         root.setSizes([390, 1110])
 
         self._build_graph_tab()
+        self._build_statistics_tab()
+        self._build_raw_log_tab()
         self._build_gps_tab()
         self._build_flight_tab()
         self._build_battery_tab()
@@ -236,10 +316,11 @@ class MainWindow(QMainWindow):
         controls.addWidget(QLabel("Drag mode"))
         self.telemetry_pan_button = QPushButton("Pan")
         self.telemetry_pan_button.setCheckable(True)
-        self.telemetry_pan_button.setChecked(True)
+        self.telemetry_pan_button.setChecked(False)
         self.telemetry_pan_button.clicked.connect(lambda: self.set_telemetry_interaction_mode("pan"))
         self.telemetry_zoom_button = QPushButton("Zoom")
         self.telemetry_zoom_button.setCheckable(True)
+        self.telemetry_zoom_button.setChecked(True)
         self.telemetry_zoom_button.clicked.connect(lambda: self.set_telemetry_interaction_mode("zoom"))
         reset = QPushButton("Reset View")
         reset.clicked.connect(self.reset_telemetry_view)
@@ -264,6 +345,70 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.info_panel, 1)
         self.tabs.addTab(tab, "Telemetry")
         self._set_empty_graph()
+
+    def _build_statistics_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        controls = QHBoxLayout()
+        self.statistics_empty_label = QLabel("No log loaded")
+        self.statistics_empty_label.setObjectName("summary")
+        controls.addWidget(self.statistics_empty_label)
+        controls.addStretch()
+        self.statistics_reset_button = QPushButton("Show All")
+        self.statistics_reset_button.clicked.connect(self.reset_statistics_exclusions)
+        controls.addWidget(self.statistics_reset_button)
+        layout.addLayout(controls)
+
+        self.statistics_table = QTableWidget(0, 7)
+        self.statistics_table.setHorizontalHeaderLabels(
+            ["Include", "Parameter", "Samples", "Min", "Max", "Mean", "Std Dev"]
+        )
+        self._horizontal_header(self.statistics_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.statistics_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._configure_sortable_table(self.statistics_table)
+        self.statistics_table.itemChanged.connect(self.statistics_item_changed)
+        layout.addWidget(self.statistics_table, 1)
+        self.tabs.addTab(tab, "Statistics")
+        self.populate_statistics_table()
+
+    def _set_raw_log_dataframe(self, dataframe: pd.DataFrame | None) -> None:
+        visible_dataframe = self._source_facing_raw_columns(dataframe)
+        self.raw_log_model.set_dataframe(visible_dataframe)
+        has_log = dataframe is not None
+        self.raw_log_empty.setVisible(not has_log)
+        self.raw_log_table.setVisible(has_log)
+
+    def _source_facing_raw_columns(self, dataframe: pd.DataFrame | None) -> pd.DataFrame | None:
+        if dataframe is None:
+            return None
+        visible_columns = [column for column in dataframe.columns if not str(column).startswith("__")]
+        if len(visible_columns) == len(dataframe.columns):
+            return dataframe
+        return dataframe[visible_columns]
+
+    def _build_raw_log_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.raw_log_empty = QLabel("No log loaded")
+        self.raw_log_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.raw_log_empty.setObjectName("summary")
+        layout.addWidget(self.raw_log_empty)
+
+        self.raw_log_model = RawLogTableModel()
+        self.raw_log_table = QTableView()
+        self.raw_log_table.setModel(self.raw_log_model)
+        self.raw_log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.raw_log_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.raw_log_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.raw_log_table.setAlternatingRowColors(True)
+        self.raw_log_table.setSortingEnabled(False)
+        header = self.raw_log_table.horizontalHeader()
+        if header is None:
+            raise RuntimeError("QTableView did not provide a horizontal header")
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        layout.addWidget(self.raw_log_table, 1)
+        self.tabs.addTab(tab, "Raw Log")
+        self._set_raw_log_dataframe(None)
 
     def _build_gps_tab(self) -> None:
         tab = QWidget()
@@ -753,7 +898,7 @@ class MainWindow(QMainWindow):
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
             QPushButton:hover { background: #3f8df2; }
             QPushButton:checked { background: #185fc7; border: 1px solid #87b7ff; padding: 6px 9px; }
-            QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget {
+            QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget, QTableView {
                 background: #15181d; color: #e5e7eb; border: 1px solid #3a414d; border-radius: 4px;
             }
             QHeaderView::section { background: #2b3038; color: #e5e7eb; padding: 5px; border: 0; }
@@ -771,7 +916,7 @@ class MainWindow(QMainWindow):
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
             QPushButton:hover { background: #1f6fd4; }
             QPushButton:checked { background: #185fc7; border: 1px solid #0f4fb0; padding: 6px 9px; }
-            QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget {
+            QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget, QTableView {
                 background: #ffffff; color: #1f2937; border: 1px solid #c9d2df; border-radius: 4px;
             }
             QHeaderView::section { background: #e8edf4; color: #1f2937; padding: 5px; border: 0; }
@@ -885,15 +1030,20 @@ class MainWindow(QMainWindow):
             self.store.set_setting("last_log", str(path))
             # Every dependent widget needs a refresh because a new log changes
             # the available columns, GPS choices, and saved notes target.
+            self._set_raw_log_dataframe(self.current_log.dataframe)
             self.initialize_selected_parameters()
             self.populate_columns()
+            self.populate_statistics_table()
             self.populate_gps_color_combo()
             self.populate_gps_value_combos()
             self.populate_analysis_combos()
             self.load_flight_notes()
             self.refresh_plots()
             self.status.showMessage(f"Loaded {path.name}")
-        except Exception as exc:
+        except Exception:
+            # Preserve the previous successful log on failure so the Raw Log tab
+            # stays aligned with the rest of the UI and does not temporarily
+            # disappear while the existing session is still valid.
             QMessageBox.warning(self, "Log load failed", traceback.format_exc())
 
     def populate_columns(self, *_args) -> None:
@@ -922,6 +1072,81 @@ class MainWindow(QMainWindow):
         self.column_table.setSortingEnabled(True)
         self.column_table.blockSignals(False)
         self.update_summary()
+
+    @staticmethod
+    def _format_stat_value(value: float | int) -> str:
+        if isinstance(value, int):
+            return str(value)
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+
+    def populate_statistics_table(self) -> None:
+        self.statistics_table.blockSignals(True)
+        self.statistics_table.setSortingEnabled(False)
+        self.statistics_table.setRowCount(0)
+        if self.current_log is None:
+            self.statistics_empty_label.setText("No log loaded")
+            self.statistics_reset_button.setEnabled(False)
+            self.statistics_table.setSortingEnabled(True)
+            self.statistics_table.blockSignals(False)
+            return
+
+        stats = basic_stats(self.current_log.dataframe, self.current_log.parameter_columns)
+        available_columns = [col for col in self.current_log.parameter_columns if col in stats]
+        self.statistics_excluded_columns &= set(available_columns)
+        visible_columns = [col for col in available_columns if col not in self.statistics_excluded_columns]
+        self.statistics_reset_button.setEnabled(bool(self.statistics_excluded_columns))
+        if not available_columns:
+            self.statistics_empty_label.setText("No numeric telemetry statistics available")
+            self.statistics_reset_button.setEnabled(False)
+            self.statistics_table.setSortingEnabled(True)
+            self.statistics_table.blockSignals(False)
+            return
+        if not visible_columns:
+            self.statistics_empty_label.setText("All statistics excluded")
+            self.statistics_table.setSortingEnabled(True)
+            self.statistics_table.blockSignals(False)
+            return
+
+        self.statistics_empty_label.setText("")
+        for col in visible_columns:
+            row = self.statistics_table.rowCount()
+            self.statistics_table.insertRow(row)
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            check.setData(Qt.ItemDataRole.UserRole, col)
+            check.setCheckState(Qt.CheckState.Checked)
+            self.statistics_table.setItem(row, 0, check)
+
+            name = QTableWidgetItem(col)
+            name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            name.setData(Qt.ItemDataRole.UserRole, col)
+            self.statistics_table.setItem(row, 1, name)
+
+            for stat_column, key in enumerate(("count", "min", "max", "mean", "std"), start=2):
+                value = stats[col][key]
+                item = _NumericSortableTableItem(self._format_stat_value(value), value)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                item.setData(Qt.ItemDataRole.UserRole, value)
+                self.statistics_table.setItem(row, stat_column, item)
+
+        self.statistics_table.setSortingEnabled(True)
+        self.statistics_table.blockSignals(False)
+
+    def reset_statistics_exclusions(self) -> None:
+        self.statistics_excluded_columns.clear()
+        self.populate_statistics_table()
+
+    def statistics_item_changed(self, item: QTableWidgetItem | None = None) -> None:
+        if item is None or item.column() != 0:
+            return
+        column = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(column, str):
+            return
+        if item.checkState() == Qt.CheckState.Checked:
+            self.statistics_excluded_columns.discard(column)
+        else:
+            self.statistics_excluded_columns.add(column)
+        self.populate_statistics_table()
 
     def selected_columns(self) -> list[str]:
         if self.current_log is None:
@@ -1098,6 +1323,7 @@ class MainWindow(QMainWindow):
         self.refresh_plots()
 
     def set_telemetry_interaction_mode(self, mode: str) -> None:
+        mode = mode if mode in {"pan", "zoom"} else "zoom"
         self.telemetry_interaction_mode = mode
         self.telemetry_pan_button.setChecked(mode == "pan")
         self.telemetry_zoom_button.setChecked(mode == "zoom")
@@ -1467,13 +1693,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_size(size: int) -> str:
-        units = ["B", "KB", "MB", "GB", "TB"]
-        value = float(size)
-        for unit in units:
-            if value < 1024.0 or unit == units[-1]:
-                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-            value /= 1024.0
-        raise ValueError("Size value is too large to format")
+        return f"{size / (1024 * 1024):.1f} MB"
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
         self.store.close()
