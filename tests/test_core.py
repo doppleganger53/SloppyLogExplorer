@@ -8,7 +8,7 @@ from typing import Any, cast
 
 import pandas as pd
 import pytest
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
@@ -49,6 +49,44 @@ def write_sample(path: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def write_axis_group_sample(path: Path, offset: float = 0.0) -> None:
+    rows = [
+        "Time,Motor 1 Temp(C),Motor 2 Temp(C),Cell 1(V),VFAS(V),Current 1(A),Current 2(A)"
+    ]
+    for index in range(6):
+        rows.append(
+            ",".join(
+                [
+                    str(index),
+                    f"{40.0 + offset + index:.2f}",
+                    f"{42.0 + offset + index:.2f}",
+                    f"{3.70 + offset * 0.01 + index * 0.02:.2f}",
+                    f"{15.20 + offset * 0.1 + index * 0.10:.2f}",
+                    f"{20.0 + offset + index * 2.0:.2f}",
+                    f"{21.5 + offset + index * 2.0:.2f}",
+                ]
+            )
+        )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+def select_column_table_rows(window: Any, columns: set[str]) -> None:
+    selection_model = window.column_table.selectionModel()
+    assert selection_model is not None
+    selection_model.clearSelection()
+    table_model = window.column_table.model()
+    for row in range(window.column_table.rowCount()):
+        item = window.column_table.item(row, 1)
+        if item is None:
+            continue
+        column = item.data(Qt.ItemDataRole.UserRole)
+        if column in columns:
+            selection_model.select(
+                table_model.index(row, 1),
+                QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+            )
 
 
 def write_coordinate_sample(path: Path) -> None:
@@ -2112,6 +2150,62 @@ def test_telemetry_selection_does_not_refresh_gps_map_for_gps_log(
     app.quit()
 
 
+def test_main_window_manual_axis_grouping_refreshes_only_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "axis_groups.csv"
+    write_axis_group_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.selected_parameter_columns = {"VFAS(V)", "Current 1(A)"}
+    window.populate_columns()
+
+    gps_refreshes: list[object] = []
+    graph_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(window.gps_view, "set_path", lambda *args, **kwargs: gps_refreshes.append((args, kwargs)))
+
+    def record_graph_refresh(log, columns, **kwargs) -> None:
+        graph_calls.append({"columns": list(columns), **kwargs})
+
+    monkeypatch.setattr(window.graph_view, "set_plot", record_graph_refresh)
+    select_column_table_rows(window, {"VFAS(V)", "Current 1(A)"})
+
+    window.group_selected_telemetry_axis_columns()
+
+    assert window.telemetry_axis_groups == [("VFAS(V)", "Current 1(A)")]
+    assert graph_calls[-1]["manual_axis_groups"] == [("VFAS(V)", "Current 1(A)")]
+    assert graph_calls[-1]["ungrouped_axis_columns"] == ()
+    assert gps_refreshes == []
+
+    window.ungroup_selected_telemetry_axis_columns()
+
+    assert window.telemetry_axis_groups == []
+    assert window.telemetry_axis_ungrouped_columns == {"VFAS(V)", "Current 1(A)"}
+    assert graph_calls[-1]["manual_axis_groups"] == []
+    assert graph_calls[-1]["ungrouped_axis_columns"] == ("Current 1(A)", "VFAS(V)")
+    assert gps_refreshes == []
+
+    window.reset_telemetry_axis_grouping()
+
+    assert window.telemetry_axis_groups == []
+    assert window.telemetry_axis_ungrouped_columns == set()
+    assert graph_calls[-1]["manual_axis_groups"] == []
+    assert graph_calls[-1]["ungrouped_axis_columns"] == ()
+    assert gps_refreshes == []
+
+    window.close()
+    app.quit()
+
+
 def test_load_log_defers_gps_map_until_flight_map_tab_opens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2414,6 +2508,84 @@ def test_telemetry_axis_layout_reserves_readable_right_gutter() -> None:
     assert _telemetry_x_axis_domain(2) == [0.0, 1.0]
     assert _telemetry_x_axis_domain(6) == [0.0, 0.745]
     assert _telemetry_x_axis_domain(24) == [0.0, 0.745]
+
+
+def test_same_unit_similar_range_telemetry_columns_share_y_axis(tmp_path: Path) -> None:
+    path = tmp_path / "axis_groups.csv"
+    write_axis_group_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(
+        log,
+        ["Motor 1 Temp(C)", "Motor 2 Temp(C)", "Current 1(A)", "Current 2(A)"],
+    )
+
+    assert [trace.yaxis for trace in fig.data] == ["y", "y", "y2", "y2"]
+    assert fig.layout.yaxis.title.text == "C group"
+    assert fig.layout.yaxis2.title.text == "A group"
+    assert fig.layout.margin.r == 126
+    assert list(fig.layout.xaxis.domain) == [0.0, 1.0]
+
+
+def test_same_unit_dissimilar_range_columns_stay_on_separate_axes(tmp_path: Path) -> None:
+    path = tmp_path / "axis_groups.csv"
+    write_axis_group_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(log, ["Cell 1(V)", "VFAS(V)"])
+
+    assert [trace.yaxis for trace in fig.data] == ["y", "y2"]
+    assert fig.layout.yaxis.title.text == "Cell 1(V)"
+    assert fig.layout.yaxis2.title.text == "VFAS(V)"
+
+
+def test_manual_axis_grouping_can_group_mixed_units(tmp_path: Path) -> None:
+    path = tmp_path / "axis_groups.csv"
+    write_axis_group_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(
+        log,
+        ["VFAS(V)", "Current 1(A)"],
+        manual_axis_groups=[["VFAS(V)", "Current 1(A)"]],
+    )
+
+    assert [trace.yaxis for trace in fig.data] == ["y", "y"]
+    assert fig.layout.yaxis.title.text == "Grouped axis"
+
+
+def test_manual_ungrouping_prevents_auto_axis_grouping(tmp_path: Path) -> None:
+    path = tmp_path / "axis_groups.csv"
+    write_axis_group_sample(path)
+    log = load_log(path)
+
+    fig = build_telemetry_figure(
+        log,
+        ["Motor 1 Temp(C)", "Motor 2 Temp(C)"],
+        ungrouped_axis_columns={"Motor 2 Temp(C)"},
+    )
+
+    assert [trace.yaxis for trace in fig.data] == ["y", "y2"]
+    assert fig.layout.yaxis.title.text == "Motor 1 Temp(C)"
+    assert fig.layout.yaxis2.title.text == "Motor 2 Temp(C)"
+
+
+def test_compare_traces_inherit_grouped_telemetry_axis(tmp_path: Path) -> None:
+    primary_path = tmp_path / "axis_groups.csv"
+    compare_path = tmp_path / "axis_groups_compare.csv"
+    write_axis_group_sample(primary_path)
+    write_axis_group_sample(compare_path, offset=5.0)
+    primary = load_log(primary_path)
+    compare = load_log(compare_path)
+
+    fig = build_telemetry_figure(
+        primary,
+        ["Current 1(A)", "Current 2(A)"],
+        compare=compare,
+    )
+
+    assert [trace.yaxis for trace in fig.data] == ["y", "y", "y", "y"]
+    assert fig.layout.yaxis.title.text == "A group"
 
 
 def test_large_telemetry_figure_downsamples_and_preserves_source_indexes(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer, QUrl
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -151,6 +152,8 @@ class MainWindow(QMainWindow):
         self.telemetry_time_mode = "absolute"
         self.telemetry_visible_elapsed_range: tuple[float, float] | None = None
         self.selected_parameter_columns: set[str] = set()
+        self.telemetry_axis_groups: list[tuple[str, ...]] = []
+        self.telemetry_axis_ungrouped_columns: set[str] = set()
         self.statistics_excluded_columns: set[str] = set()
         self._deferred_views_dirty: set[str] = set()
         self._gps_view_loaded = False
@@ -274,6 +277,9 @@ class MainWindow(QMainWindow):
         self.column_table.setHorizontalHeaderLabels(["Show", "Parameter"])
         self._horizontal_header(self.column_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.column_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.column_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.column_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.column_table.customContextMenuRequested.connect(self.show_column_context_menu)
         self._configure_sortable_table(self.column_table)
         self.column_table.itemChanged.connect(self.column_changed)
         sidebar_layout.addWidget(self.column_table, 3)
@@ -1110,6 +1116,7 @@ class MainWindow(QMainWindow):
             self.current_log = load_log(path, self.library_root)
             self.selected_index = 0
             self.telemetry_visible_elapsed_range = None
+            self.reset_telemetry_axis_grouping(refresh=False)
             self._reset_gps_playback()
             self.store.set_setting("last_log", str(path))
             # Every dependent widget needs a refresh because a new log changes
@@ -1236,6 +1243,90 @@ class MainWindow(QMainWindow):
         if self.current_log is None:
             return []
         return [col for col in self.current_log.parameter_columns if col in self.selected_parameter_columns]
+
+    def _selected_column_table_columns(self) -> list[str]:
+        selection_model = self.column_table.selectionModel()
+        if selection_model is None:
+            return []
+        rows = sorted({index.row() for index in selection_model.selectedRows()})
+        columns: list[str] = []
+        for row in rows:
+            item = self.column_table.item(row, 1) or self.column_table.item(row, 0)
+            if item is None:
+                continue
+            column = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(column, str):
+                columns.append(column)
+        return columns
+
+    def show_column_context_menu(self, position: QPoint) -> None:
+        index = self.column_table.indexAt(position)
+        selection_model = self.column_table.selectionModel()
+        if index.isValid() and selection_model is not None:
+            selected_rows = {row_index.row() for row_index in selection_model.selectedRows()}
+            if index.row() not in selected_rows:
+                self.column_table.selectRow(index.row())
+
+        selected_columns = self._selected_column_table_columns()
+        menu = QMenu(self)
+        group_action = QAction("Group selected on one Y axis", self)
+        group_action.setEnabled(len(selected_columns) >= 2)
+        menu.addAction(group_action)
+        ungroup_action = QAction("Ungroup selected from shared axes", self)
+        ungroup_action.setEnabled(bool(selected_columns))
+        menu.addAction(ungroup_action)
+        reset_action = QAction("Reset Y-axis grouping overrides", self)
+        reset_action.setEnabled(bool(self.telemetry_axis_groups or self.telemetry_axis_ungrouped_columns))
+        menu.addAction(reset_action)
+
+        viewport = self.column_table.viewport()
+        if viewport is None:
+            return
+        chosen = menu.exec(viewport.mapToGlobal(position))
+        if chosen == group_action:
+            self.group_selected_telemetry_axis_columns()
+        elif chosen == ungroup_action:
+            self.ungroup_selected_telemetry_axis_columns()
+        elif chosen == reset_action:
+            self.reset_telemetry_axis_grouping()
+
+    def group_selected_telemetry_axis_columns(self) -> None:
+        columns = self._selected_column_table_columns()
+        if len(columns) < 2:
+            return
+        selected = set(columns)
+        next_groups: list[tuple[str, ...]] = []
+        for group in self.telemetry_axis_groups:
+            remaining = tuple(column for column in group if column not in selected)
+            if len(remaining) >= 2:
+                next_groups.append(remaining)
+        next_groups.append(tuple(columns))
+        self.telemetry_axis_groups = next_groups
+        self.telemetry_axis_ungrouped_columns.difference_update(selected)
+        self.refresh_graph()
+        self.status.showMessage(f"Grouped {len(columns)} telemetry parameters on one Y axis")
+
+    def ungroup_selected_telemetry_axis_columns(self) -> None:
+        columns = self._selected_column_table_columns()
+        if not columns:
+            return
+        selected = set(columns)
+        next_groups: list[tuple[str, ...]] = []
+        for group in self.telemetry_axis_groups:
+            remaining = tuple(column for column in group if column not in selected)
+            if len(remaining) >= 2:
+                next_groups.append(remaining)
+        self.telemetry_axis_groups = next_groups
+        self.telemetry_axis_ungrouped_columns.update(selected)
+        self.refresh_graph()
+        self.status.showMessage(f"Ungrouped {len(columns)} telemetry parameters for this session")
+
+    def reset_telemetry_axis_grouping(self, refresh: bool = True) -> None:
+        self.telemetry_axis_groups = []
+        self.telemetry_axis_ungrouped_columns = set()
+        if refresh:
+            self.refresh_graph()
+            self.status.showMessage("Reset telemetry Y-axis grouping overrides")
 
     def initialize_selected_parameters(self) -> None:
         if self.current_log is None:
@@ -1473,6 +1564,8 @@ class MainWindow(QMainWindow):
             interaction_mode=self.telemetry_interaction_mode,
             time_mode=self.telemetry_time_mode,
             x_axis_range=self._telemetry_elapsed_range_to_axis_range(),
+            manual_axis_groups=self.telemetry_axis_groups,
+            ungrouped_axis_columns=tuple(sorted(self.telemetry_axis_ungrouped_columns)),
         )
 
     def refresh_gps(self, *_args, force: bool = False) -> None:

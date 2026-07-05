@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from html import escape
 import math
 import re
@@ -42,6 +43,7 @@ COLORS = [
 DEFAULT_PATH_COLOR = "#55d977"
 MISSING_VALUE_COLOR = "#9ca3af"
 HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+TELEMETRY_UNIT_RE = re.compile(r"\(([^()]+)\)\s*$")
 MAX_TELEMETRY_TRACE_POINTS_HARD_CAP = 12000
 MIN_TELEMETRY_TRACE_POINTS = 2000
 TELEMETRY_SAMPLES_PER_PIXEL = 4
@@ -61,6 +63,13 @@ MAX_GPS_JUMP_KM = 1000.0
 # A tiny origin tolerance catches placeholder zeros without rejecting genuine
 # coordinates that are only close to zero.
 GPS_ORIGIN_EPSILON = 1e-9
+
+
+@dataclass(frozen=True)
+class TelemetryAxisGroup:
+    columns: tuple[str, ...]
+    title: str
+    color_index: int
 
 
 def _plotly_js_uri() -> str:
@@ -111,6 +120,170 @@ def _telemetry_x_axis_domain(plotted_column_count: int) -> list[float]:
         positions[0] - TELEMETRY_RIGHT_AXIS_DOMAIN_GAP,
     )
     return [0.0, round(domain_end, 6)]
+
+
+def _telemetry_column_unit(column: str) -> str | None:
+    match = TELEMETRY_UNIT_RE.search(column.strip())
+    if match is None:
+        return None
+    unit = match.group(1).strip()
+    return unit or None
+
+
+def _telemetry_range(primary: LoadedLog, column: str) -> tuple[float, float] | None:
+    if column not in primary.dataframe.columns:
+        return None
+    series = _numeric_series(primary.dataframe, column)
+    minimum = _coerce_float(series.min())
+    maximum = _coerce_float(series.max())
+    if minimum is None or maximum is None:
+        return None
+    if maximum < minimum:
+        minimum, maximum = maximum, minimum
+    return minimum, maximum
+
+
+def _telemetry_ranges_are_similar(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> bool:
+    left_min, left_max = left
+    right_min, right_max = right
+    left_span = max(0.0, left_max - left_min)
+    right_span = max(0.0, right_max - right_min)
+    left_magnitude = max(abs(left_min), abs(left_max), 1.0)
+    right_magnitude = max(abs(right_min), abs(right_max), 1.0)
+    magnitude_ratio = max(left_magnitude, right_magnitude) / min(left_magnitude, right_magnitude)
+    if magnitude_ratio > 2.5:
+        return False
+
+    overlap = min(left_max, right_max) - max(left_min, right_min)
+    if overlap >= 0:
+        return True
+    gap = -overlap
+    tolerance = max(left_span, right_span, left_magnitude * 0.05, right_magnitude * 0.05, 1.0)
+    return gap <= tolerance
+
+
+def _telemetry_group_title(columns: Sequence[str], manual: bool = False) -> str:
+    if len(columns) == 1:
+        return columns[0]
+    units = {_telemetry_column_unit(column) for column in columns}
+    units.discard(None)
+    if len(units) == 1 and all(_telemetry_column_unit(column) in units for column in columns):
+        return f"{next(iter(units))} group"
+    return "Grouped axis" if manual else columns[0]
+
+
+def _normalise_manual_axis_groups(
+    plotted_columns: Sequence[str],
+    manual_axis_groups: Sequence[Sequence[str]] | None,
+) -> list[tuple[str, ...]]:
+    plotted = set(plotted_columns)
+    claimed: set[str] = set()
+    groups: list[tuple[str, ...]] = []
+    for group in manual_axis_groups or ():
+        columns: list[str] = []
+        seen: set[str] = set()
+        for column in group:
+            if column not in plotted or column in seen or column in claimed:
+                continue
+            columns.append(column)
+            seen.add(column)
+        if len(columns) < 2:
+            continue
+        groups.append(tuple(columns))
+        claimed.update(columns)
+    return groups
+
+
+def _resolve_telemetry_axis_groups(
+    primary: LoadedLog,
+    columns: Sequence[str],
+    manual_axis_groups: Sequence[Sequence[str]] | None = None,
+    ungrouped_axis_columns: Sequence[str] | None = None,
+) -> list[TelemetryAxisGroup]:
+    plotted_columns = list(columns[:MAX_RENDERED_TELEMETRY_TRACES])
+    column_order = {column: index for index, column in enumerate(plotted_columns)}
+    manual_groups = _normalise_manual_axis_groups(plotted_columns, manual_axis_groups)
+    manual_columns = {column for group in manual_groups for column in group}
+    ungrouped_columns = set(ungrouped_axis_columns or ()) & set(plotted_columns)
+    ungrouped_columns -= manual_columns
+
+    groups: list[TelemetryAxisGroup] = []
+    consumed = set(manual_columns)
+    for group in manual_groups:
+        groups.append(
+            TelemetryAxisGroup(
+                columns=group,
+                title=_telemetry_group_title(group, manual=True),
+                color_index=column_order[group[0]],
+            )
+        )
+
+    available = [
+        column
+        for column in plotted_columns
+        if column not in consumed and column not in ungrouped_columns
+    ]
+    auto_consumed: set[str] = set()
+    ranges = {column: _telemetry_range(primary, column) for column in available}
+    units = {column: _telemetry_column_unit(column) for column in available}
+    for column in available:
+        if column in auto_consumed:
+            continue
+        auto_consumed.add(column)
+        group = [column]
+        unit = units[column]
+        column_range = ranges[column]
+        if unit is not None and column_range is not None:
+            for candidate in available:
+                if candidate in auto_consumed or units[candidate] != unit:
+                    continue
+                candidate_range = ranges[candidate]
+                if candidate_range is None:
+                    continue
+                if all(_telemetry_ranges_are_similar(ranges[member] or column_range, candidate_range) for member in group):
+                    group.append(candidate)
+                    auto_consumed.add(candidate)
+        groups.append(
+            TelemetryAxisGroup(
+                columns=tuple(group),
+                title=_telemetry_group_title(group),
+                color_index=column_order[group[0]],
+            )
+        )
+
+    for column in plotted_columns:
+        if column in consumed or column in auto_consumed:
+            continue
+        groups.append(
+            TelemetryAxisGroup(
+                columns=(column,),
+                title=column,
+                color_index=column_order[column],
+            )
+        )
+
+    return sorted(groups, key=lambda group: column_order[group.columns[0]])
+
+
+def _telemetry_axis_group_count(
+    primary: LoadedLog | None,
+    columns: Sequence[str],
+    manual_axis_groups: Sequence[Sequence[str]] | None = None,
+    ungrouped_axis_columns: Sequence[str] | None = None,
+) -> int:
+    if primary is None:
+        return min(len(columns), MAX_RENDERED_TELEMETRY_TRACES)
+    return len(
+        _resolve_telemetry_axis_groups(
+            primary,
+            columns,
+            manual_axis_groups=manual_axis_groups,
+            ungrouped_axis_columns=ungrouped_axis_columns,
+        )
+    )
 
 
 def _normalise_gps_scope(
@@ -382,6 +555,8 @@ def build_telemetry_figure(
     time_mode: str = "absolute",
     max_trace_points: int = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
     x_axis_range: tuple[object, object] | None = None,
+    manual_axis_groups: Sequence[Sequence[str]] | None = None,
+    ungrouped_axis_columns: Sequence[str] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if primary is None:
@@ -398,6 +573,17 @@ def build_telemetry_figure(
     x = _telemetry_x_values(primary, time_mode)
     plotted_columns = columns[:MAX_RENDERED_TELEMETRY_TRACES]
     hidden_trace_count = max(0, len(columns) - len(plotted_columns))
+    axis_groups = _resolve_telemetry_axis_groups(
+        primary,
+        plotted_columns,
+        manual_axis_groups=manual_axis_groups,
+        ungrouped_axis_columns=ungrouped_axis_columns,
+    )
+    axis_by_column = {
+        column: _axis_name(axis_index)
+        for axis_index, group in enumerate(axis_groups)
+        for column in group.columns
+    }
     for idx, col in enumerate(plotted_columns):
         if col not in primary.dataframe.columns:
             continue
@@ -407,7 +593,7 @@ def build_telemetry_figure(
         primary_x = [x[index] for index in primary_indices] if primary_indices else []
         trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
         color = COLORS[idx % len(COLORS)]
-        axis = _axis_name(idx)
+        axis = axis_by_column.get(col, _axis_name(idx))
         fig.add_trace(
             trace_class(
                 x=primary_x,
@@ -448,31 +634,31 @@ def build_telemetry_figure(
         "dragmode": interaction_mode if interaction_mode in {"pan", "zoom"} else "zoom",
         "margin": {
             "l": TELEMETRY_MARGIN_LEFT,
-            "r": _telemetry_right_margin(len(plotted_columns)),
+            "r": _telemetry_right_margin(len(axis_groups)),
             "t": TELEMETRY_MARGIN_TOP,
             "b": TELEMETRY_MARGIN_BOTTOM,
         },
         "legend": {"orientation": "h", "y": 1.08, "x": 0},
         "xaxis": {
             "title": "Time" if time_mode == "absolute" and primary.time is not None else "Elapsed time",
-            "domain": _telemetry_x_axis_domain(len(plotted_columns)),
+            "domain": _telemetry_x_axis_domain(len(axis_groups)),
             "showgrid": show_grid,
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         },
     }
     if x_axis_range is not None:
         layout["xaxis"]["range"] = [x_axis_range[0], x_axis_range[1]]
-    right_axis_positions = _telemetry_right_axis_positions(len(plotted_columns))
-    for idx, col in enumerate(plotted_columns):
+    right_axis_positions = _telemetry_right_axis_positions(len(axis_groups))
+    for idx, group in enumerate(axis_groups):
         axis_key = "yaxis" if idx == 0 else f"yaxis{idx + 1}"
         axis_is_visible = idx < MAX_VISIBLE_TELEMETRY_AXES
         axis = {
             "title": {
-                "text": col if axis_is_visible else "",
-                "font": {"color": COLORS[idx % len(COLORS)]},
+                "text": group.title if axis_is_visible else "",
+                "font": {"color": COLORS[group.color_index % len(COLORS)]},
                 "standoff": 8,
             },
-            "tickfont": {"color": COLORS[idx % len(COLORS)], "size": 10 if idx > 0 else 11},
+            "tickfont": {"color": COLORS[group.color_index % len(COLORS)], "size": 10 if idx > 0 else 11},
             "showticklabels": axis_is_visible,
             "ticks": "outside" if axis_is_visible else "",
             "ticklen": 4,
