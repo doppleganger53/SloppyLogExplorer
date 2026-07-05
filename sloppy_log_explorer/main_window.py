@@ -4,7 +4,7 @@ import html
 import math
 import time
 import traceback
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from datetime import datetime
 from pathlib import Path
 
@@ -821,11 +821,12 @@ class MainWindow(QMainWindow):
                 columns.append(column)
         return columns[:4]
 
-    def _gps_marker_values(self) -> list[dict[str, object]]:
+    def _gps_marker_values(self, index: int | None = None) -> list[dict[str, object]]:
         if self.current_log is None:
             return []
         values: list[dict[str, object]] = []
-        row_index = max(0, min(self.selected_index, len(self.current_log.dataframe) - 1))
+        selected_index = self.selected_index if index is None else index
+        row_index = max(0, min(selected_index, len(self.current_log.dataframe) - 1))
         for column in self._gps_marker_columns():
             value = self.current_log.dataframe[column].iloc[row_index]
             if pd.isna(value):
@@ -837,19 +838,34 @@ class MainWindow(QMainWindow):
             values.append({"label": column, "value": clean_value})
         return values
 
+    def _selected_index_in_elapsed_scope(self, index: int) -> int:
+        if self.current_log is None:
+            return index
+        scoped_index = max(0, min(index, len(self.current_log.dataframe) - 1))
+        if self.telemetry_visible_elapsed_range is not None:
+            scoped_index = self._clamp_index_to_elapsed_scope(
+                self.telemetry_visible_elapsed_range,
+                scoped_index,
+            )
+        return scoped_index
+
     def _gps_cursor_payload(self) -> dict[str, object]:
-        elapsed = self.gps_playback_elapsed_seconds if self.gps_playback_playing else self._gps_elapsed_for_index(self.selected_index)
+        selected_index = self._selected_index_in_elapsed_scope(self.selected_index)
         scope_start, scope_end = self._gps_playback_scope_bounds()
+        if self.gps_playback_playing:
+            elapsed = max(scope_start, min(self.gps_playback_elapsed_seconds, scope_end))
+        else:
+            elapsed = self._gps_elapsed_for_index(selected_index)
         return {
-            "index": self.selected_index,
-            "row": self.selected_index + 1,
+            "index": selected_index,
+            "row": selected_index + 1,
             "elapsedSeconds": elapsed,
             "durationSeconds": max(0.0, scope_end - scope_start),
             "scopeStartSeconds": scope_start,
             "scopeEndSeconds": scope_end,
             "playing": self.gps_playback_playing,
             "speed": self.gps_playback_speed,
-            "values": self._gps_marker_values(),
+            "values": self._gps_marker_values(selected_index),
         }
 
     def sync_gps_cursor(self) -> None:
@@ -880,7 +896,10 @@ class MainWindow(QMainWindow):
             current_elapsed = self._gps_elapsed_for_index(self.selected_index)
             if current_elapsed < scope_start or current_elapsed > scope_end:
                 self.gps_playback_elapsed_seconds = scope_start
-                self.set_selected_index(self._nearest_gps_index(scope_start), sync_playback_elapsed=False)
+                self.set_selected_index(
+                    self._clamp_index_to_elapsed_scope((scope_start, scope_end)),
+                    sync_playback_elapsed=False,
+                )
             else:
                 self.gps_playback_elapsed_seconds = current_elapsed
         if self.gps_playback_playing:
@@ -1267,9 +1286,16 @@ class MainWindow(QMainWindow):
 
     def commit_column_selection(self) -> None:
         cols = self.selected_columns()
+        cleared_visible_scope = False
+        if not cols and self.telemetry_visible_elapsed_range is not None:
+            self.telemetry_visible_elapsed_range = None
+            cleared_visible_scope = True
         self.store.set_setting("selected_columns", cols)
         self.update_summary()
         self.refresh_graph()
+        if cleared_visible_scope:
+            self.refresh_gps()
+            self.sync_gps_cursor()
         self.update_info_panel()
 
     def update_summary(self) -> None:
@@ -1354,14 +1380,53 @@ class MainWindow(QMainWindow):
                 )
         return start_elapsed, end_elapsed
 
-    def _clamp_index_to_elapsed_scope(self, scope: tuple[float, float]) -> int:
+    def _gps_index_at_or_after_elapsed(self, elapsed_seconds: float, scope_end: float | None = None) -> int | None:
+        if not self.gps_timeline_seconds:
+            return None
+        if self.gps_timeline_is_monotonic:
+            index = bisect_left(self.gps_timeline_seconds, elapsed_seconds)
+            if index < len(self.gps_timeline_seconds):
+                value = self.gps_timeline_seconds[index]
+                if scope_end is None or value <= scope_end:
+                    return index
+            return None
+        for index, value in enumerate(self.gps_timeline_seconds):
+            if value >= elapsed_seconds and (scope_end is None or value <= scope_end):
+                return index
+        return None
+
+    def _gps_index_at_or_before_elapsed(self, elapsed_seconds: float, scope_start: float | None = None) -> int | None:
+        if not self.gps_timeline_seconds:
+            return None
+        if self.gps_timeline_is_monotonic:
+            index = bisect_right(self.gps_timeline_seconds, elapsed_seconds) - 1
+            if index >= 0:
+                value = self.gps_timeline_seconds[index]
+                if scope_start is None or value >= scope_start:
+                    return index
+            return None
+        for index in range(len(self.gps_timeline_seconds) - 1, -1, -1):
+            value = self.gps_timeline_seconds[index]
+            if value <= elapsed_seconds and (scope_start is None or value >= scope_start):
+                return index
+        return None
+
+    def _clamp_index_to_elapsed_scope(self, scope: tuple[float, float], index: int | None = None) -> int:
         if self.current_log is None:
-            return self.selected_index
-        current_elapsed = self._gps_elapsed_for_index(self.selected_index)
-        if scope[0] <= current_elapsed <= scope[1]:
-            return self.selected_index
-        boundary = scope[0] if current_elapsed < scope[0] else scope[1]
-        return self._nearest_gps_index(boundary)
+            return self.selected_index if index is None else index
+        selected_index = self.selected_index if index is None else index
+        selected_index = max(0, min(selected_index, len(self.current_log.dataframe) - 1))
+        scope_start, scope_end = scope
+        current_elapsed = self._gps_elapsed_for_index(selected_index)
+        if scope_start <= current_elapsed <= scope_end:
+            return selected_index
+        if current_elapsed < scope_start:
+            scoped_index = self._gps_index_at_or_after_elapsed(scope_start, scope_end)
+        else:
+            scoped_index = self._gps_index_at_or_before_elapsed(scope_end, scope_start)
+        if scoped_index is not None:
+            return scoped_index
+        return selected_index
 
     def set_telemetry_visible_x_range(self, start: object, end: object) -> None:
         next_range = self._normalise_telemetry_elapsed_range(start, end)
@@ -1451,7 +1516,7 @@ class MainWindow(QMainWindow):
     def set_selected_index(self, index: int, sync_playback_elapsed: bool = True) -> None:
         if self.current_log is None:
             return
-        self.selected_index = max(0, min(index, len(self.current_log.dataframe) - 1))
+        self.selected_index = self._selected_index_in_elapsed_scope(index)
         if sync_playback_elapsed:
             self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
         self.update_info_panel()

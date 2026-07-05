@@ -712,7 +712,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       const sliderValue = duration > 0 ? Math.round(((elapsed - scopeStart) / duration) * 1000) : 0;
       playbackSlider.value = String(sliderValue);
       playbackCurrent.textContent = formatElapsed(elapsed);
-      playbackDuration.textContent = formatElapsed(duration);
+      playbackDuration.textContent = formatElapsed(scopeEnd);
       playPauseButton.textContent = currentCursor.playing ? "Pause" : "Play";
       if (playbackSpeed) {
         playbackSpeed.value = String(currentCursor.speed || 1);
