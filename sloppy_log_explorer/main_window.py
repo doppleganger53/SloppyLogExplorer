@@ -1429,7 +1429,7 @@ class MainWindow(QMainWindow):
         return selected_index
 
     def set_telemetry_visible_x_range(self, start: object, end: object) -> None:
-        next_range = self._normalise_telemetry_elapsed_range(start, end)
+        next_range = None if not self.selected_columns() else self._normalise_telemetry_elapsed_range(start, end)
         previous_range = self.telemetry_visible_elapsed_range
         if previous_range is not None and next_range is not None:
             if abs(previous_range[0] - next_range[0]) < 0.01 and abs(previous_range[1] - next_range[1]) < 0.01:

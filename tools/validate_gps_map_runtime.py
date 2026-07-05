@@ -108,6 +108,18 @@ def _image_metrics(image: Any) -> dict[str, int]:
     }
 
 
+def _gps_runtime_options(
+    color_column: str | None,
+    scope_start_seconds: float,
+    scope_end_seconds: float,
+) -> GpsGradientOptions:
+    return GpsGradientOptions(
+        color_column=color_column,
+        scope_start_seconds=scope_start_seconds,
+        scope_end_seconds=scope_end_seconds,
+    )
+
+
 def validate_gps_map_runtime(
     log_path: Path,
     color_column: str | None,
@@ -142,7 +154,11 @@ def validate_gps_map_runtime(
         scope_end = duration
     cursor_elapsed = scope_start + max(0.0, min(1.0, scope_end - scope_start))
 
-    options = GpsGradientOptions(color_column=color_column)
+    options = _gps_runtime_options(
+        color_column=color_column,
+        scope_start_seconds=scope_start,
+        scope_end_seconds=scope_end,
+    )
     html_path = state_root / "gps-map-runtime.html"
     # Write the HTML to disk so the page exercises the same file:// loading
     # path that the desktop widget uses.

@@ -1845,6 +1845,12 @@ def test_main_window_empty_telemetry_selection_clears_gps_scope(
     assert cursor_payloads[-1]["scopeStartSeconds"] == pytest.approx(0.0)
     assert cursor_payloads[-1]["scopeEndSeconds"] == pytest.approx(8.0)
 
+    gps_refresh_count = len(gps_refreshes)
+    window.set_telemetry_visible_x_range(2.0, 5.0)
+
+    assert window.telemetry_visible_elapsed_range is None
+    assert len(gps_refreshes) == gps_refresh_count
+
     window.close()
     app.quit()
 
