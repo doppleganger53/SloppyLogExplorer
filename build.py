@@ -4,31 +4,77 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import shutil
-import sys
 from pathlib import Path
-
-import PyInstaller.__main__
+from typing import Literal
 
 
 APP_NAME = "SloppyLogExplorer"
+BUILD_TARGETS = ("minimal", "debug")
+BuildTarget = Literal["minimal", "debug"]
+
+QT_WEBENGINE_HIDDEN_IMPORTS = (
+    "PyQt6.QtWebChannel",
+    "PyQt6.QtWebEngineCore",
+    "PyQt6.QtWebEngineWidgets",
+    "PyQt6.QtPrintSupport",
+)
+PYTTSX3_HIDDEN_IMPORTS = (
+    "pyttsx3.drivers",
+    "pyttsx3.drivers.sapi5",
+)
+MINIMAL_PLOTLY_HIDDEN_IMPORTS = (
+    "plotly.graph_objects",
+    "plotly.offline",
+    "plotly.io",
+    "plotly.io._templates",
+)
+MINIMAL_EXCLUDED_MODULES = (
+    "IPython",
+    "ipywidgets",
+    "jupyterlab",
+    "kaleido",
+    "matplotlib",
+    "notebook",
+    "plotly.io.kaleido",
+    "plotly.matplotlylib",
+)
+MINIMAL_PRUNE_FILENAMES = frozenset(
+    {
+        "qtwebengine_devtools_resources.debug.pak",
+        "qtwebengine_devtools_resources.pak",
+    }
+)
 
 
-def build(one_file: bool = False, clean: bool = False) -> int:
-    project_root = Path(__file__).resolve().parent
+def _flag_values(flag: str, values: tuple[str, ...]) -> list[str]:
+    args: list[str] = []
+    for value in values:
+        args.extend([flag, value])
+    return args
+
+
+def _add_data_arg(source: Path, destination: str) -> str:
+    return f"{source}{os.pathsep}{destination}"
+
+
+def _package_file(package: str, relative_path: Path) -> Path:
+    spec = importlib.util.find_spec(package)
+    if spec is None or spec.origin is None:
+        raise RuntimeError(f"Package is not importable: {package}")
+    package_root = Path(spec.origin).resolve().parent
+    path = package_root / relative_path
+    if not path.exists():
+        raise RuntimeError(f"Package data file not found: {path}")
+    return path
+
+
+def _base_pyinstaller_args(project_root: Path, one_file: bool) -> list[str]:
     dist_dir = project_root / "dist"
     build_dir = project_root / "build"
     assets_dir = project_root / "sloppy_log_explorer" / "assets"
-
-    if clean:
-        # Clean only the local build outputs so a stale spec or previous dist
-        # tree does not mask packaging changes during a fresh run.
-        shutil.rmtree(dist_dir, ignore_errors=True)
-        shutil.rmtree(build_dir, ignore_errors=True)
-        spec_file = project_root / f"{APP_NAME}.spec"
-        if spec_file.exists():
-            spec_file.unlink()
 
     args = [
         str(project_root / "main.py"),
@@ -43,43 +89,120 @@ def build(one_file: bool = False, clean: bool = False) -> int:
         str(build_dir),
         "--specpath",
         str(project_root),
-        "--collect-all",
-        "plotly",
-        # Kaleido and pyttsx3 both need extra data or submodule collection for
-        # the packaged app to render charts and synthesize speech reliably.
-        "--collect-data",
-        "kaleido",
         "--add-data",
-        f"{assets_dir}{os.pathsep}sloppy_log_explorer/assets",
-        "--collect-submodules",
-        "pyttsx3",
-        "--hidden-import",
-        "PyQt6.QtWebChannel",
-        "--hidden-import",
-        "PyQt6.QtWebEngineCore",
-        "--hidden-import",
-        "PyQt6.QtWebEngineWidgets",
-        "--hidden-import",
-        "PyQt6.QtPrintSupport",
-        "--hidden-import",
-        "pyttsx3.drivers",
-        "--hidden-import",
-        "pyttsx3.drivers.sapi5",
+        _add_data_arg(assets_dir, "sloppy_log_explorer/assets"),
     ]
 
     icon = project_root / "icon.ico"
     if icon.exists():
         args.extend(["--icon", str(icon)])
+    return args
+
+
+def _qt_webengine_args() -> list[str]:
+    return _flag_values("--hidden-import", QT_WEBENGINE_HIDDEN_IMPORTS)
+
+
+def _voice_args() -> list[str]:
+    return [
+        "--collect-submodules",
+        "pyttsx3",
+        *_flag_values("--hidden-import", PYTTSX3_HIDDEN_IMPORTS),
+    ]
+
+
+def _minimal_plotly_args() -> list[str]:
+    plotly_js = _package_file("plotly", Path("package_data") / "plotly.min.js")
+    return [
+        "--add-data",
+        _add_data_arg(plotly_js, "plotly/package_data"),
+        *_flag_values("--hidden-import", MINIMAL_PLOTLY_HIDDEN_IMPORTS),
+        *_flag_values("--exclude-module", MINIMAL_EXCLUDED_MODULES),
+    ]
+
+
+def _debug_plotly_args() -> list[str]:
+    # Keep the broad Plotly collection available for packaging diagnostics.
+    # It can surface optional-import warnings such as plotly.matplotlylib when
+    # matplotlib is absent; the minimal target avoids that path.
+    return ["--collect-all", "plotly"]
+
+
+def _target_pyinstaller_args(target: BuildTarget) -> list[str]:
+    if target == "minimal":
+        return [
+            *_minimal_plotly_args(),
+            *_voice_args(),
+            *_qt_webengine_args(),
+        ]
+    if target == "debug":
+        return [
+            *_debug_plotly_args(),
+            *_voice_args(),
+            *_qt_webengine_args(),
+        ]
+    raise ValueError(f"Unsupported build target: {target}")
+
+
+def build_pyinstaller_args(project_root: Path, one_file: bool = False, target: BuildTarget = "minimal") -> list[str]:
+    return [
+        *_base_pyinstaller_args(project_root, one_file),
+        *_target_pyinstaller_args(target),
+    ]
+
+
+def _clean_build_outputs(project_root: Path) -> None:
+    dist_dir = project_root / "dist"
+    build_dir = project_root / "build"
+    spec_file = project_root / f"{APP_NAME}.spec"
+
+    shutil.rmtree(dist_dir, ignore_errors=True)
+    shutil.rmtree(build_dir, ignore_errors=True)
+    if spec_file.exists():
+        spec_file.unlink()
+
+
+def _prune_minimal_onedir_dist(app_dir: Path) -> list[Path]:
+    if not app_dir.exists():
+        return []
+    removed: list[Path] = []
+    for path in app_dir.rglob("*"):
+        if path.is_file() and path.name in MINIMAL_PRUNE_FILENAMES:
+            path.unlink()
+            removed.append(path)
+    return removed
+
+
+def _exe_path(project_root: Path, one_file: bool) -> Path:
+    dist_dir = project_root / "dist"
+    if one_file:
+        return dist_dir / f"{APP_NAME}.exe"
+    return dist_dir / APP_NAME / f"{APP_NAME}.exe"
+
+
+def build(one_file: bool = False, clean: bool = False, target: BuildTarget = "minimal") -> int:
+    project_root = Path(__file__).resolve().parent
+    dist_dir = project_root / "dist"
+
+    if clean:
+        # Clean only the local build outputs so a stale spec or previous dist
+        # tree does not mask packaging changes during a fresh run.
+        _clean_build_outputs(project_root)
+
+    args = build_pyinstaller_args(project_root, one_file=one_file, target=target)
 
     print("=" * 72)
     print(f"Building {APP_NAME}")
     print("=" * 72)
+    print(f"Target: {target}")
     print(f"Mode: {'single executable' if one_file else 'directory'}")
     print(f"Project: {project_root}")
     print(f"Output:  {dist_dir}")
     print()
 
     try:
+        import PyInstaller.__main__
+
         PyInstaller.__main__.run(args)
     except Exception as exc:
         print()
@@ -87,10 +210,11 @@ def build(one_file: bool = False, clean: bool = False) -> int:
         print(str(exc))
         return 1
 
-    if one_file:
-        exe_path = dist_dir / f"{APP_NAME}.exe"
-    else:
-        exe_path = dist_dir / APP_NAME / f"{APP_NAME}.exe"
+    pruned: list[Path] = []
+    if target == "minimal" and not one_file:
+        pruned = _prune_minimal_onedir_dist(dist_dir / APP_NAME)
+
+    exe_path = _exe_path(project_root, one_file)
 
     print()
     print("=" * 72)
@@ -99,12 +223,20 @@ def build(one_file: bool = False, clean: bool = False) -> int:
     print(f"Executable: {exe_path}")
     if exe_path.exists():
         print(f"Size:       {exe_path.stat().st_size / (1024 * 1024):.1f} MB")
+    if pruned:
+        print(f"Pruned:     {len(pruned)} minimal-target devtools resource file(s)")
     print()
     return 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the Windows desktop executable with PyInstaller.")
+    parser.add_argument(
+        "--target",
+        choices=BUILD_TARGETS,
+        default="minimal",
+        help="Build profile: minimal end-user package or debug diagnostics package.",
+    )
     parser.add_argument("--onefile", action="store_true", help="Build one exe instead of a faster-starting dist folder.")
     parser.add_argument("--clean", action="store_true", help="Remove previous build artifacts before building.")
     return parser.parse_args()
@@ -112,4 +244,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     options = parse_args()
-    raise SystemExit(build(one_file=options.onefile, clean=options.clean))
+    raise SystemExit(build(one_file=options.onefile, clean=options.clean, target=options.target))

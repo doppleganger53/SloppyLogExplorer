@@ -28,7 +28,7 @@ if errorlevel 1 exit /b 1
 python -m pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
-python build.py --clean %*
+python build.py --clean --target minimal %*
 if errorlevel 1 exit /b 1
 
 echo.
