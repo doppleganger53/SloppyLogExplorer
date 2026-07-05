@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -51,7 +51,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
         raise AssertionError(f"not enough plottable columns selected: {selected}")
 
     fig = build_telemetry_figure(log, selected, selected_index=min(10, log.info.rows - 1))
-    if len(fig.data) < len(selected):
+    fig_data = cast(Any, fig.data)
+    if len(fig_data) < len(selected):
         raise AssertionError("telemetry figure did not create a trace for each selected column")
     html = figure_html(fig, bridge=True)
     if "plotly" not in html.lower() or "qwebchannel" not in html.lower():
@@ -62,7 +63,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
     # Reuse the same cursor logic against the compare log so the contract
     # covers both the primary view and the diff view.
     compare_fig = build_telemetry_figure(log, common, compare=compare, selected_index=min(10, log.info.rows - 1))
-    if common and len(compare_fig.data) < len(common) * 2:
+    compare_fig_data = cast(Any, compare_fig.data)
+    if common and len(compare_fig_data) < len(common) * 2:
         raise AssertionError("compare figure did not include primary and compare traces")
 
     index = min(max(1, log.info.rows // 2), log.info.rows - 1)
@@ -112,6 +114,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
             'id="playbackOverlay"',
             'id="playbackSlider"',
             'id="playbackSpeed"',
+            "scopeStartSeconds",
+            "scopeEndSeconds",
             "qrc:///qtwebchannel/qwebchannel.js",
             "function connectGpsBridge()",
             "function interpolatedPointForElapsed(elapsedSeconds)",
@@ -164,8 +168,8 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
         "duration_seconds": log.info.duration_seconds,
         "has_gps_lat_lon": log.info.has_gps,
         "selected_columns": selected,
-        "telemetry_traces": len(fig.data),
-        "compare_traces": len(compare_fig.data),
+        "telemetry_traces": len(fig_data),
+        "compare_traces": len(compare_fig_data),
         "cursor_columns": [value.column for value in cursor],
         "voltage_columns_found": voltage_columns[:8],
         "current_columns_found": current_columns[:8],
@@ -206,15 +210,18 @@ def validate_ui(
     window = MainWindow()
     window.library_root = library_root
     window.load_log(log_path)
+    current_log = window.current_log
+    if current_log is None:
+        raise AssertionError("UI did not load the requested log")
     selected = window.selected_columns()
     if not selected:
         raise AssertionError("UI did not select any columns for the loaded log")
-    window.set_selected_index(min(5, window.current_log.info.rows - 1))
+    window.set_selected_index(min(5, current_log.info.rows - 1))
     if "Cursor row" not in window.info_panel.toHtml():
         raise AssertionError("UI cursor panel did not render loaded log values")
     result = {
         "ui_title": window.windowTitle(),
-        "ui_rows": window.current_log.info.rows,
+        "ui_rows": current_log.info.rows,
         "ui_selected_columns": selected,
         "ui_state_root": str(state_root),
         "ui_platform": platform,

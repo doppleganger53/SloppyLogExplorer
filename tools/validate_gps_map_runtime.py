@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sloppy_log_explorer.models import GpsGradientOptions
-from sloppy_log_explorer.parser import load_log
+from sloppy_log_explorer.parser import load_log, relative_seconds
 from sloppy_log_explorer.plotting import build_gps_map_html
 
 
@@ -133,6 +133,15 @@ def validate_gps_map_runtime(
     if not log.info.has_gps:
         raise AssertionError(f"{log_path} does not contain detected GPS coordinates")
 
+    elapsed_values = relative_seconds(log)
+    duration = max(elapsed_values) if elapsed_values else 0.0
+    scope_start = 1.0 if duration > 3.0 else 0.0
+    scope_end = min(duration, scope_start + 3.0) if duration > scope_start else duration
+    if scope_end <= scope_start:
+        scope_start = 0.0
+        scope_end = duration
+    cursor_elapsed = scope_start + max(0.0, min(1.0, scope_end - scope_start))
+
     options = GpsGradientOptions(color_column=color_column)
     html_path = state_root / "gps-map-runtime.html"
     # Write the HTML to disk so the page exercises the same file:// loading
@@ -177,15 +186,18 @@ def validate_gps_map_runtime(
         view.close()
         raise
 
-    _run_js(
-        page,
-        (
-            "window.sloppyGpsMap.setCursor({"
-            "index:3,row:4,elapsedSeconds:3,durationSeconds:8,playing:false,speed:2,"
-            "values:[{label:'Current(A)',value:30},{label:'Alt(m)',value:16}]"
-            "}); true;"
-        ),
-    )
+    cursor_payload = {
+        "index": 3,
+        "row": 4,
+        "elapsedSeconds": cursor_elapsed,
+        "durationSeconds": max(0.0, scope_end - scope_start),
+        "scopeStartSeconds": scope_start,
+        "scopeEndSeconds": scope_end,
+        "playing": False,
+        "speed": 2,
+        "values": [{"label": "Current(A)", "value": 30}, {"label": "Alt(m)", "value": 16}],
+    }
+    _run_js(page, f"window.sloppyGpsMap.setCursor({json.dumps(cursor_payload)}); true;")
     cursor_state = _wait_for_ready_state(page)
     if cursor_state is None:
         view.close()
@@ -194,14 +206,26 @@ def validate_gps_map_runtime(
     if not isinstance(cursor, dict):
         view.close()
         raise AssertionError(f"GPS map cursor state was not reported: {cursor_state}")
-    if int(cursor.get("row") or 0) != 4 or abs(float(cursor.get("elapsedSeconds") or 0) - 3.0) > 0.1:
+    if int(cursor.get("row") or 0) != 4 or abs(float(cursor.get("elapsedSeconds") or 0) - cursor_elapsed) > 0.1:
         view.close()
         raise AssertionError(f"GPS map cursor did not update to the requested point: {cursor_state}")
+    if abs(float(cursor.get("scopeStartSeconds") or 0) - scope_start) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map cursor did not report scoped start: {cursor_state}")
+    if abs(float(cursor.get("scopeEndSeconds") or 0) - scope_end) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map cursor did not report scoped end: {cursor_state}")
     raw_playback = cursor_state.get("playback")
     playback: dict[str, Any] = raw_playback if isinstance(raw_playback, dict) else {}
     if float(playback.get("speed") or 0) != 2.0:
         view.close()
         raise AssertionError(f"GPS map playback state did not preserve requested speed: {cursor_state}")
+    if abs(float(playback.get("scopeStartSeconds") or 0) - scope_start) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map playback state did not report scoped start: {cursor_state}")
+    if abs(float(playback.get("scopeEndSeconds") or 0) - scope_end) > 0.1:
+        view.close()
+        raise AssertionError(f"GPS map playback state did not report scoped end: {cursor_state}")
 
     _run_js(
         page,
