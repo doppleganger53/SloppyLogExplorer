@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import os
 import shutil
+import textwrap
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +48,10 @@ MINIMAL_PRUNE_FILENAMES = frozenset(
         "qtwebengine_devtools_resources.pak",
     }
 )
+MINIMAL_SPEC_FILENAMES = {
+    False: f"{APP_NAME}-minimal-onedir.spec",
+    True: f"{APP_NAME}-minimal-onefile.spec",
+}
 
 
 def _flag_values(flag: str, values: tuple[str, ...]) -> list[str]:
@@ -58,6 +63,10 @@ def _flag_values(flag: str, values: tuple[str, ...]) -> list[str]:
 
 def _add_data_arg(source: Path, destination: str) -> str:
     return f"{source}{os.pathsep}{destination}"
+
+
+def _add_data_spec(source: Path, destination: str) -> tuple[str, str]:
+    return (str(source), destination)
 
 
 def _package_file(package: str, relative_path: Path) -> Path:
@@ -121,6 +130,126 @@ def _minimal_plotly_args() -> list[str]:
     ]
 
 
+def _minimal_spec_path(project_root: Path, one_file: bool) -> Path:
+    return project_root / MINIMAL_SPEC_FILENAMES[one_file]
+
+
+def _spec_build_args(project_root: Path, spec_path: Path) -> list[str]:
+    return [
+        "--noconfirm",
+        "--clean",
+        "--distpath",
+        str(project_root / "dist"),
+        "--workpath",
+        str(project_root / "build"),
+        str(spec_path),
+    ]
+
+
+def _repr_list(values: object) -> str:
+    return repr(values)
+
+
+def _minimal_spec_text(project_root: Path, one_file: bool) -> str:
+    assets_dir = project_root / "sloppy_log_explorer" / "assets"
+    plotly_js = _package_file("plotly", Path("package_data") / "plotly.min.js")
+    datas = [
+        _add_data_spec(assets_dir, "sloppy_log_explorer/assets"),
+        _add_data_spec(plotly_js, "plotly/package_data"),
+    ]
+    hidden_imports = [
+        *MINIMAL_PLOTLY_HIDDEN_IMPORTS,
+        *PYTTSX3_HIDDEN_IMPORTS,
+        *QT_WEBENGINE_HIDDEN_IMPORTS,
+    ]
+    icon = project_root / "icon.ico"
+    icon_arg = f"icon={[str(icon)]!r}," if icon.exists() else ""
+
+    exe_inputs = "a.binaries,\n    a.datas,\n    []," if one_file else "[],\n    exclude_binaries=True,"
+    collect = ""
+    if not one_file:
+        collect = f"""
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name={APP_NAME!r},
+)
+"""
+
+    spec = f"""
+# -*- mode: python ; coding: utf-8 -*-
+import os
+
+from PyInstaller.utils.hooks import collect_submodules
+
+hiddenimports = {_repr_list(hidden_imports)}
+hiddenimports += collect_submodules('pyttsx3')
+
+MINIMAL_DEVTOOLS_RESOURCE_FILENAMES = {sorted(MINIMAL_PRUNE_FILENAMES)!r}
+
+
+def _is_minimal_devtools_resource(entry):
+    for value in entry[:2]:
+        if os.path.basename(str(value)).lower() in MINIMAL_DEVTOOLS_RESOURCE_FILENAMES:
+            return True
+    return False
+
+
+def _without_minimal_devtools(entries):
+    return type(entries)(entry for entry in entries if not _is_minimal_devtools_resource(entry))
+
+
+a = Analysis(
+    [{str(project_root / "main.py")!r}],
+    pathex=[{str(project_root)!r}],
+    binaries=[],
+    datas={_repr_list(datas)},
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={{}},
+    runtime_hooks=[],
+    excludes={_repr_list(list(MINIMAL_EXCLUDED_MODULES))},
+    noarchive=False,
+    optimize=0,
+)
+a.datas = _without_minimal_devtools(a.datas)
+a.binaries = _without_minimal_devtools(a.binaries)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    {exe_inputs}
+    name={APP_NAME!r},
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    {"runtime_tmpdir=None," if one_file else ""}
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    {icon_arg}
+)
+{collect}
+"""
+    return textwrap.dedent(spec).lstrip()
+
+
+def _write_minimal_spec(project_root: Path, one_file: bool) -> Path:
+    spec_path = _minimal_spec_path(project_root, one_file)
+    spec_path.write_text(_minimal_spec_text(project_root, one_file), encoding="utf-8")
+    return spec_path
+
+
 def _debug_plotly_args() -> list[str]:
     # Keep the broad Plotly collection available for packaging diagnostics.
     # It can surface optional-import warnings such as plotly.matplotlylib when
@@ -145,6 +274,9 @@ def _target_pyinstaller_args(target: BuildTarget) -> list[str]:
 
 
 def build_pyinstaller_args(project_root: Path, one_file: bool = False, target: BuildTarget = "minimal") -> list[str]:
+    if target == "minimal":
+        spec_path = _write_minimal_spec(project_root, one_file)
+        return _spec_build_args(project_root, spec_path)
     return [
         *_base_pyinstaller_args(project_root, one_file),
         *_target_pyinstaller_args(target),
@@ -160,6 +292,10 @@ def _clean_build_outputs(project_root: Path) -> None:
     shutil.rmtree(build_dir, ignore_errors=True)
     if spec_file.exists():
         spec_file.unlink()
+    for filename in MINIMAL_SPEC_FILENAMES.values():
+        generated_spec = project_root / filename
+        if generated_spec.exists():
+            generated_spec.unlink()
 
 
 def _prune_minimal_onedir_dist(app_dir: Path) -> list[Path]:
