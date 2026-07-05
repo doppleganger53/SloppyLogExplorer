@@ -153,6 +153,7 @@ class MainWindow(QMainWindow):
         self.selected_parameter_columns: set[str] = set()
         self.statistics_excluded_columns: set[str] = set()
         self._deferred_views_dirty: set[str] = set()
+        self._gps_view_loaded = False
         self.gps_start_color = GpsGradientOptions.start_color
         self.gps_end_color = GpsGradientOptions.end_color
         self.gps_playback_playing = False
@@ -483,7 +484,6 @@ class MainWindow(QMainWindow):
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
         self.populate_gps_value_combos()
-        self.gps_view.set_path(None, dark=self.dark_mode)
 
     def _build_flight_tab(self) -> None:
         tab = QWidget()
@@ -1478,6 +1478,7 @@ class MainWindow(QMainWindow):
             options=self._gps_gradient_options(),
             dark=self.dark_mode,
         )
+        self._gps_view_loaded = True
         self.sync_gps_cursor()
 
     def tab_changed(self, index: int) -> None:
@@ -1491,7 +1492,7 @@ class MainWindow(QMainWindow):
             if "flight_notes" in self._deferred_views_dirty:
                 self._refresh_flight_notes_if_visible(force=True)
         if hasattr(self, "gps_tab") and self.tabs.widget(index) is self.gps_tab:
-            if "gps" in self._deferred_views_dirty:
+            if not self._gps_view_loaded or "gps" in self._deferred_views_dirty:
                 self.refresh_gps(force=True)
             self.gps_view.refresh_viewport(fit=True)
 

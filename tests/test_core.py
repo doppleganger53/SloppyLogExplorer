@@ -2082,6 +2082,38 @@ def test_load_log_defers_gps_map_until_flight_map_tab_opens(
     app.quit()
 
 
+def test_main_window_construction_defers_initial_gps_map_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    gps_refreshes: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+    def record_gps_refresh(widget, *args, **kwargs) -> None:
+        gps_refreshes.append((widget, args, kwargs))
+
+    monkeypatch.setattr(GpsPathWidget, "set_path", record_gps_refresh)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    assert gps_refreshes == []
+    assert window._gps_view_loaded is False
+
+    window.tabs.setCurrentWidget(window.gps_tab)
+
+    assert len(gps_refreshes) == 1
+    assert gps_refreshes[0][1][0] is None
+    assert window._gps_view_loaded is True
+
+    window.close()
+    app.quit()
+
+
 def test_gps_tab_has_no_map_mode_selector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app_root = tmp_path / "appdata"
     monkeypatch.setenv("APPDATA", str(app_root))
