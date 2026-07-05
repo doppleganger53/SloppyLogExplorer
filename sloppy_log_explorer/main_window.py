@@ -1360,6 +1360,13 @@ class MainWindow(QMainWindow):
             return None
         timeline_start = min(elapsed_values)
         timeline_end = max(elapsed_values)
+        if timeline_end <= timeline_start:
+            return None
+        empty_scope_width = min(0.001, (timeline_end - timeline_start) / 1000.0)
+        if end_elapsed < timeline_start:
+            return timeline_start, timeline_start + empty_scope_width
+        if start_elapsed > timeline_end:
+            return timeline_end - empty_scope_width, timeline_end
         start_elapsed = max(timeline_start, min(start_elapsed, timeline_end))
         end_elapsed = max(timeline_start, min(end_elapsed, timeline_end))
         if end_elapsed <= start_elapsed:

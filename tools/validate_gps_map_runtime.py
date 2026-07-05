@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -120,6 +121,65 @@ def _gps_runtime_options(
     )
 
 
+def _coerce_finite_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _valid_gps_elapsed_values(log: Any, elapsed_values: list[float]) -> list[float]:
+    gps = log.gps_columns
+    if gps is None:
+        return []
+
+    df = log.dataframe
+    valid: list[float] = []
+    for row_index in range(min(len(df), len(elapsed_values))):
+        lat = _coerce_finite_float(df[gps.latitude].iloc[row_index])
+        lon = _coerce_finite_float(df[gps.longitude].iloc[row_index])
+        if lat is None or lon is None:
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        if lat == 0.0 and lon == 0.0:
+            continue
+        elapsed = _coerce_finite_float(elapsed_values[row_index])
+        if elapsed is not None:
+            valid.append(elapsed)
+    return valid
+
+
+def _fallback_scope(elapsed_values: list[float]) -> tuple[float, float]:
+    duration = max(elapsed_values) if elapsed_values else 0.0
+    scope_start = 1.0 if duration > 3.0 else 0.0
+    scope_end = min(duration, scope_start + 3.0) if duration > scope_start else duration
+    if scope_end <= scope_start:
+        return 0.0, duration
+    return scope_start, scope_end
+
+
+def _gps_validation_scope(log: Any, elapsed_values: list[float]) -> tuple[float, float]:
+    duration = max(elapsed_values) if elapsed_values else 0.0
+    valid_elapsed = _valid_gps_elapsed_values(log, elapsed_values)
+    if len(valid_elapsed) < 2:
+        return _fallback_scope(elapsed_values)
+
+    for index, scope_start in enumerate(valid_elapsed[:-1]):
+        scope_end = min(duration, scope_start + 3.0)
+        if scope_end <= scope_start:
+            continue
+        if any(scope_start <= elapsed <= scope_end for elapsed in valid_elapsed[index + 1 :]):
+            return scope_start, scope_end
+
+    scope_start = valid_elapsed[0]
+    scope_end = valid_elapsed[-1]
+    if scope_end > scope_start:
+        return scope_start, scope_end
+    return _fallback_scope(elapsed_values)
+
+
 def validate_gps_map_runtime(
     log_path: Path,
     color_column: str | None,
@@ -146,12 +206,7 @@ def validate_gps_map_runtime(
         raise AssertionError(f"{log_path} does not contain detected GPS coordinates")
 
     elapsed_values = relative_seconds(log)
-    duration = max(elapsed_values) if elapsed_values else 0.0
-    scope_start = 1.0 if duration > 3.0 else 0.0
-    scope_end = min(duration, scope_start + 3.0) if duration > scope_start else duration
-    if scope_end <= scope_start:
-        scope_start = 0.0
-        scope_end = duration
+    scope_start, scope_end = _gps_validation_scope(log, elapsed_values)
     cursor_elapsed = scope_start + max(0.0, min(1.0, scope_end - scope_start))
 
     options = _gps_runtime_options(

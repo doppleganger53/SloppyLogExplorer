@@ -1807,6 +1807,61 @@ def test_main_window_relative_x_range_scopes_gps_and_clamps_cursor(
     app.quit()
 
 
+@pytest.mark.parametrize(
+    ("range_start", "range_end", "expected_scope", "expected_index"),
+    [
+        (-10.0, -5.0, (0.0, 0.001), 0),
+        (20.0, 25.0, (7.999, 8.0), 8),
+    ],
+)
+def test_main_window_out_of_log_x_range_keeps_empty_gps_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    range_start: float,
+    range_end: float,
+    expected_scope: tuple[float, float],
+    expected_index: int,
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.tabs.setCurrentWidget(window.gps_tab)
+
+    gps_refreshes: list[GpsGradientOptions | None] = []
+
+    def record_gps_refresh(_log, options=None, **_kwargs) -> None:
+        gps_refreshes.append(options)
+
+    monkeypatch.setattr(window.gps_view, "set_path", record_gps_refresh)
+    window.telemetry_time_mode = "relative"
+
+    window.set_telemetry_visible_x_range(range_start, range_end)
+
+    assert window.telemetry_visible_elapsed_range == pytest.approx(expected_scope)
+    assert window.selected_index == expected_index
+    last_options = gps_refreshes[-1]
+    assert last_options is not None
+    assert last_options.scope_start_seconds == pytest.approx(expected_scope[0])
+    assert last_options.scope_end_seconds == pytest.approx(expected_scope[1])
+
+    payload = build_gps_map_payload(log, last_options)
+    assert payload["status"] == "empty"
+    assert payload["points"] == []
+
+    window.close()
+    app.quit()
+
+
 def test_main_window_empty_telemetry_selection_clears_gps_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
