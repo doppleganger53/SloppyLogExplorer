@@ -34,6 +34,7 @@ TELEMETRY_RESIZE_RERENDER_MS = 150
 class _PlotBridge(QObject):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
+    x_range_changed = pyqtSignal(object, object)
 
     @pyqtSlot(int)
     def selectIndex(self, index: int) -> None:
@@ -42,6 +43,10 @@ class _PlotBridge(QObject):
     @pyqtSlot(int)
     def stepIndex(self, delta: int) -> None:
         self.index_stepped.emit(delta)
+
+    @pyqtSlot(object, object)
+    def setXRange(self, start: object, end: object) -> None:
+        self.x_range_changed.emit(start, end)
 
 
 class _GpsBridge(QObject):
@@ -130,6 +135,7 @@ def _json_plotly_value(value: Any) -> object:
 class TelemetryPlotWidget(QWidget):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
+    x_range_changed = pyqtSignal(object, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -141,6 +147,7 @@ class TelemetryPlotWidget(QWidget):
         self.dark = True
         self.interaction_mode = "zoom"
         self.time_mode = "absolute"
+        self.x_axis_range: tuple[object, object] | None = None
         self._view: QWebEngineView | QTextEdit
         self._page: QWebEnginePage | None = None
         self._cursor_x_values: list[object] = []
@@ -163,6 +170,7 @@ class TelemetryPlotWidget(QWidget):
             self._bridge = _PlotBridge()
             self._bridge.index_selected.connect(self.index_selected)
             self._bridge.index_stepped.connect(self.index_stepped)
+            self._bridge.x_range_changed.connect(self.x_range_changed)
             self._channel = QWebChannel(page)
             self._channel.registerObject("plotBridge", self._bridge)
             page.setWebChannel(self._channel)
@@ -184,6 +192,7 @@ class TelemetryPlotWidget(QWidget):
         dark: bool = True,
         interaction_mode: str | None = None,
         time_mode: str | None = None,
+        x_axis_range: tuple[object, object] | None = None,
     ) -> None:
         self.log = log
         self.compare = compare
@@ -195,6 +204,7 @@ class TelemetryPlotWidget(QWidget):
             self.interaction_mode = interaction_mode if interaction_mode in {"pan", "zoom"} else "zoom"
         if time_mode:
             self.time_mode = time_mode
+        self.x_axis_range = x_axis_range
         self._render()
 
     def set_interaction_mode(self, mode: str) -> None:
@@ -251,6 +261,7 @@ class TelemetryPlotWidget(QWidget):
             interaction_mode=self.interaction_mode,
             time_mode=self.time_mode,
             max_trace_points=trace_point_budget,
+            x_axis_range=getattr(self, "x_axis_range", None),
         )
         self._last_trace_point_budget = trace_point_budget
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)

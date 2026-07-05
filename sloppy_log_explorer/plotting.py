@@ -51,9 +51,12 @@ MAX_VISIBLE_LEGEND_ITEMS = 12
 MAX_STATS_ANNOTATION_ROWS = 12
 TELEMETRY_MARGIN_LEFT = 58
 TELEMETRY_MARGIN_RIGHT_BASE = 64
-TELEMETRY_MARGIN_RIGHT_PER_AXIS = 44
+TELEMETRY_MARGIN_RIGHT_PER_AXIS = 62
 TELEMETRY_MARGIN_TOP = 30
 TELEMETRY_MARGIN_BOTTOM = 46
+TELEMETRY_RIGHT_AXIS_SPACING = 0.055
+TELEMETRY_RIGHT_AXIS_DOMAIN_GAP = 0.035
+TELEMETRY_RIGHT_AXIS_MIN_DOMAIN_END = 0.55
 MAX_GPS_JUMP_KM = 1000.0
 # A tiny origin tolerance catches placeholder zeros without rejecting genuine
 # coordinates that are only close to zero.
@@ -78,9 +81,60 @@ def _axis_name(index: int) -> str:
 
 
 def _telemetry_right_margin(plotted_column_count: int) -> int:
-    return TELEMETRY_MARGIN_RIGHT_BASE + min(
-        max(0, plotted_column_count - 1), MAX_VISIBLE_TELEMETRY_AXES - 1
+    return TELEMETRY_MARGIN_RIGHT_BASE + _telemetry_visible_right_axis_count(
+        plotted_column_count
     ) * TELEMETRY_MARGIN_RIGHT_PER_AXIS
+
+
+def _telemetry_visible_axis_count(plotted_column_count: int) -> int:
+    return min(max(0, plotted_column_count), MAX_VISIBLE_TELEMETRY_AXES)
+
+
+def _telemetry_visible_right_axis_count(plotted_column_count: int) -> int:
+    return max(0, _telemetry_visible_axis_count(plotted_column_count) - 1)
+
+
+def _telemetry_right_axis_positions(plotted_column_count: int) -> list[float]:
+    right_axis_count = _telemetry_visible_right_axis_count(plotted_column_count)
+    if right_axis_count <= 0:
+        return []
+    start = 1.0 - (right_axis_count - 1) * TELEMETRY_RIGHT_AXIS_SPACING
+    return [round(start + offset * TELEMETRY_RIGHT_AXIS_SPACING, 6) for offset in range(right_axis_count)]
+
+
+def _telemetry_x_axis_domain(plotted_column_count: int) -> list[float]:
+    positions = _telemetry_right_axis_positions(plotted_column_count)
+    if len(positions) <= 1:
+        return [0.0, 1.0]
+    domain_end = max(
+        TELEMETRY_RIGHT_AXIS_MIN_DOMAIN_END,
+        positions[0] - TELEMETRY_RIGHT_AXIS_DOMAIN_GAP,
+    )
+    return [0.0, round(domain_end, 6)]
+
+
+def _normalise_gps_scope(
+    elapsed_values: Sequence[float],
+    start_seconds: float | None,
+    end_seconds: float | None,
+) -> tuple[float, float] | None:
+    if not elapsed_values or start_seconds is None or end_seconds is None:
+        return None
+    start = _coerce_float(start_seconds)
+    end = _coerce_float(end_seconds)
+    if start is None or end is None:
+        return None
+    if not math.isfinite(start) or not math.isfinite(end):
+        return None
+    if end < start:
+        start, end = end, start
+    timeline_start = min(elapsed_values)
+    timeline_end = max(elapsed_values)
+    start = max(timeline_start, min(start, timeline_end))
+    end = max(timeline_start, min(end, timeline_end))
+    if end <= start:
+        return None
+    return start, end
 
 
 def _telemetry_trace_point_budget(plot_width_px: int | None) -> int:
@@ -327,6 +381,7 @@ def build_telemetry_figure(
     interaction_mode: str = "zoom",
     time_mode: str = "absolute",
     max_trace_points: int = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
+    x_axis_range: tuple[object, object] | None = None,
 ) -> go.Figure:
     fig = go.Figure()
     if primary is None:
@@ -400,10 +455,14 @@ def build_telemetry_figure(
         "legend": {"orientation": "h", "y": 1.08, "x": 0},
         "xaxis": {
             "title": "Time" if time_mode == "absolute" and primary.time is not None else "Elapsed time",
+            "domain": _telemetry_x_axis_domain(len(plotted_columns)),
             "showgrid": show_grid,
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
         },
     }
+    if x_axis_range is not None:
+        layout["xaxis"]["range"] = [x_axis_range[0], x_axis_range[1]]
+    right_axis_positions = _telemetry_right_axis_positions(len(plotted_columns))
     for idx, col in enumerate(plotted_columns):
         axis_key = "yaxis" if idx == 0 else f"yaxis{idx + 1}"
         axis_is_visible = idx < MAX_VISIBLE_TELEMETRY_AXES
@@ -411,23 +470,32 @@ def build_telemetry_figure(
             "title": {
                 "text": col if axis_is_visible else "",
                 "font": {"color": COLORS[idx % len(COLORS)]},
+                "standoff": 8,
             },
-            "tickfont": {"color": COLORS[idx % len(COLORS)]},
+            "tickfont": {"color": COLORS[idx % len(COLORS)], "size": 10 if idx > 0 else 11},
             "showticklabels": axis_is_visible,
+            "ticks": "outside" if axis_is_visible else "",
+            "ticklen": 4,
+            "automargin": True,
             "showgrid": show_grid and idx == 0,
             "gridcolor": "rgba(255,255,255,0.08)" if dark else "rgba(0,0,0,0.1)",
+            "zeroline": False if idx > 0 else True,
         }
         if idx > 0:
-            # Overlay secondary axes on the right edge so every selected
-            # telemetry channel keeps its own scale. Only the first few axes
-            # are visible; beyond that, the labels hurt readability more than
-            # they help.
+            # Overlay secondary axes in a reserved right-side gutter so every
+            # plotted telemetry channel keeps its own scale without stacking
+            # the readable axes on top of each other.
+            position = (
+                right_axis_positions[idx - 1]
+                if idx - 1 < len(right_axis_positions)
+                else 1.0
+            )
             axis.update(
                 {
                     "anchor": "free",
                     "overlaying": "y",
                     "side": "right",
-                    "position": min(0.98, 0.86 + min(idx, MAX_VISIBLE_TELEMETRY_AXES - 1) * 0.045),
+                    "position": position,
                 }
             )
         if not axis_is_visible:
@@ -568,7 +636,12 @@ def build_gps_figure(log: LoadedLog | None, color_column: str | None = None, dar
     return fig
 
 
-def _empty_gps_payload(message: str) -> dict[str, object]:
+def _empty_gps_payload(
+    message: str,
+    scope: tuple[float, float] | None = None,
+) -> dict[str, object]:
+    start_elapsed = scope[0] if scope is not None else 0.0
+    end_elapsed = scope[1] if scope is not None else 0.0
     return {
         "status": "empty",
         "message": message,
@@ -577,9 +650,9 @@ def _empty_gps_payload(message: str) -> dict[str, object]:
         "legend": {"enabled": False},
         "timeline": {
             "enabled": False,
-            "durationSeconds": 0.0,
-            "startElapsedSeconds": 0.0,
-            "endElapsedSeconds": 0.0,
+            "durationSeconds": max(0.0, end_elapsed - start_elapsed),
+            "startElapsedSeconds": start_elapsed,
+            "endElapsedSeconds": end_elapsed,
             "rows": 0,
         },
         "altitudeLabel": "Altitude",
@@ -608,6 +681,11 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     lon_values = _numeric_series(df, gps.longitude)
     time_values = list(log.time) if log.time is not None else [None] * len(df)
     elapsed_values = relative_seconds(log)
+    active_scope = _normalise_gps_scope(
+        elapsed_values,
+        options.scope_start_seconds,
+        options.scope_end_seconds,
+    )
     if gps.altitude and gps.altitude in df.columns:
         alt_values = _numeric_series(df, gps.altitude)
         altitude_label = gps.altitude_label or gps.altitude
@@ -638,17 +716,31 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
             "elapsedSeconds": elapsed_values[row_index] if row_index < len(elapsed_values) else float(row_index),
             "value": None,
         }
+        if active_scope is not None:
+            elapsed = point["elapsedSeconds"]
+            if elapsed < active_scope[0] or elapsed > active_scope[1]:
+                continue
         if color_values is not None:
             point["value"] = _coerce_float(color_values.iloc[row_index])
         candidate_points.append((point, time_values[row_index] if row_index < len(time_values) else None))
 
     if len(candidate_points) < 2:
+        if active_scope is not None:
+            return _empty_gps_payload(
+                "GPS data was detected, but fewer than two valid coordinate rows were found in the visible telemetry range.",
+                active_scope,
+            )
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
 
     # Run the outlier pass before segmenting so isolated bad samples disappear
     # instead of forcing an unnecessary path break.
     candidate_points = _drop_isolated_gps_outliers(candidate_points)
     if len(candidate_points) < 2:
+        if active_scope is not None:
+            return _empty_gps_payload(
+                "GPS data was detected, but fewer than two valid coordinate rows were found in the visible telemetry range.",
+                active_scope,
+            )
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
 
     path_parts: list[list[GpsCandidate]] = []
@@ -666,6 +758,11 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
 
     rendered_parts = [part for part in path_parts if len(part) >= 2]
     if not rendered_parts:
+        if active_scope is not None:
+            return _empty_gps_payload(
+                "GPS data was detected, but fewer than two valid coordinate rows were found in the visible telemetry range.",
+                active_scope,
+            )
         return _empty_gps_payload("GPS data was detected, but fewer than two valid coordinate rows were found.")
 
     points: list[GpsPoint] = [point for part in rendered_parts for point, _ in part]
@@ -758,7 +855,8 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
     valid_altitudes = [point["alt"] for point in points if math.isfinite(point["alt"])]
     altitude_minimum = min(valid_altitudes) if valid_altitudes else 0.0
     altitude_maximum = max(valid_altitudes) if valid_altitudes else 0.0
-    timeline_end = max(elapsed_values) if elapsed_values else 0.0
+    timeline_start = active_scope[0] if active_scope is not None else 0.0
+    timeline_end = active_scope[1] if active_scope is not None else (max(elapsed_values) if elapsed_values else 0.0)
 
     return {
         "status": "ok",
@@ -769,10 +867,10 @@ def build_gps_map_payload(log: LoadedLog | None, options: GpsGradientOptions | N
         "legend": legend,
         "timeline": {
             "enabled": bool(points),
-            "durationSeconds": timeline_end,
-            "startElapsedSeconds": 0.0,
+            "durationSeconds": max(0.0, timeline_end - timeline_start),
+            "startElapsedSeconds": timeline_start,
             "endElapsedSeconds": timeline_end,
-            "rows": len(df),
+            "rows": len(points),
         },
         "latitudeLabel": gps.latitude_label or gps.latitude,
         "longitudeLabel": gps.longitude_label or gps.longitude,
@@ -834,11 +932,36 @@ function plotDiv() {{
 function bindPlot() {{
   const plot = plotDiv();
   if (!plot) return;
+  let relayoutTimer = null;
   plot.on('plotly_click', function(data) {{
     if (!bridge || !data.points || !data.points.length) return;
     const point = data.points[0];
     const selected = Number.isFinite(point.customdata) ? point.customdata : point.pointIndex;
     bridge.selectIndex(selected);
+  }});
+  plot.on('plotly_relayout', function(event) {{
+    if (!bridge || !event) return;
+    let start = null;
+    let end = null;
+    if (event['xaxis.autorange'] === true) {{
+      start = null;
+      end = null;
+    }} else if (Array.isArray(event['xaxis.range']) && event['xaxis.range'].length >= 2) {{
+      start = event['xaxis.range'][0];
+      end = event['xaxis.range'][1];
+    }} else if (Object.prototype.hasOwnProperty.call(event, 'xaxis.range[0]') &&
+               Object.prototype.hasOwnProperty.call(event, 'xaxis.range[1]')) {{
+      start = event['xaxis.range[0]'];
+      end = event['xaxis.range[1]'];
+    }} else {{
+      return;
+    }}
+    window.clearTimeout(relayoutTimer);
+    relayoutTimer = window.setTimeout(function() {{
+      if (bridge && typeof bridge.setXRange === 'function') {{
+        bridge.setXRange(start, end);
+      }}
+    }}, 100);
   }});
   document.addEventListener('keydown', function(event) {{
     if (!bridge) return;

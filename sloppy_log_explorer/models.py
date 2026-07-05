@@ -29,6 +29,8 @@ class GpsGradientOptions:
     range_min: float | None = None
     range_max: float | None = None
     midpoint: float | None = None
+    scope_start_seconds: float | None = None
+    scope_end_seconds: float | None = None
 
 
 @dataclass(frozen=True)
