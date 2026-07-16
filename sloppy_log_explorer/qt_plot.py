@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import os
 import json
 import tempfile
@@ -20,6 +21,7 @@ from .plotting import (
     MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
     TELEMETRY_MARGIN_LEFT,
     _telemetry_right_margin,
+    _telemetry_axis_group_count,
     _telemetry_trace_point_budget,
     _telemetry_x_values,
     build_gps_map_html,
@@ -148,6 +150,8 @@ class TelemetryPlotWidget(QWidget):
         self.interaction_mode = "zoom"
         self.time_mode = "absolute"
         self.x_axis_range: tuple[object, object] | None = None
+        self.manual_axis_groups: list[tuple[str, ...]] = []
+        self.ungrouped_axis_columns: set[str] = set()
         self._view: QWebEngineView | QTextEdit
         self._page: QWebEnginePage | None = None
         self._cursor_x_values: list[object] = []
@@ -193,6 +197,8 @@ class TelemetryPlotWidget(QWidget):
         interaction_mode: str | None = None,
         time_mode: str | None = None,
         x_axis_range: tuple[object, object] | None = None,
+        manual_axis_groups: Sequence[Sequence[str]] | None = None,
+        ungrouped_axis_columns: Sequence[str] | None = None,
     ) -> None:
         self.log = log
         self.compare = compare
@@ -205,6 +211,8 @@ class TelemetryPlotWidget(QWidget):
         if time_mode:
             self.time_mode = time_mode
         self.x_axis_range = x_axis_range
+        self.manual_axis_groups = [tuple(group) for group in manual_axis_groups or ()]
+        self.ungrouped_axis_columns = set(ungrouped_axis_columns or ())
         self._render()
 
     def set_interaction_mode(self, mode: str) -> None:
@@ -251,6 +259,8 @@ class TelemetryPlotWidget(QWidget):
         # cursor selection, and display mode stay in sync with the main window.
         self._cursor_x_values = list(_telemetry_x_values(self.log, self.time_mode)) if self.log is not None else []
         trace_point_budget = self._current_trace_point_budget()
+        manual_axis_groups = getattr(self, "manual_axis_groups", [])
+        ungrouped_axis_columns = tuple(getattr(self, "ungrouped_axis_columns", ()))
         fig = build_telemetry_figure(
             self.log,
             self.columns,
@@ -262,6 +272,8 @@ class TelemetryPlotWidget(QWidget):
             time_mode=self.time_mode,
             max_trace_points=trace_point_budget,
             x_axis_range=getattr(self, "x_axis_range", None),
+            manual_axis_groups=manual_axis_groups,
+            ungrouped_axis_columns=ungrouped_axis_columns,
         )
         self._last_trace_point_budget = trace_point_budget
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)
@@ -278,8 +290,14 @@ class TelemetryPlotWidget(QWidget):
             view_width = int(self._view.width())
         except (AttributeError, RuntimeError, TypeError):
             return MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
-        plotted_column_count = min(len(self.columns), MAX_RENDERED_TELEMETRY_TRACES)
-        plot_width = view_width - TELEMETRY_MARGIN_LEFT - _telemetry_right_margin(plotted_column_count)
+        axis_group_count = _telemetry_axis_group_count(
+            getattr(self, "log", None),
+            self.columns,
+            manual_axis_groups=getattr(self, "manual_axis_groups", []),
+            ungrouped_axis_columns=tuple(getattr(self, "ungrouped_axis_columns", ())),
+        )
+        plotted_axis_count = min(axis_group_count, MAX_RENDERED_TELEMETRY_TRACES)
+        plot_width = view_width - TELEMETRY_MARGIN_LEFT - _telemetry_right_margin(plotted_axis_count)
         return _telemetry_trace_point_budget(max(1, plot_width))
 
     def _trace_point_budget_changed(self, next_budget: int) -> bool:
