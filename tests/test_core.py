@@ -312,6 +312,8 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
             "no usable numeric telemetry columns",
         ),
         ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
+        ("VFAS(V)\ninf\n-inf\n", "no usable numeric telemetry columns"),
+        ("Time\ninf\n-inf\n", "no usable numeric telemetry columns"),
     ],
     ids=[
         "empty",
@@ -325,6 +327,8 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
         "header-only",
         "single-column-text",
         "nonnumeric-csv",
+        "non-finite-numeric",
+        "non-finite-timeline-only",
     ],
 )
 def test_load_log_rejects_files_without_usable_telemetry(
@@ -371,6 +375,40 @@ def test_load_log_detects_underscored_timeline_without_hiding_timer(tmp_path: Pa
     assert log.timeline_columns == frozenset(("Date_Time",))
     assert log.numeric_columns == ["Timer1"]
     assert log.parameter_columns == ["Timer1"]
+
+
+def test_load_log_accepts_numeric_channel_with_at_least_one_finite_sample(tmp_path: Path) -> None:
+    path = tmp_path / "partly-finite.csv"
+    path.write_text("VFAS(V)\ninf\n16.8\n-inf\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.parameter_columns == ["VFAS(V)"]
+
+
+def test_load_log_ignores_purely_non_finite_timeline_when_sensor_is_usable(tmp_path: Path) -> None:
+    path = tmp_path / "non-finite-time.csv"
+    path.write_text("Time,VFAS(V)\ninf,16.8\n-inf,16.7\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.time is None
+    assert log.timeline_columns == frozenset()
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.info.duration_seconds == 1.0
+
+
+def test_load_log_tolerates_non_finite_gaps_in_numeric_timeline(tmp_path: Path) -> None:
+    path = tmp_path / "partly-finite-time.csv"
+    path.write_text("Time,VFAS(V)\n0,16.8\ninf,16.7\n2,16.6\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Time",))
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.info.duration_seconds == 2.0
 
 
 def test_load_log_detects_coordinate_string_gps_under_single_heading(tmp_path: Path) -> None:
@@ -1309,6 +1347,8 @@ def test_main_window_load_log_failure_keeps_previous_raw_log_view(
             "no usable numeric telemetry columns",
         ),
         ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
+        ("VFAS(V)\ninf\n-inf\n", "no usable numeric telemetry columns"),
+        ("Time\ninf\n-inf\n", "no usable numeric telemetry columns"),
     ],
     ids=[
         "empty",
@@ -1322,6 +1362,8 @@ def test_main_window_load_log_failure_keeps_previous_raw_log_view(
         "header-only",
         "single-column-text",
         "nonnumeric-csv",
+        "non-finite-numeric",
+        "non-finite-timeline-only",
     ],
 )
 def test_main_window_rejects_malformed_log_without_replacing_valid_session(

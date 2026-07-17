@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import re
 import csv
+import math
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -170,10 +171,12 @@ def _detect_time(df: pd.DataFrame) -> tuple[pd.Series | None, frozenset[str]]:
 
     for col in time_cols + date_cols:
         raw = df[col]
-        parsed = _coerce_datetime_series(raw)
-        if parsed.notna().sum() >= max(1, len(df) // 3):
-            return parsed, frozenset((col,))
         numeric = _coerce_numeric_series(raw)
+        numeric_value_count = numeric.notna().sum()
+        finite_mask = numeric.map(
+            lambda value: bool(pd.notna(value) and math.isfinite(float(value)))
+        )
+        numeric = numeric.where(finite_mask)
         if numeric.notna().sum() >= max(1, len(df) // 3):
             # Some exports store elapsed seconds as a bare number; convert them
             # to timestamps anchored at the Unix epoch so Plotly can format them.
@@ -182,6 +185,13 @@ def _detect_time(df: pd.DataFrame) -> tuple[pd.Series | None, frozenset[str]]:
                 pd.Series(base + pd.to_timedelta(numeric.fillna(0), unit="s"), index=numeric.index),
                 frozenset((col,)),
             )
+        if numeric_value_count == raw.notna().sum() and raw.notna().any():
+            # A wholly numeric-looking column containing only non-finite or too
+            # sparse values cannot become a valid datetime by reparsing it.
+            continue
+        parsed = _coerce_datetime_series(raw)
+        if parsed.notna().sum() >= max(1, len(df) // 3):
+            return parsed, frozenset((col,))
 
     return None, frozenset()
 
@@ -215,7 +225,8 @@ def _numeric_columns(df: pd.DataFrame, timeline_columns: frozenset[str]) -> list
         if col in timeline_columns:
             continue
         converted = _coerce_numeric_series(df[col])
-        if converted.notna().any():
+        finite_values = converted.dropna().map(math.isfinite)
+        if finite_values.any():
             if _should_preserve_coordinate_text_column(col, df[col], converted):
                 continue
             # Coerce in place so downstream plotting and GPS heuristics can use
