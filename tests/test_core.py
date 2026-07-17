@@ -9,7 +9,8 @@ from typing import Any, cast
 
 import pandas as pd
 import pytest
-from PyQt6.QtCore import QItemSelectionModel, Qt
+from PyQt6.QtCore import QItemSelectionModel, QPoint, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
@@ -1657,6 +1658,44 @@ def test_load_log_infers_model_from_root_level_filename(tmp_path: Path) -> None:
     assert log.info.model == "ERATIX"
 
 
+@pytest.mark.parametrize("dialog_method", ["open_log_dialog", "open_compare_dialog"])
+def test_log_file_dialogs_start_from_local_home_instead_of_cloud_library(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dialog_method: str,
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    dialog_calls: list[tuple[str, str]] = []
+
+    def fake_open_file(_parent, caption: str, directory: str, _filter: str) -> tuple[str, str]:
+        dialog_calls.append((caption, directory))
+        return "", ""
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", fake_open_file)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.library_root = Path(r"G:\My Drive\0-RC\Telemetry\frsky")
+    load_calls: list[Path] = []
+    monkeypatch.setattr(window, "load_log", load_calls.append)
+
+    getattr(window, dialog_method)()
+
+    assert len(dialog_calls) == 1
+    assert dialog_calls[0][1] == str(Path.home())
+    assert dialog_calls[0][1] != str(window.library_root)
+    assert load_calls == []
+    assert window.isEnabled()
+
+    window.close()
+    app.quit()
+
+
 def test_scan_library_uses_metadata_only_and_groups_root_level_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "frsky"
     root.mkdir()
@@ -1716,6 +1755,8 @@ def test_library_tree_sorts_top_level_and_children_by_clicked_column_and_preserv
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     window.load_library(root)
+    window.show()
+    app.processEvents()
 
     def top_level_items() -> list:
         return [window.library_tree.topLevelItem(index) for index in range(window.library_tree.topLevelItemCount())]
@@ -1728,7 +1769,25 @@ def test_library_tree_sorts_top_level_and_children_by_clicked_column_and_preserv
         return [item.child(index).text(0) for index in range(item.childCount())]
 
     header = window.library_tree.header()
+    for column in range(4):
+        header.resizeSection(column, 80)
+    preserved_selection: list[Any] = []
+
+    def click_header(column: int) -> None:
+        x = header.sectionViewportPosition(column) + header.sectionSize(column) // 2
+        QTest.mouseClick(
+            header.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPoint(x, header.height() // 2),
+        )
+        app.processEvents()
+        if preserved_selection:
+            assert window.library_tree.currentItem() is preserved_selection[0]
+            assert window.library_tree.selectedItems() == preserved_selection
+
     assert window.library_tree.columnCount() == 4
+    assert header.sectionsClickable()
     assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Interactive
     assert header.sectionResizeMode(1) == QHeaderView.ResizeMode.Interactive
     assert header.sectionResizeMode(2) == QHeaderView.ResizeMode.Interactive
@@ -1751,27 +1810,129 @@ def test_library_tree_sorts_top_level_and_children_by_clicked_column_and_preserv
     assert alpha.child(0).data(3, Qt.ItemDataRole.UserRole) == alpha_b.stat().st_size
     alpha.setExpanded(True)
     gamma.setExpanded(True)
+    selected_log = alpha.child(1)
+    window.library_tree.setCurrentItem(selected_log)
+    selected_log.setSelected(True)
+    preserved_selection.append(selected_log)
 
-    window.library_header_clicked(0)
+    click_header(0)
     assert top_level_names() == ["Alpha", "Beta", "Gamma"]
     assert child_names("Alpha") == [alpha_a.name, alpha_b.name, alpha_c.name]
+    assert header.sortIndicatorSection() == 0
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
     assert alpha.isExpanded()
     assert not beta.isExpanded()
     assert gamma.isExpanded()
 
-    window.library_header_clicked(3)
+    click_header(0)
+    assert top_level_names() == ["Gamma", "Beta", "Alpha"]
+    assert child_names("Alpha") == [alpha_c.name, alpha_b.name, alpha_a.name]
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    click_header(3)
     assert top_level_names() == ["Alpha", "Gamma", "Beta"]
     assert child_names("Alpha") == [alpha_a.name, alpha_c.name, alpha_b.name]
+    assert header.sortIndicatorSection() == 3
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
     assert alpha.isExpanded()
     assert not beta.isExpanded()
     assert gamma.isExpanded()
 
-    window.library_header_clicked(2)
+    click_header(3)
     assert top_level_names() == ["Beta", "Gamma", "Alpha"]
     assert child_names("Alpha") == [alpha_b.name, alpha_c.name, alpha_a.name]
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+
+    click_header(2)
+    assert top_level_names() == ["Beta", "Gamma", "Alpha"]
+    assert child_names("Alpha") == [alpha_b.name, alpha_c.name, alpha_a.name]
+    assert header.sortIndicatorSection() == 2
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    click_header(2)
+    assert top_level_names() == ["Alpha", "Gamma", "Beta"]
+    assert child_names("Alpha") == [alpha_a.name, alpha_c.name, alpha_b.name]
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+
+    click_header(1)
+    assert top_level_names() == ["Alpha", "Beta", "Gamma"]
+    assert child_names("Alpha") == [alpha_c.name, alpha_b.name, alpha_a.name]
+    assert header.sortIndicatorSection() == 1
+    assert header.sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+
+    click_header(1)
+    assert top_level_names() == ["Gamma", "Beta", "Alpha"]
+    assert child_names("Alpha") == [alpha_a.name, alpha_b.name, alpha_c.name]
+    assert header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
     assert alpha.isExpanded()
     assert not beta.isExpanded()
     assert gamma.isExpanded()
+    window.close()
+    app.quit()
+
+
+def test_library_name_header_uses_natural_text_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    root = tmp_path / "frsky"
+    for relative_path in [
+        Path("Model 10") / "flight10.csv",
+        Path("Model 10") / "flight2.csv",
+        Path("Model 2") / "flight1.csv",
+    ]:
+        path = root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_library_blob(path, 100)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_library(root)
+    window.show()
+    app.processEvents()
+
+    header = window.library_tree.header()
+    for column in range(4):
+        header.resizeSection(column, 80)
+    x = header.sectionViewportPosition(0) + header.sectionSize(0) // 2
+    click_position = QPoint(x, header.height() // 2)
+
+    QTest.mouseClick(
+        header.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        click_position,
+    )
+    app.processEvents()
+
+    top_level = [
+        window.library_tree.topLevelItem(index)
+        for index in range(window.library_tree.topLevelItemCount())
+    ]
+    assert [item.text(0) for item in top_level] == ["Model 2", "Model 10"]
+    model_10 = top_level[1]
+    assert [model_10.child(index).text(0) for index in range(model_10.childCount())] == [
+        "flight2.csv",
+        "flight10.csv",
+    ]
+
+    QTest.mouseClick(
+        header.viewport(),
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+        click_position,
+    )
+    app.processEvents()
+    assert [
+        window.library_tree.topLevelItem(index).text(0)
+        for index in range(window.library_tree.topLevelItemCount())
+    ] == ["Model 10", "Model 2"]
+
     window.close()
     app.quit()
 
