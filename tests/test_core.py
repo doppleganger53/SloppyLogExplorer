@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog,
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
 from sloppy_log_explorer.models import GpsGradientOptions
-from sloppy_log_explorer.parser import load_log
+from sloppy_log_explorer.parser import InvalidTelemetryLogError, load_log
 from sloppy_log_explorer.plotting import (
     _telemetry_right_axis_positions,
     _telemetry_right_margin,
@@ -286,6 +286,131 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
     assert log.info.has_gps is True
     assert "VFAS(V)" in log.parameter_columns
     assert log.info.duration_seconds == 8
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("", "empty or has no usable CSV column headers"),
+        ("1,2\n3,4\n", "empty or has no usable CSV column headers"),
+        ("1e3,2e3\n3e3,4e3\n", "empty or has no usable CSV column headers"),
+        ("inf,nan\n1,2\n", "empty or has no usable CSV column headers"),
+        ('"   ",2\n1,3\n', "empty or has no usable CSV column headers"),
+        (
+            "2026-01-01,12:00:00,16.8\n2026-01-01,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "2026-01-01T12:00:00,16.8\n2026-01-01T12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "Jul 16 2026,12:00:00,16.8\nJul 16 2026,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        ("Date,Time,VFAS(V)\n", "column headers but no telemetry samples"),
+        (
+            "this is not a telemetry table\nand it has no usable numeric telemetry columns\n",
+            "no usable numeric telemetry columns",
+        ),
+        ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
+        ("VFAS(V)\ninf\n-inf\n", "no usable numeric telemetry columns"),
+        ("Time\ninf\n-inf\n", "no usable numeric telemetry columns"),
+    ],
+    ids=[
+        "empty",
+        "headerless-numeric",
+        "headerless-scientific",
+        "headerless-special-float",
+        "blank-and-numeric-headers",
+        "headerless-timestamped",
+        "headerless-iso-timestamp",
+        "headerless-month-name",
+        "header-only",
+        "single-column-text",
+        "nonnumeric-csv",
+        "non-finite-numeric",
+        "non-finite-timeline-only",
+    ],
+)
+def test_load_log_rejects_files_without_usable_telemetry(
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    path = tmp_path / "malformed.csv"
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(InvalidTelemetryLogError, match=message):
+        load_log(path)
+
+
+def test_load_log_retains_timer_named_numeric_telemetry(tmp_path: Path) -> None:
+    path = tmp_path / "timer.csv"
+    path.write_text(
+        "Date,Time,Timer1,Runtime\n"
+        "2026-01-01,12:00:00,1,10\n"
+        "2026-01-01,12:00:01,2,11\n",
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Date", "Time"))
+    assert log.numeric_columns == ["Timer1", "Runtime"]
+    assert log.parameter_columns == ["Timer1", "Runtime"]
+
+
+def test_load_log_detects_underscored_timeline_without_hiding_timer(tmp_path: Path) -> None:
+    path = tmp_path / "underscored-time.csv"
+    path.write_text(
+        "Date_Time,Timer1\n"
+        "2026-01-01 12:00:00,1\n"
+        "2026-01-01 12:00:01,2\n",
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Date_Time",))
+    assert log.numeric_columns == ["Timer1"]
+    assert log.parameter_columns == ["Timer1"]
+
+
+def test_load_log_accepts_numeric_channel_with_at_least_one_finite_sample(tmp_path: Path) -> None:
+    path = tmp_path / "partly-finite.csv"
+    path.write_text("VFAS(V)\ninf\n16.8\n-inf\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.parameter_columns == ["VFAS(V)"]
+
+
+def test_load_log_ignores_purely_non_finite_timeline_when_sensor_is_usable(tmp_path: Path) -> None:
+    path = tmp_path / "non-finite-time.csv"
+    path.write_text("Time,VFAS(V)\ninf,16.8\n-inf,16.7\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.time is None
+    assert log.timeline_columns == frozenset()
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.info.duration_seconds == 1.0
+
+
+def test_load_log_tolerates_non_finite_gaps_in_numeric_timeline(tmp_path: Path) -> None:
+    path = tmp_path / "partly-finite-time.csv"
+    path.write_text("Time,VFAS(V)\n0,16.8\ninf,16.7\n2,16.6\n", encoding="utf-8")
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Time",))
+    assert log.numeric_columns == ["VFAS(V)"]
+    assert log.info.duration_seconds == 2.0
 
 
 def test_load_log_detects_coordinate_string_gps_under_single_heading(tmp_path: Path) -> None:
@@ -625,14 +750,12 @@ def test_gps_map_payload_skips_origin_placeholder_points(tmp_path: Path) -> None
     assert payload["points"][-1]["lon"] == pytest.approx(-75.0005)
 
 
-def test_load_log_does_not_report_gps_for_origin_only_coordinate_strings(tmp_path: Path) -> None:
+def test_load_log_rejects_origin_only_coordinate_strings_without_telemetry(tmp_path: Path) -> None:
     path = tmp_path / "origin_only.csv"
     write_origin_only_coordinate_sample(path)
 
-    log = load_log(path)
-
-    assert log.info.has_gps is False
-    assert log.gps_columns is None
+    with pytest.raises(InvalidTelemetryLogError, match="no usable numeric telemetry columns"):
+        load_log(path)
 
 
 def test_gps_map_payload_skips_isolated_far_away_points(tmp_path: Path) -> None:
@@ -1306,6 +1429,113 @@ def test_main_window_load_log_failure_keeps_previous_raw_log_view(
     assert window.raw_log_empty.isHidden() is True
     assert window.raw_log_table.isHidden() is False
     assert window.file_summary.text() == first_summary
+
+    window.close()
+    app.quit()
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected_message"),
+    [
+        ("", "empty or has no usable CSV column headers"),
+        ("1,2\n3,4\n", "empty or has no usable CSV column headers"),
+        ("1e3,2e3\n3e3,4e3\n", "empty or has no usable CSV column headers"),
+        ("inf,nan\n1,2\n", "empty or has no usable CSV column headers"),
+        ('"   ",2\n1,3\n', "empty or has no usable CSV column headers"),
+        (
+            "2026-01-01,12:00:00,16.8\n2026-01-01,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "2026-01-01T12:00:00,16.8\n2026-01-01T12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "Jul 16 2026,12:00:00,16.8\nJul 16 2026,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        ("Date,Time,VFAS(V)\n", "column headers but no telemetry samples"),
+        (
+            "this is not a telemetry table\nand it has no usable numeric telemetry columns\n",
+            "no usable numeric telemetry columns",
+        ),
+        ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
+        ("VFAS(V)\ninf\n-inf\n", "no usable numeric telemetry columns"),
+        ("Time\ninf\n-inf\n", "no usable numeric telemetry columns"),
+    ],
+    ids=[
+        "empty",
+        "headerless-numeric",
+        "headerless-scientific",
+        "headerless-special-float",
+        "blank-and-numeric-headers",
+        "headerless-timestamped",
+        "headerless-iso-timestamp",
+        "headerless-month-name",
+        "header-only",
+        "single-column-text",
+        "nonnumeric-csv",
+        "non-finite-numeric",
+        "non-finite-timeline-only",
+    ],
+)
+def test_main_window_rejects_malformed_log_without_replacing_valid_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+    expected_message: str,
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first = tmp_path / "first.csv"
+    malformed = tmp_path / "malformed.csv"
+    recovered = tmp_path / "recovered.csv"
+    write_sample(first)
+    malformed.write_text(contents, encoding="utf-8")
+    write_sample(recovered)
+
+    warnings: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, title, message: warnings.append((title, message)),
+    )
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first)
+    window.tabs.setCurrentWidget(window.raw_log_tab)
+    window.selected_index = 4
+
+    first_log = window.current_log
+    first_dataframe = window.raw_log_model.dataframe
+    first_summary = window.file_summary.text()
+
+    window.load_log(malformed)
+
+    assert len(warnings) == 1
+    assert warnings[0][0] == "Log load failed"
+    assert expected_message in warnings[0][1]
+    assert "Traceback" not in warnings[0][1]
+    assert window.current_log is first_log
+    assert window.raw_log_model.dataframe is first_dataframe
+    assert window.file_summary.text() == first_summary
+    assert window.selected_index == 4
+    assert window.store.get_setting("last_log") == str(first)
+
+    window.load_log(recovered)
+
+    assert len(warnings) == 1
+    assert window.current_log is not None
+    assert window.current_log.info.path == recovered
+    assert window.raw_log_model.dataframe is window.current_log.dataframe
+    assert window.selected_index == 0
+    assert window.store.get_setting("last_log") == str(recovered)
+    assert window.status.currentMessage() == f"Loaded {recovered.name}"
 
     window.close()
     app.quit()

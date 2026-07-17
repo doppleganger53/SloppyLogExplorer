@@ -54,7 +54,7 @@ from .analysis import (
 )
 from .library import group_by_model, scan_library
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
-from .parser import load_log, relative_seconds
+from .parser import InvalidTelemetryLogError, load_log, relative_seconds
 from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
@@ -1162,6 +1162,8 @@ class MainWindow(QMainWindow):
             self._refresh_flight_notes_if_visible()
             self.refresh_plots()
             self.status.showMessage(f"Loaded {path.name}")
+        except InvalidTelemetryLogError as exc:
+            QMessageBox.warning(self, "Log load failed", str(exc))
         except Exception:
             # Preserve the previous successful log on failure so the Raw Log tab
             # stays aligned with the rest of the UI and does not temporarily
