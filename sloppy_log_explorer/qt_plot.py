@@ -237,6 +237,10 @@ class TelemetryPlotWidget(QWidget):
         if x_axis_range is not None:
             self._reset_view_pending = False
 
+    @property
+    def render_generation(self) -> int:
+        return self._render_generation
+
     def reset_view(self) -> None:
         self.x_axis_range = None
         if not self._web_engine:
@@ -334,6 +338,9 @@ class TelemetryPlotWidget(QWidget):
     def _render(self) -> None:
         # The Plotly figure is rebuilt on every state change so compare traces,
         # cursor selection, and display mode stay in sync with the main window.
+        self._render_generation = getattr(self, "_render_generation", 0) + 1
+        if self._web_engine and getattr(self, "_reset_view_pending", False):
+            self._reset_target_generation = self._render_generation
         self._cursor_x_values = list(_telemetry_x_values(self.log, self.time_mode)) if self.log is not None else []
         trace_point_budget = self._current_trace_point_budget()
         manual_axis_groups = getattr(self, "manual_axis_groups", [])
@@ -353,10 +360,6 @@ class TelemetryPlotWidget(QWidget):
             ungrouped_axis_columns=ungrouped_axis_columns,
         )
         self._last_trace_point_budget = trace_point_budget
-        if self._web_engine:
-            self._render_generation = getattr(self, "_render_generation", 0) + 1
-            if getattr(self, "_reset_view_pending", False):
-                self._reset_target_generation = self._render_generation
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)
         if self._web_engine:
             marker = f"<script>window.sloppyTelemetryRenderGeneration = {self._render_generation};</script>"

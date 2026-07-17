@@ -1550,9 +1550,19 @@ class MainWindow(QMainWindow):
             values = json.loads(payload)
         except (json.JSONDecodeError, TypeError):
             return
-        if not isinstance(values, list) or len(values) != 2:
+        if not isinstance(values, dict):
             return
-        self.set_telemetry_visible_x_range(values[0], values[1])
+        document_generation = values.get("generation")
+        range_values = values.get("range")
+        if (
+            not isinstance(document_generation, int)
+            or isinstance(document_generation, bool)
+            or document_generation != self.graph_view.render_generation
+            or not isinstance(range_values, list)
+            or len(range_values) != 2
+        ):
+            return
+        self.set_telemetry_visible_x_range(range_values[0], range_values[1])
 
     def set_telemetry_visible_x_range(self, start: object, end: object) -> None:
         next_range = None if not self.selected_columns() else self._normalise_telemetry_elapsed_range(start, end)

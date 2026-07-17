@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 import os
@@ -1945,7 +1946,9 @@ def test_main_window_relative_x_range_scopes_gps_and_clamps_cursor(
     monkeypatch.setattr(window, "refresh_graph", lambda: graph_refreshes.append(True))
     monkeypatch.setattr(window.graph_view, "set_cursor_index", lambda index: cursor_updates.append(index))
 
-    window.graph_view.x_range_changed.emit("[2.0, 5.0]")
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
 
     assert window.telemetry_visible_elapsed_range is None
     app.processEvents()
@@ -1982,7 +1985,9 @@ def test_reset_telemetry_view_invalidates_queued_x_range(
     window = MainWindow()
     window.load_log(path)
 
-    window.graph_view.x_range_changed.emit("[2.0, 5.0]")
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
     window.reset_telemetry_view()
     app.processEvents()
 
@@ -2011,12 +2016,45 @@ def test_loading_new_log_invalidates_queued_x_range(
     window = MainWindow()
     window.load_log(first_path)
 
-    window.graph_view.x_range_changed.emit("[2.0, 5.0]")
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
     window.load_log(second_path)
     app.processEvents()
 
     assert window.current_log is not None
     assert window.current_log.info.path == second_path
+    assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
+
+    window.close()
+    app.quit()
+
+
+def test_rerender_invalidates_queued_x_range_from_old_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    outgoing_generation = window.graph_view.render_generation
+
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": outgoing_generation, "range": [2.0, 5.0]})
+    )
+    window.refresh_graph()
+    assert window.graph_view.render_generation > outgoing_generation
+    app.processEvents()
+
     assert window.telemetry_visible_elapsed_range is None
     assert window.graph_view.x_axis_range is None
 
@@ -2642,9 +2680,9 @@ def test_plot_bridge_emits_x_range_signal() -> None:
     emitted: list[str] = []
     bridge.x_range_changed.connect(emitted.append)
 
-    bridge.setXRange('[2.0, "2026-01-01 12:00:05"]')
+    bridge.setXRange('{"generation": 3, "range": [2.0, "2026-01-01 12:00:05"]}')
 
-    assert emitted == ['[2.0, "2026-01-01 12:00:05"]']
+    assert emitted == ['{"generation": 3, "range": [2.0, "2026-01-01 12:00:05"]}']
 
 
 def test_telemetry_figure_applies_x_axis_range(tmp_path: Path) -> None:
