@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import math
+import re
 import time
 import traceback
 from bisect import bisect_left, bisect_right
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QPoint, Qt, QTimer, QUrl
+from PyQt6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QPoint, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -136,6 +137,7 @@ class _NumericSortableTableItem(QTableWidgetItem):
 
 class MainWindow(QMainWindow):
     library_sort_column = 2
+    library_sort_order = Qt.SortOrder.DescendingOrder
 
     def __init__(self) -> None:
         super().__init__()
@@ -244,6 +246,9 @@ class MainWindow(QMainWindow):
 
         self.library_tree = QTreeWidget()
         self.library_tree.setHeaderLabels(["Model / Log", "Logs", "Latest", "Size"])
+        # Configure manual sorting before making the header clickable. Qt's
+        # setSortingEnabled(False) resets header clickability when called later.
+        self.library_tree.setSortingEnabled(False)
         header = self.library_tree.header()
         if header is None:
             raise RuntimeError("Failed to get library tree header")
@@ -252,7 +257,6 @@ class MainWindow(QMainWindow):
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(True)
         header.sectionClicked.connect(self.library_header_clicked)
-        self.library_tree.setSortingEnabled(False)
         self.library_tree.itemActivated.connect(self.library_item_activated)
         sidebar_layout.addWidget(QLabel("Log Library"))
         sidebar_layout.addWidget(self.library_tree, 2)
@@ -1004,13 +1008,30 @@ class MainWindow(QMainWindow):
     def _set_empty_graph(self) -> None:
         self.graph_view.set_plot(None, [])
 
+    @staticmethod
+    def _safe_log_dialog_directory() -> str:
+        # Passing an empty directory lets the Windows native dialog reuse its
+        # last location. After choosing a cloud-backed library that can block
+        # the UI while the shell enumerates thousands of remote files.
+        return str(Path.home())
+
     def open_log_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open telemetry log", "", "Telemetry logs (*.csv *.log);;All files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open telemetry log",
+            self._safe_log_dialog_directory(),
+            "Telemetry logs (*.csv *.log);;All files (*.*)",
+        )
         if path:
             self.load_log(Path(path))
 
     def open_compare_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open compare telemetry log", "", "Telemetry logs (*.csv *.log);;All files (*.*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open compare telemetry log",
+            self._safe_log_dialog_directory(),
+            "Telemetry logs (*.csv *.log);;All files (*.*)",
+        )
         if not path:
             return
         try:
@@ -1066,7 +1087,7 @@ class MainWindow(QMainWindow):
                 item.setData(2, Qt.ItemDataRole.UserRole, log.modified)
                 item.setData(3, Qt.ItemDataRole.UserRole, log.size)
                 parent.addChild(item)
-        self._sort_library_tree(self.library_sort_column, Qt.SortOrder.DescendingOrder)
+        self._sort_library_tree(self.library_sort_column, self.library_sort_order)
         self.library_tree.collapseAll()
 
     def library_item_activated(self, item: QTreeWidgetItem) -> None:
@@ -1075,13 +1096,15 @@ class MainWindow(QMainWindow):
             self.load_log(Path(path))
 
     def library_header_clicked(self, column: int) -> None:
-        header = self.library_tree.header()
-        if header is None:
-            return
-        current_column = header.sortIndicatorSection()
-        current_order = header.sortIndicatorOrder()
-        if current_column == column:
-            order = Qt.SortOrder.AscendingOrder if current_order == Qt.SortOrder.DescendingOrder else Qt.SortOrder.DescendingOrder
+        # A real QHeaderView click may update its visual indicator before this
+        # slot runs. Keep the authoritative state outside the header so one
+        # user click produces exactly one direction change.
+        if self.library_sort_column == column:
+            order = (
+                Qt.SortOrder.AscendingOrder
+                if self.library_sort_order == Qt.SortOrder.DescendingOrder
+                else Qt.SortOrder.DescendingOrder
+            )
         else:
             order = Qt.SortOrder.DescendingOrder if column in {1, 2, 3} else Qt.SortOrder.AscendingOrder
         self._sort_library_tree(column, order)
@@ -1972,11 +1995,16 @@ class MainWindow(QMainWindow):
         # Capture expansion state before we rebuild the tree, otherwise Qt will
         # collapse everything when the items are reinserted.
         expanded_state = {id(item): item.isExpanded() for item in items}
+        current_item = _my_library_tree.currentItem()
+        current_column = _my_library_tree.currentColumn()
+        selected_items = _my_library_tree.selectedItems()
         while _my_library_tree.topLevelItemCount():
             _my_library_tree.takeTopLevelItem(0)
 
         reverse = order == Qt.SortOrder.DescendingOrder
         items.sort(key=lambda item: self._library_sort_key(item, column), reverse=reverse)
+        self.library_sort_column = column
+        self.library_sort_order = order
 
         _my_library_tree.setUpdatesEnabled(False)
         try:
@@ -1985,6 +2013,14 @@ class MainWindow(QMainWindow):
                 self._sort_library_children(item, column, order)
             for item in items:
                 item.setExpanded(expanded_state.get(id(item), False))
+            if current_item is not None:
+                _my_library_tree.setCurrentItem(
+                    current_item,
+                    current_column,
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
+            for selected_item in selected_items:
+                selected_item.setSelected(True)
         finally:
             _my_library_tree.setUpdatesEnabled(True)
 
@@ -2012,19 +2048,28 @@ class MainWindow(QMainWindow):
         for child in children:
             child.setExpanded(expanded_state.get(id(child), False))
 
-    def _library_sort_key(self, item: QTreeWidgetItem, column: int, child_rows: bool = False) -> tuple[object, str]:
-        label = str(item.text(0)).casefold()
+    def _library_sort_key(self, item: QTreeWidgetItem, column: int, child_rows: bool = False) -> tuple[object, object]:
+        label = str(item.text(0))
+        label_key = self._natural_library_text_key(label)
         if column == 1:
             # Model rows sort by their stored counts, while child rows fall back
             # to the label because the count column is intentionally blank there.
-            primary = label if child_rows else int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
+            primary = label_key if child_rows else int(item.data(1, Qt.ItemDataRole.UserRole) or 0)
         elif column == 2:
             primary = float(item.data(2, Qt.ItemDataRole.UserRole) or 0.0)
         elif column == 3:
             primary = int(item.data(3, Qt.ItemDataRole.UserRole) or 0)
         else:
-            primary = label
-        return (primary, label)
+            primary = label_key
+        return (primary, label_key)
+
+    @staticmethod
+    def _natural_library_text_key(value: str) -> tuple[tuple[int, object], ...]:
+        return tuple(
+            (1, int(part)) if part.isdigit() else (0, part.casefold())
+            for part in re.split(r"(\d+)", value)
+            if part
+        )
 
     @staticmethod
     def _format_timestamp(timestamp: float) -> str:
