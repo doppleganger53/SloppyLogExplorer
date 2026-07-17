@@ -1119,6 +1119,9 @@ class MainWindow(QMainWindow):
     def load_log(self, path: Path) -> None:
         try:
             self.current_log = load_log(path, self.library_root)
+            # Discard range callbacks already queued by the outgoing WebEngine
+            # document before the replacement log rebuilds the plot.
+            self._telemetry_x_range_generation += 1
             self.selected_index = 0
             self.telemetry_visible_elapsed_range = None
             self.reset_telemetry_axis_grouping(refresh=False)

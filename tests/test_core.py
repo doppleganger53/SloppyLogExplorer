@@ -1993,6 +1993,37 @@ def test_reset_telemetry_view_invalidates_queued_x_range(
     app.quit()
 
 
+def test_loading_new_log_invalidates_queued_x_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first_path = tmp_path / "first.csv"
+    second_path = tmp_path / "second.csv"
+    write_sample(first_path)
+    write_sample(second_path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first_path)
+
+    window.graph_view.x_range_changed.emit("[2.0, 5.0]")
+    window.load_log(second_path)
+    app.processEvents()
+
+    assert window.current_log is not None
+    assert window.current_log.info.path == second_path
+    assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
+
+    window.close()
+    app.quit()
+
+
 @pytest.mark.parametrize(
     ("range_start", "range_end", "expected_scope", "expected_index"),
     [
