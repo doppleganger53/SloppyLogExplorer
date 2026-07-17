@@ -36,7 +36,7 @@ TELEMETRY_RESIZE_RERENDER_MS = 150
 class _PlotBridge(QObject):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
-    x_range_changed = pyqtSignal(object, object)
+    x_range_changed = pyqtSignal(str)
 
     @pyqtSlot(int)
     def selectIndex(self, index: int) -> None:
@@ -46,9 +46,9 @@ class _PlotBridge(QObject):
     def stepIndex(self, delta: int) -> None:
         self.index_stepped.emit(delta)
 
-    @pyqtSlot(object, object)
-    def setXRange(self, start: object, end: object) -> None:
-        self.x_range_changed.emit(start, end)
+    @pyqtSlot(str)
+    def setXRange(self, payload: str) -> None:
+        self.x_range_changed.emit(payload)
 
 
 class _GpsBridge(QObject):
@@ -137,7 +137,7 @@ def _json_plotly_value(value: Any) -> object:
 class TelemetryPlotWidget(QWidget):
     index_selected = pyqtSignal(int)
     index_stepped = pyqtSignal(int)
-    x_range_changed = pyqtSignal(object, object)
+    x_range_changed = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -150,6 +150,10 @@ class TelemetryPlotWidget(QWidget):
         self.interaction_mode = "zoom"
         self.time_mode = "absolute"
         self.x_axis_range: tuple[object, object] | None = None
+        self._reset_view_pending = False
+        self._render_generation = 0
+        self._loaded_render_generation = 0
+        self._reset_target_generation = 0
         self.manual_axis_groups: list[tuple[str, ...]] = []
         self.ungrouped_axis_columns: set[str] = set()
         self._view: QWebEngineView | QTextEdit
@@ -171,6 +175,7 @@ class TelemetryPlotWidget(QWidget):
             settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
             self._view.setPage(page)
             self._page = page
+            page.loadFinished.connect(self._telemetry_page_loaded)
             self._bridge = _PlotBridge()
             self._bridge.index_selected.connect(self.index_selected)
             self._bridge.index_stepped.connect(self.index_stepped)
@@ -211,6 +216,8 @@ class TelemetryPlotWidget(QWidget):
         if time_mode:
             self.time_mode = time_mode
         self.x_axis_range = x_axis_range
+        if x_axis_range is not None:
+            self._reset_view_pending = False
         self.manual_axis_groups = [tuple(group) for group in manual_axis_groups or ()]
         self.ungrouped_axis_columns = set(ungrouped_axis_columns or ())
         self._render()
@@ -224,8 +231,78 @@ class TelemetryPlotWidget(QWidget):
         self.time_mode = mode
         self._render()
 
+    def set_x_axis_range(self, x_axis_range: tuple[object, object] | None) -> None:
+        """Remember the live Plotly range without reloading its WebEngine page."""
+        self.x_axis_range = x_axis_range
+        if x_axis_range is not None:
+            self._reset_view_pending = False
+
     def reset_view(self) -> None:
-        self._render()
+        self.x_axis_range = None
+        if not self._web_engine:
+            self._render()
+            return
+        self._reset_view_pending = True
+        self._reset_target_generation = self._render_generation
+        self._apply_pending_reset()
+
+    def _telemetry_page_loaded(self, success: bool) -> None:
+        page = self._page
+        if not success or page is None:
+            return
+        page.runJavaScript(
+            "String(window.sloppyTelemetryRenderGeneration || '');",
+            self._telemetry_page_generation_loaded,
+        )
+
+    def _telemetry_page_generation_loaded(self, result: object) -> None:
+        try:
+            generation = int(result) if isinstance(result, str) else -1
+        except ValueError:
+            return
+        if generation != self._render_generation:
+            return
+        self._loaded_render_generation = generation
+        self._apply_pending_reset()
+
+    def _apply_pending_reset(self) -> None:
+        if not self._reset_view_pending:
+            return
+        target_generation = self._reset_target_generation
+        if self._loaded_render_generation != target_generation:
+            return
+        page = self._page
+        if page is None:
+            return
+        page.runJavaScript(
+            r"""
+(function() {
+  const plot = document.querySelector('.plotly-graph-div');
+  if (!plot || !window.Plotly) {
+    return false;
+  }
+  const generation = String(window.sloppyTelemetryRenderGeneration || '');
+  const autorange = {'xaxis.autorange': true};
+  Object.keys(plot.layout || {}).forEach((key) => {
+    if (/^yaxis\d*$/.test(key)) {
+      autorange[`${key}.autorange`] = true;
+    }
+  });
+  Plotly.relayout(plot, autorange);
+  return generation;
+})();
+""",
+            lambda result: self._reset_view_completed(result, target_generation),
+        )
+
+    def _reset_view_completed(self, result: object, generation: int) -> None:
+        if (
+            result == str(generation)
+            and generation == self._reset_target_generation
+            and generation == self._loaded_render_generation
+            and generation == self._render_generation
+        ):
+            self._reset_view_pending = False
 
     def set_cursor_index(self, selected_index: int) -> None:
         self.selected_index = selected_index
@@ -276,8 +353,14 @@ class TelemetryPlotWidget(QWidget):
             ungrouped_axis_columns=ungrouped_axis_columns,
         )
         self._last_trace_point_budget = trace_point_budget
+        if self._web_engine:
+            self._render_generation = getattr(self, "_render_generation", 0) + 1
+            if getattr(self, "_reset_view_pending", False):
+                self._reset_target_generation = self._render_generation
         html = figure_html(fig, bridge=self._web_engine, dark=self.dark)
         if self._web_engine:
+            marker = f"<script>window.sloppyTelemetryRenderGeneration = {self._render_generation};</script>"
+            html = html.replace("<head>", f"<head>{marker}", 1)
             previous_path = self._html_path
             self._html_path = _write_temp_html(html, "telemetry-plot-")
             cast(QWebEngineView, self._view).setUrl(QUrl.fromLocalFile(str(self._html_path)))
