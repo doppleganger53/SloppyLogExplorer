@@ -290,6 +290,22 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
     ("contents", "message"),
     [
         ("", "empty or has no usable CSV column headers"),
+        ("1,2\n3,4\n", "empty or has no usable CSV column headers"),
+        ("1e3,2e3\n3e3,4e3\n", "empty or has no usable CSV column headers"),
+        ("inf,nan\n1,2\n", "empty or has no usable CSV column headers"),
+        ('"   ",2\n1,3\n', "empty or has no usable CSV column headers"),
+        (
+            "2026-01-01,12:00:00,16.8\n2026-01-01,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "2026-01-01T12:00:00,16.8\n2026-01-01T12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "Jul 16 2026,12:00:00,16.8\nJul 16 2026,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
         ("Date,Time,VFAS(V)\n", "column headers but no telemetry samples"),
         (
             "this is not a telemetry table\nand it has no usable numeric telemetry columns\n",
@@ -297,7 +313,19 @@ def test_load_log_detects_time_numeric_and_gps(tmp_path: Path) -> None:
         ),
         ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
     ],
-    ids=["empty", "header-only", "single-column-text", "nonnumeric-csv"],
+    ids=[
+        "empty",
+        "headerless-numeric",
+        "headerless-scientific",
+        "headerless-special-float",
+        "blank-and-numeric-headers",
+        "headerless-timestamped",
+        "headerless-iso-timestamp",
+        "headerless-month-name",
+        "header-only",
+        "single-column-text",
+        "nonnumeric-csv",
+    ],
 )
 def test_load_log_rejects_files_without_usable_telemetry(
     tmp_path: Path,
@@ -309,6 +337,40 @@ def test_load_log_rejects_files_without_usable_telemetry(
 
     with pytest.raises(InvalidTelemetryLogError, match=message):
         load_log(path)
+
+
+def test_load_log_retains_timer_named_numeric_telemetry(tmp_path: Path) -> None:
+    path = tmp_path / "timer.csv"
+    path.write_text(
+        "Date,Time,Timer1,Runtime\n"
+        "2026-01-01,12:00:00,1,10\n"
+        "2026-01-01,12:00:01,2,11\n",
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Date", "Time"))
+    assert log.numeric_columns == ["Timer1", "Runtime"]
+    assert log.parameter_columns == ["Timer1", "Runtime"]
+
+
+def test_load_log_detects_underscored_timeline_without_hiding_timer(tmp_path: Path) -> None:
+    path = tmp_path / "underscored-time.csv"
+    path.write_text(
+        "Date_Time,Timer1\n"
+        "2026-01-01 12:00:00,1\n"
+        "2026-01-01 12:00:01,2\n",
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.time is not None
+    assert log.timeline_columns == frozenset(("Date_Time",))
+    assert log.numeric_columns == ["Timer1"]
+    assert log.parameter_columns == ["Timer1"]
 
 
 def test_load_log_detects_coordinate_string_gps_under_single_heading(tmp_path: Path) -> None:
@@ -1225,6 +1287,22 @@ def test_main_window_load_log_failure_keeps_previous_raw_log_view(
     ("contents", "expected_message"),
     [
         ("", "empty or has no usable CSV column headers"),
+        ("1,2\n3,4\n", "empty or has no usable CSV column headers"),
+        ("1e3,2e3\n3e3,4e3\n", "empty or has no usable CSV column headers"),
+        ("inf,nan\n1,2\n", "empty or has no usable CSV column headers"),
+        ('"   ",2\n1,3\n', "empty or has no usable CSV column headers"),
+        (
+            "2026-01-01,12:00:00,16.8\n2026-01-01,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "2026-01-01T12:00:00,16.8\n2026-01-01T12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
+        (
+            "Jul 16 2026,12:00:00,16.8\nJul 16 2026,12:00:01,16.7\n",
+            "empty or has no usable CSV column headers",
+        ),
         ("Date,Time,VFAS(V)\n", "column headers but no telemetry samples"),
         (
             "this is not a telemetry table\nand it has no usable numeric telemetry columns\n",
@@ -1232,7 +1310,19 @@ def test_main_window_load_log_failure_keeps_previous_raw_log_view(
         ),
         ("Date,Time,Mode\n2026-01-01,12:00:00,Cruise\n", "no usable numeric telemetry columns"),
     ],
-    ids=["empty", "header-only", "single-column-text", "nonnumeric-csv"],
+    ids=[
+        "empty",
+        "headerless-numeric",
+        "headerless-scientific",
+        "headerless-special-float",
+        "blank-and-numeric-headers",
+        "headerless-timestamped",
+        "headerless-iso-timestamp",
+        "headerless-month-name",
+        "header-only",
+        "single-column-text",
+        "nonnumeric-csv",
+    ],
 )
 def test_main_window_rejects_malformed_log_without_replacing_valid_session(
     tmp_path: Path,

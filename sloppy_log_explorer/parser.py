@@ -29,10 +29,10 @@ class InvalidTelemetryLogError(ValueError):
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Remove pandas' auto-generated placeholder columns from ragged exports and
     # normalize names so later heuristics can compare them reliably.
-    mask = df.columns.to_series().astype(str).str.match(r"^Unnamed", na=False)
-    df = df.loc[:, ~mask]
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    normalized = [str(column).strip() for column in df.columns]
+    keep = [bool(column) and re.match(r"^Unnamed", column) is None for column in normalized]
+    df = df.loc[:, keep].copy()
+    df.columns = [column for column, should_keep in zip(normalized, keep) if should_keep]
     return df
 
 
@@ -103,7 +103,8 @@ def _read_csv(path: Path) -> pd.DataFrame:
 
 
 def _validate_table_structure(df: pd.DataFrame, path: Path) -> None:
-    if len(df.columns) == 0:
+    headers = [str(column).strip() for column in df.columns]
+    if not headers or not any(_is_plausible_header(header) for header in headers):
         raise InvalidTelemetryLogError(
             f"{path.name} is empty or has no usable CSV column headers."
         )
@@ -113,34 +114,76 @@ def _validate_table_structure(df: pd.DataFrame, path: Path) -> None:
         )
 
 
-def _detect_time(df: pd.DataFrame) -> pd.Series | None:
-    columns = list(df.columns)
-    lower = {c: c.lower().strip() for c in columns}
-    date_cols = [c for c in columns if "date" in lower[c]]
-    time_cols = [c for c in columns if "time" in lower[c]]
+def _is_numeric_literal(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
 
-    if date_cols and time_cols:
+
+def _is_datetime_literal(value: str) -> bool:
+    if not any(character.isdigit() for character in value):
+        return False
+    return not pd.isna(pd.to_datetime(value, errors="coerce"))
+
+
+def _is_plausible_header(value: str) -> bool:
+    return (
+        any(character.isalpha() for character in value)
+        and not _is_numeric_literal(value)
+        and not _is_datetime_literal(value)
+    )
+
+
+def _has_date_header(column: str) -> bool:
+    name = column.lower().strip()
+    return (
+        "datetime" in name
+        or "timestamp" in name
+        or re.search(r"(?<![a-z0-9])date(?![a-z0-9])", name) is not None
+    )
+
+
+def _has_time_header(column: str) -> bool:
+    name = column.lower().strip()
+    return (
+        "datetime" in name
+        or "timestamp" in name
+        or re.search(r"(?<![a-z0-9])time(?![a-z0-9])", name) is not None
+    )
+
+
+def _detect_time(df: pd.DataFrame) -> tuple[pd.Series | None, frozenset[str]]:
+    columns = list(df.columns)
+    date_cols = [column for column in columns if _has_date_header(column)]
+    time_cols = [column for column in columns if _has_time_header(column)]
+
+    if date_cols and time_cols and date_cols[0] != time_cols[0]:
         # Prefer a combined date/time parse when both fields exist because many
         # logs split the timestamp across two columns.
         series = _coerce_datetime_series(
             df[date_cols[0]].astype(str).str.strip() + " " + df[time_cols[0]].astype(str).str.strip(),
         )
         if series.notna().any():
-            return series
+            return series, frozenset((date_cols[0], time_cols[0]))
 
     for col in time_cols + date_cols:
         raw = df[col]
         parsed = _coerce_datetime_series(raw)
         if parsed.notna().sum() >= max(1, len(df) // 3):
-            return parsed
+            return parsed, frozenset((col,))
         numeric = _coerce_numeric_series(raw)
         if numeric.notna().sum() >= max(1, len(df) // 3):
             # Some exports store elapsed seconds as a bare number; convert them
             # to timestamps anchored at the Unix epoch so Plotly can format them.
             base = pd.Timestamp("1970-01-01")
-            return pd.Series(base + pd.to_timedelta(numeric.fillna(0), unit="s"), index=numeric.index)
+            return (
+                pd.Series(base + pd.to_timedelta(numeric.fillna(0), unit="s"), index=numeric.index),
+                frozenset((col,)),
+            )
 
-    return None
+    return None, frozenset()
 
 
 def _model_from_path(path: Path, library_root: Path | None = None) -> str:
@@ -166,10 +209,10 @@ def _model_from_path(path: Path, library_root: Path | None = None) -> str:
     return re.split(r"[-_ ]\d{4}", stem, maxsplit=1)[0] or "Unsorted"
 
 
-def _numeric_columns(df: pd.DataFrame, time: pd.Series | None) -> list[str]:
+def _numeric_columns(df: pd.DataFrame, timeline_columns: frozenset[str]) -> list[str]:
     numeric: list[str] = []
     for col in df.columns:
-        if time is not None and ("date" in col.lower() or "time" in col.lower()):
+        if col in timeline_columns:
             continue
         converted = _coerce_numeric_series(df[col])
         if converted.notna().any():
@@ -544,13 +587,13 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     root_path = Path(library_root) if library_root else None
     df = _clean_columns(_read_csv(file_path))
     _validate_table_structure(df, file_path)
-    time = _detect_time(df)
-    numeric = _numeric_columns(df, time)
+    time, timeline_columns = _detect_time(df)
+    numeric = _numeric_columns(df, timeline_columns)
     df = df.copy()
     # GPS detection can inject helper columns, so rerun the numeric pass after
     # the detector has had a chance to normalize coordinate text.
     gps = detect_gps_columns(df, numeric)
-    numeric = _numeric_columns(df, time)
+    numeric = _numeric_columns(df, timeline_columns)
     df = df.copy()
     if not numeric:
         raise InvalidTelemetryLogError(
@@ -581,7 +624,14 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
         duration_seconds=duration,
         has_gps=gps is not None,
     )
-    return LoadedLog(info=info, dataframe=df, time=time, numeric_columns=numeric, gps_columns=gps)
+    return LoadedLog(
+        info=info,
+        dataframe=df,
+        time=time,
+        numeric_columns=numeric,
+        gps_columns=gps,
+        timeline_columns=timeline_columns,
+    )
 
 
 def relative_seconds(log: LoadedLog) -> list[float]:
