@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 import os
@@ -737,6 +738,7 @@ def test_telemetry_webengine_widget_loads_plot_from_local_html_file(
     assert "plotly-" in html
     assert "cdn.plot.ly" not in html
     assert "QWebChannel" in html
+    assert "window.sloppyTelemetryRenderGeneration = 1" in html
 
 
 def test_telemetry_plot_widget_defaults_to_zoom(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -749,6 +751,116 @@ def test_telemetry_plot_widget_defaults_to_zoom(monkeypatch: pytest.MonkeyPatch)
     assert widget.interaction_mode == "zoom"
 
     widget.deleteLater()
+
+
+def test_telemetry_webengine_reset_uses_in_page_autorange() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def runJavaScript(self, script: str, callback) -> None:
+            self.scripts.append(script)
+            callback("1")
+
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+    fake_widget.x_axis_range = (2.0, 5.0)
+    fake_widget._reset_view_pending = False
+    fake_widget._render_generation = 1
+    fake_widget._loaded_render_generation = 1
+    fake_widget._reset_target_generation = 1
+    fake_widget._apply_pending_reset = lambda: TelemetryPlotWidget._apply_pending_reset(fake_widget)
+    fake_widget._reset_view_completed = (
+        lambda result, generation: TelemetryPlotWidget._reset_view_completed(fake_widget, result, generation)
+    )
+    renders: list[bool] = []
+    fake_widget._render = lambda: renders.append(True)
+
+    TelemetryPlotWidget.reset_view(fake_widget)
+
+    assert fake_widget.x_axis_range is None
+    assert renders == []
+    assert len(fake_widget._page.scripts) == 1
+    assert "xaxis.autorange" in fake_widget._page.scripts[0]
+    assert "/^yaxis\\d*$/" in fake_widget._page.scripts[0]
+    assert not fake_widget._reset_view_pending
+
+
+def test_telemetry_webengine_reset_retries_after_page_load() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.reset_results = iter([False, "1"])
+            self.scripts: list[str] = []
+
+        def runJavaScript(self, script: str, callback) -> None:
+            self.scripts.append(script)
+            if script.startswith("String(window.sloppyTelemetryRenderGeneration"):
+                callback("1")
+            else:
+                callback(next(self.reset_results))
+
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+    fake_widget.x_axis_range = (2.0, 5.0)
+    fake_widget._reset_view_pending = False
+    fake_widget._render_generation = 1
+    fake_widget._loaded_render_generation = 1
+    fake_widget._reset_target_generation = 1
+    fake_widget._apply_pending_reset = lambda: TelemetryPlotWidget._apply_pending_reset(fake_widget)
+    fake_widget._telemetry_page_generation_loaded = (
+        lambda result: TelemetryPlotWidget._telemetry_page_generation_loaded(fake_widget, result)
+    )
+    fake_widget._reset_view_completed = (
+        lambda result, generation: TelemetryPlotWidget._reset_view_completed(fake_widget, result, generation)
+    )
+
+    TelemetryPlotWidget.reset_view(fake_widget)
+
+    assert fake_widget._reset_view_pending
+    TelemetryPlotWidget._telemetry_page_loaded(fake_widget, True)
+    assert len(fake_widget._page.scripts) == 3
+    assert not fake_widget._reset_view_pending
+
+
+def test_telemetry_webengine_reset_waits_for_current_navigation() -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.document_generation = "1"
+            self.scripts: list[str] = []
+
+        def runJavaScript(self, script: str, callback) -> None:
+            self.scripts.append(script)
+            callback(self.document_generation)
+
+    fake_widget = type("FakeTelemetryWidget", (), {})()
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+    fake_widget.x_axis_range = (2.0, 5.0)
+    fake_widget._reset_view_pending = False
+    fake_widget._render_generation = 2
+    fake_widget._loaded_render_generation = 1
+    fake_widget._reset_target_generation = 1
+    fake_widget._apply_pending_reset = lambda: TelemetryPlotWidget._apply_pending_reset(fake_widget)
+    fake_widget._telemetry_page_generation_loaded = (
+        lambda result: TelemetryPlotWidget._telemetry_page_generation_loaded(fake_widget, result)
+    )
+    fake_widget._reset_view_completed = (
+        lambda result, generation: TelemetryPlotWidget._reset_view_completed(fake_widget, result, generation)
+    )
+
+    TelemetryPlotWidget.reset_view(fake_widget)
+
+    assert fake_widget._reset_view_pending
+    assert fake_widget._page.scripts == []
+    TelemetryPlotWidget._telemetry_page_loaded(fake_widget, True)
+    assert len(fake_widget._page.scripts) == 1
+    assert fake_widget._reset_view_pending
+    fake_widget._page.document_generation = "2"
+    TelemetryPlotWidget._telemetry_page_loaded(fake_widget, True)
+    assert len(fake_widget._page.scripts) == 3
+    assert not fake_widget._reset_view_pending
 
 
 def test_telemetry_widget_passes_viewport_scaled_trace_budget(
@@ -1829,17 +1941,122 @@ def test_main_window_relative_x_range_scopes_gps_and_clamps_cursor(
     monkeypatch.setattr(window.gps_view, "set_path", record_gps_refresh)
     window.telemetry_time_mode = "relative"
     window.set_selected_index(8)
+    graph_refreshes: list[bool] = []
+    cursor_updates: list[int] = []
+    monkeypatch.setattr(window, "refresh_graph", lambda: graph_refreshes.append(True))
+    monkeypatch.setattr(window.graph_view, "set_cursor_index", lambda index: cursor_updates.append(index))
 
-    window.set_telemetry_visible_x_range(2.0, 5.0)
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
+
+    assert window.telemetry_visible_elapsed_range is None
+    app.processEvents()
 
     assert window.telemetry_visible_elapsed_range == (2.0, 5.0)
+    assert window.graph_view.x_axis_range == (2.0, 5.0)
     assert window.selected_index == 5
+    assert graph_refreshes == []
+    assert cursor_updates == [5]
     last_options = gps_refreshes[-1]
     assert last_options is not None
     assert last_options.scope_start_seconds == 2.0
     assert last_options.scope_end_seconds == 5.0
     assert window._gps_cursor_payload()["durationSeconds"] == pytest.approx(3.0)
     assert window._gps_cursor_payload()["scopeStartSeconds"] == pytest.approx(2.0)
+
+    window.close()
+    app.quit()
+
+
+def test_reset_telemetry_view_invalidates_queued_x_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
+    window.reset_telemetry_view()
+    app.processEvents()
+
+    assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
+
+    window.close()
+    app.quit()
+
+
+def test_loading_new_log_invalidates_queued_x_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    first_path = tmp_path / "first.csv"
+    second_path = tmp_path / "second.csv"
+    write_sample(first_path)
+    write_sample(second_path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(first_path)
+
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": window.graph_view.render_generation, "range": [2.0, 5.0]})
+    )
+    window.load_log(second_path)
+    app.processEvents()
+
+    assert window.current_log is not None
+    assert window.current_log.info.path == second_path
+    assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
+
+    window.close()
+    app.quit()
+
+
+def test_rerender_invalidates_queued_x_range_from_old_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    outgoing_generation = window.graph_view.render_generation
+
+    window.graph_view.x_range_changed.emit(
+        json.dumps({"generation": outgoing_generation, "range": [2.0, 5.0]})
+    )
+    window.refresh_graph()
+    assert window.graph_view.render_generation > outgoing_generation
+    app.processEvents()
+
+    assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
 
     window.close()
     app.quit()
@@ -2043,9 +2260,44 @@ def test_main_window_absolute_x_range_converts_to_elapsed_scope(
     assert axis_range is not None
     assert str(axis_range[0]) == "2026-01-01 12:00:02"
     assert str(axis_range[1]) == "2026-01-01 12:00:05"
+    assert window.graph_view.x_axis_range == axis_range
 
     window.set_telemetry_visible_x_range(None, None)
     assert window.telemetry_visible_elapsed_range is None
+    assert window.graph_view.x_axis_range is None
+
+    window.close()
+    app.quit()
+
+
+def test_reset_telemetry_view_renders_once_with_cleared_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.load_log(path)
+    window.telemetry_visible_elapsed_range = (2.0, 5.0)
+    window.graph_view.set_x_axis_range((2.0, 5.0))
+    rendered_ranges: list[tuple[object, object] | None] = []
+    monkeypatch.setattr(
+        window.graph_view,
+        "_render",
+        lambda: rendered_ranges.append(window.graph_view.x_axis_range),
+    )
+
+    window.reset_telemetry_view()
+
+    assert window.telemetry_visible_elapsed_range is None
+    assert rendered_ranges == [None]
 
     window.close()
     app.quit()
@@ -2425,12 +2677,12 @@ def test_telemetry_html_bridges_x_range_relayout(tmp_path: Path) -> None:
 
 def test_plot_bridge_emits_x_range_signal() -> None:
     bridge = _PlotBridge()
-    emitted: list[tuple[object, object]] = []
-    bridge.x_range_changed.connect(lambda start, end: emitted.append((start, end)))
+    emitted: list[str] = []
+    bridge.x_range_changed.connect(emitted.append)
 
-    bridge.setXRange(2.0, "2026-01-01 12:00:05")
+    bridge.setXRange('{"generation": 3, "range": [2.0, "2026-01-01 12:00:05"]}')
 
-    assert emitted == [(2.0, "2026-01-01 12:00:05")]
+    assert emitted == ['{"generation": 3, "range": [2.0, "2026-01-01 12:00:05"]}']
 
 
 def test_telemetry_figure_applies_x_axis_range(tmp_path: Path) -> None:

@@ -1145,7 +1145,10 @@ function bindPlot() {{
     window.clearTimeout(relayoutTimer);
     relayoutTimer = window.setTimeout(function() {{
       if (bridge && typeof bridge.setXRange === 'function') {{
-        bridge.setXRange(start, end);
+        bridge.setXRange(JSON.stringify({{
+          generation: Number(window.sloppyTelemetryRenderGeneration || 0),
+          range: [start, end]
+        }}));
       }}
     }}, 100);
   }});

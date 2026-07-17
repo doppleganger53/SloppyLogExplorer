@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import math
 import time
 import traceback
@@ -151,6 +152,7 @@ class MainWindow(QMainWindow):
         self.telemetry_interaction_mode = "zoom"
         self.telemetry_time_mode = "absolute"
         self.telemetry_visible_elapsed_range: tuple[float, float] | None = None
+        self._telemetry_x_range_generation = 0
         self.selected_parameter_columns: set[str] = set()
         self.telemetry_axis_groups: list[tuple[str, ...]] = []
         self.telemetry_axis_ungrouped_columns: set[str] = set()
@@ -348,7 +350,10 @@ class MainWindow(QMainWindow):
         self.graph_view = TelemetryPlotWidget()
         self.graph_view.index_selected.connect(self.set_selected_index)
         self.graph_view.index_stepped.connect(self.step_selected_index)
-        self.graph_view.x_range_changed.connect(self.set_telemetry_visible_x_range)
+        # WebChannel invokes bridge slots while Chromium/Qt is still unwinding
+        # the JavaScript call. Queue the UI work so even targeted Plotly updates
+        # cannot re-enter the active callback and destabilize WebEngine.
+        self.graph_view.x_range_changed.connect(self.queue_telemetry_visible_x_range)
         layout.addWidget(self.graph_view, 5)
         self.info_panel = QTextEdit()
         self.info_panel.setReadOnly(True)
@@ -1114,6 +1119,9 @@ class MainWindow(QMainWindow):
     def load_log(self, path: Path) -> None:
         try:
             self.current_log = load_log(path, self.library_root)
+            # Discard range callbacks already queued by the outgoing WebEngine
+            # document before the replacement log rebuilds the plot.
+            self._telemetry_x_range_generation += 1
             self.selected_index = 0
             self.telemetry_visible_elapsed_range = None
             self.reset_telemetry_axis_grouping(refresh=False)
@@ -1526,6 +1534,36 @@ class MainWindow(QMainWindow):
             return scoped_index
         return selected_index
 
+    def queue_telemetry_visible_x_range(self, payload: str) -> None:
+        # Keep the WebChannel boundary to a Qt-owned string. Generic Python
+        # object parameters can outlive the originating callback when queued.
+        generation = self._telemetry_x_range_generation
+        QTimer.singleShot(
+            0,
+            lambda: self._apply_telemetry_visible_x_range(payload, generation),
+        )
+
+    def _apply_telemetry_visible_x_range(self, payload: str, generation: int | None = None) -> None:
+        if generation is not None and generation != self._telemetry_x_range_generation:
+            return
+        try:
+            values = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(values, dict):
+            return
+        document_generation = values.get("generation")
+        range_values = values.get("range")
+        if (
+            not isinstance(document_generation, int)
+            or isinstance(document_generation, bool)
+            or document_generation != self.graph_view.render_generation
+            or not isinstance(range_values, list)
+            or len(range_values) != 2
+        ):
+            return
+        self.set_telemetry_visible_x_range(range_values[0], range_values[1])
+
     def set_telemetry_visible_x_range(self, start: object, end: object) -> None:
         next_range = None if not self.selected_columns() else self._normalise_telemetry_elapsed_range(start, end)
         previous_range = self.telemetry_visible_elapsed_range
@@ -1535,13 +1573,18 @@ class MainWindow(QMainWindow):
         elif previous_range == next_range:
             return
         self.telemetry_visible_elapsed_range = next_range
+        # The Plotly page already displays the range that raised this callback.
+        # Keep the Python-side widget state aligned for later resize rerenders,
+        # but do not reload the same WebEngine page while its QWebChannel call
+        # is still unwinding.
+        self.graph_view.set_x_axis_range(self._telemetry_elapsed_range_to_axis_range())
         if next_range is not None:
             clamped_index = self._clamp_index_to_elapsed_scope(next_range)
             if clamped_index != self.selected_index:
                 self.selected_index = clamped_index
                 self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
                 self.update_info_panel()
-        self.refresh_graph()
+                self.graph_view.set_cursor_index(self.selected_index)
         self.refresh_gps()
         self.sync_gps_cursor()
 
@@ -1671,10 +1714,12 @@ class MainWindow(QMainWindow):
         self.refresh_graph()
 
     def reset_telemetry_view(self) -> None:
+        self._telemetry_x_range_generation += 1
         self.telemetry_visible_elapsed_range = None
-        if hasattr(self, "graph_view"):
-            self.graph_view.reset_view()
-        self.refresh_graph()
+        self.graph_view.set_x_axis_range(None)
+        # Reset Plotly in place. Rebuilding the active WebEngine document here
+        # reintroduces the same navigation lifecycle risk as drag-zoom.
+        self.graph_view.reset_view()
         self.refresh_gps()
         self.sync_gps_cursor()
 
