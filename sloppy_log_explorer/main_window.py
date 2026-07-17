@@ -44,6 +44,7 @@ from PyQt6.QtWidgets import (
     QWidget
 )
 
+from . import __version__
 from .analysis import (
     basic_stats,
     calculate_internal_resistance,
@@ -59,6 +60,14 @@ from .qt_plot import GpsPathWidget, TelemetryPlotWidget
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
 from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_csv
+
+
+def _about_text() -> str:
+    return (
+        f"Sloppy Log Explorer {__version__}\n\n"
+        "GPL-3.0-or-later telemetry log explorer for Ethos and OpenTX CSV logs.\n"
+        "Derived from Ethos_LogView concepts with attribution in NOTICE.md."
+    )
 
 
 class RawLogTableModel(QAbstractTableModel):
@@ -2026,7 +2035,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About Sloppy Log Explorer",
-            "Sloppy Log Explorer\n\nGPL-3.0-or-later telemetry log explorer for Ethos and OpenTX CSV logs.\nDerived from Ethos_LogView concepts with attribution in NOTICE.md.",
+            _about_text(),
         )
 
     def _sort_library_tree(self, column: int, order: Qt.SortOrder) -> None:
