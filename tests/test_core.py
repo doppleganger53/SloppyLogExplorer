@@ -11,8 +11,10 @@ import pytest
 from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import QApplication, QHeaderView, QMessageBox, QFileDialog, QTableWidgetItem
 
+from sloppy_log_explorer import __version__
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, find_current_columns, find_voltage_columns, suggest_display_columns
 from sloppy_log_explorer.library import group_by_model, scan_library
+from sloppy_log_explorer.main_window import MainWindow
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.plotting import (
@@ -29,6 +31,26 @@ from sloppy_log_explorer.plotting import (
 from sloppy_log_explorer.qt_plot import GpsPathWidget, TelemetryPlotWidget, _PlotBridge
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
 from sloppy_log_explorer.voice import VoiceItem, generate_voice_pack
+
+
+def test_about_dialog_includes_authoritative_application_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    dialogs: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "about",
+        lambda _parent, title, message: dialogs.append((title, message)),
+    )
+
+    MainWindow.about(cast(Any, None))
+
+    assert dialogs == [
+        (
+            "About Sloppy Log Explorer",
+            f"Sloppy Log Explorer {__version__}\n\n"
+            "GPL-3.0-or-later telemetry log explorer for Ethos and OpenTX CSV logs.\n"
+            "Derived from Ethos_LogView concepts with attribution in NOTICE.md.",
+        )
+    ]
 
 
 def write_sample(path: Path) -> None:
