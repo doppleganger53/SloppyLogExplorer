@@ -407,6 +407,61 @@ def test_gps_map_html_uses_maplibre_openstreetmap_without_api_keys(tmp_path: Pat
     assert [token for token in forbidden if token in html] == []
 
 
+@pytest.mark.parametrize(
+    ("dark", "color_scheme", "foreground", "background", "hover_background", "focus_color"),
+    [
+        (True, "dark", "#f3f4f6", "#111827", "#1f2937", "#60a5fa"),
+        (False, "light", "#1f2937", "#ffffff", "#e5efff", "#2563eb"),
+    ],
+)
+def test_gps_map_playback_speed_menu_has_explicit_theme_contrast(
+    tmp_path: Path,
+    dark: bool,
+    color_scheme: str,
+    foreground: str,
+    background: str,
+    hover_background: str,
+    focus_color: str,
+) -> None:
+    path = tmp_path / "flight.csv"
+    write_sample(path)
+    log = load_log(path)
+
+    html = build_gps_map_html(log, dark=dark)
+
+    assert (
+        "#playbackSpeed {\n"
+        "      height: 30px;\n"
+        f"      color-scheme: {color_scheme};\n"
+        f"      color: {foreground};\n"
+        f"      background-color: {background};"
+    ) in html
+    assert f"#playbackSpeed:hover {{\n      background-color: {hover_background};" in html
+    assert f"#playbackSpeed:focus {{\n      border-color: {focus_color};" in html
+    assert f"#playbackSpeed:focus-visible {{\n      outline: 2px solid {focus_color};" in html
+    assert (
+        "#playbackSpeed option {\n"
+        f"      color: {foreground};\n"
+        f"      background-color: {background};"
+    ) in html
+    assert "#playbackSpeed option:hover," in html
+    assert "#playbackSpeed option:focus {" in html
+    assert "#playbackSpeed option:checked {" in html
+    assert "background-color: #2563eb;" in html
+    speed_options = (
+        ("0.25", ".25x"),
+        ("0.5", ".5x"),
+        ("1", "1x"),
+        ("2", "2x"),
+        ("5", "5x"),
+        ("10", "10x"),
+    )
+    for value, label in speed_options:
+        assert f'value="{value}"' in html
+        assert f">{label}</option>" in html
+    assert "__SPEED_" not in html
+
+
 def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path) -> None:
     path = tmp_path / "flight.csv"
     write_sample(path)
