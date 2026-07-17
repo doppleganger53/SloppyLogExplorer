@@ -22,6 +22,10 @@ _COORDINATE_DECIMAL_RE = re.compile(
 )
 
 
+class InvalidTelemetryLogError(ValueError):
+    """Raised when a parsed file cannot satisfy the telemetry-log contract."""
+
+
 def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Remove pandas' auto-generated placeholder columns from ragged exports and
     # normalize names so later heuristics can compare them reliably.
@@ -96,6 +100,17 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.read_csv(path, low_memory=False)
     except Exception:
         return _read_ragged_csv(path)
+
+
+def _validate_table_structure(df: pd.DataFrame, path: Path) -> None:
+    if len(df.columns) == 0:
+        raise InvalidTelemetryLogError(
+            f"{path.name} is empty or has no usable CSV column headers."
+        )
+    if df.empty:
+        raise InvalidTelemetryLogError(
+            f"{path.name} contains column headers but no telemetry samples."
+        )
 
 
 def _detect_time(df: pd.DataFrame) -> pd.Series | None:
@@ -528,6 +543,7 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     file_path = Path(path)
     root_path = Path(library_root) if library_root else None
     df = _clean_columns(_read_csv(file_path))
+    _validate_table_structure(df, file_path)
     time = _detect_time(df)
     numeric = _numeric_columns(df, time)
     df = df.copy()
@@ -536,6 +552,11 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     gps = detect_gps_columns(df, numeric)
     numeric = _numeric_columns(df, time)
     df = df.copy()
+    if not numeric:
+        raise InvalidTelemetryLogError(
+            f"{file_path.name} has no usable numeric telemetry columns. "
+            "Check that it is a telemetry CSV with a header row and numeric data samples."
+        )
 
     if time is not None and time.notna().any():
         start = time.dropna().iloc[0]
