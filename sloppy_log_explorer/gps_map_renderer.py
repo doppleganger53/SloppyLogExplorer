@@ -48,6 +48,12 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     panel_bg = "rgba(21,24,29,0.88)" if dark else "rgba(255,255,255,0.92)"
     panel_fg = "#e5e7eb" if dark else "#1f2937"
     border = "rgba(255,255,255,0.18)" if dark else "rgba(0,0,0,0.18)"
+    speed_color_scheme = "dark" if dark else "light"
+    speed_fg = "#f3f4f6" if dark else "#1f2937"
+    speed_bg = "#111827" if dark else "#ffffff"
+    speed_hover_bg = "#1f2937" if dark else "#e5efff"
+    speed_focus = "#60a5fa" if dark else "#2563eb"
+    speed_selected_bg = "#2563eb"
     css_uri = html.escape(_asset_uri("maplibre-gl.css"), quote=True)
     js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
     worker_uri_json = json.dumps(_asset_uri("maplibre-gl-csp-worker.js"))
@@ -295,11 +301,36 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     }
     #playbackSpeed {
       height: 30px;
-      color: __PANEL_FG__;
-      background: rgba(0,0,0,0.16);
+      color-scheme: __SPEED_COLOR_SCHEME__;
+      color: __SPEED_FG__;
+      background-color: __SPEED_BG__;
       border: 1px solid __BORDER__;
       border-radius: 4px;
       font: 12px Arial, sans-serif;
+    }
+    #playbackSpeed:hover {
+      background-color: __SPEED_HOVER_BG__;
+    }
+    #playbackSpeed:focus {
+      border-color: __SPEED_FOCUS__;
+      outline: none;
+    }
+    #playbackSpeed:focus-visible {
+      outline: 2px solid __SPEED_FOCUS__;
+      outline-offset: 2px;
+    }
+    #playbackSpeed option {
+      color: __SPEED_FG__;
+      background-color: __SPEED_BG__;
+    }
+    #playbackSpeed option:hover,
+    #playbackSpeed option:focus {
+      color: __SPEED_FG__;
+      background-color: __SPEED_HOVER_BG__;
+    }
+    #playbackSpeed option:checked {
+      color: #ffffff;
+      background-color: __SPEED_SELECTED_BG__;
     }
   </style>
 </head>
@@ -1817,6 +1848,12 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,
         "__BORDER__": border,
+        "__SPEED_COLOR_SCHEME__": speed_color_scheme,
+        "__SPEED_FG__": speed_fg,
+        "__SPEED_BG__": speed_bg,
+        "__SPEED_HOVER_BG__": speed_hover_bg,
+        "__SPEED_FOCUS__": speed_focus,
+        "__SPEED_SELECTED_BG__": speed_selected_bg,
     }
     # Replace placeholder tokens last so the template stays readable above and
     # the payload can be serialized with strict JSON escaping.
