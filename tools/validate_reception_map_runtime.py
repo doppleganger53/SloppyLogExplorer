@@ -45,7 +45,9 @@ def synthetic_payload() -> dict[str, object]:
         "unit": "%",
         "cell_size_m": 5,
         "auto_range": False,
-        "range": {"min": 0.0, "max": 100.0},
+        # Match the flat payload shape emitted by MainWindow after generation.
+        "range_min": 2.0,
+        "range_max": 85.0,
         "reverse": False,
         "cells": cells,
     }
@@ -136,7 +138,7 @@ def _assert_ready_state(state: dict[str, Any] | None, expected_cells: int) -> No
     value_range: dict[str, Any] = raw_value_range if isinstance(raw_value_range, dict) else {}
     if value_range.get("auto") is not False:
         raise AssertionError(f"Reception map did not preserve manual range mode: {state}")
-    if float(value_range.get("minimum") or 0) != 0.0 or float(value_range.get("maximum") or 0) != 100.0:
+    if float(value_range.get("minimum") or 0) != 2.0 or float(value_range.get("maximum") or 0) != 85.0:
         raise AssertionError(f"Reception map manual range is wrong: {state}")
     raw_camera = state.get("camera")
     camera: dict[str, Any] = raw_camera if isinstance(raw_camera, dict) else {}
@@ -244,6 +246,8 @@ def validate_reception_map_runtime(
     legend = _run_js(
         page,
         "({title: document.getElementById('legend-title').textContent, "
+        "minimum: document.getElementById('legend-min').textContent, "
+        "maximum: document.getElementById('legend-max').textContent, "
         "detail: document.getElementById('legend-detail').textContent});",
     )
     if not isinstance(legend, dict) or legend.get("title") != "VFR 2.4G(%)":
@@ -252,6 +256,12 @@ def validate_reception_map_runtime(
     if "5 m cells" not in str(legend.get("detail") or ""):
         view.close()
         raise AssertionError(f"Reception map legend is missing cell resolution: {legend}")
+    if legend.get("minimum") != "2 %" or legend.get("maximum") != "85 %":
+        view.close()
+        raise AssertionError(f"Reception map legend has the wrong manual bounds: {legend}")
+    if "Manual range" not in str(legend.get("detail") or ""):
+        view.close()
+        raise AssertionError(f"Reception map legend lost manual range mode: {legend}")
 
     _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
     _run_event_loop(1000)

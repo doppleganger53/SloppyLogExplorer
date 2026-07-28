@@ -206,6 +206,8 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     let dataBounds = null;
 
     function finiteNumber(value) {
+      if (value === null || value === undefined) return null;
+      if (typeof value === "string" && value.trim() === "") return null;
       const result = Number(value);
       return Number.isFinite(result) ? result : null;
     }

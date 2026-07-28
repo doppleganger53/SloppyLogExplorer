@@ -82,7 +82,8 @@ def test_reception_renderer_preserves_manual_range_and_reverse_setting() -> None
     payload.update(
         {
             "auto_range": False,
-            "range": {"min": 10.0, "max": 100.0},
+            "range_min": 10.0,
+            "range_max": 100.0,
             "reverse": True,
         }
     )
@@ -90,8 +91,10 @@ def test_reception_renderer_preserves_manual_range_and_reverse_setting() -> None
     document = build_reception_map_html(payload)
 
     assert '"auto_range":false' in document
-    assert '"range":{"min":10.0,"max":100.0}' in document
+    assert '"range_min":10.0' in document
+    assert '"range_max":100.0' in document
     assert '"reverse":true' in document
+    assert 'value === null || value === undefined' in document
     assert 'range.reverse ? "#16a34a" : "#dc2626"' in document
     assert 'classList.toggle("reverse", range.reverse)' in document
 
