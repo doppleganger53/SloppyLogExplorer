@@ -12,6 +12,7 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 - View detected GPS latitude/longitude/altitude on a 3D MapLibre/OpenStreetMap flight map.
 - Color the GPS flight path by any numeric telemetry parameter with custom start/end colors and range controls.
 - Step through the GPS flight path with play/pause timeline controls, playback speeds, and synchronized marker telemetry.
+- Detect flying sites across the current library and build 5 m, multi-flight reception maps for an exact telemetry channel and date range.
 - Store flight notes and link a local video file to each flight.
 - Register batteries, calculate pack and per-cell internal resistance from voltage/current logs, and retain health history.
 - Sync newer log files from a radio SD card folder into a local PC log library.
@@ -79,6 +80,8 @@ python build.py --clean --target debug --onefile
 Application state is stored under `%APPDATA%\SloppyLogExplorer` on Windows or `~/.sloppy_log_explorer` on other platforms. The app stores settings, flight notes, video links, battery history, and switch aliases in a local SQLite database.
 
 The flight map tab uses locally bundled MapLibre GL JS assets with OpenStreetMap raster tiles for Qt WebEngine tile-refresh reliability. It does not require Google Maps, Mapbox, paid subscriptions, account signups, or API keys. The map tiles require normal internet access and are cached by Qt WebEngine under the app data directory.
+
+The Reception Map tab keeps the normal library tree scan metadata-only, then refreshes a separate GPS/site index in one background worker. Unchanged files are reused from the local SQLite cache. The indexer first checks up to 2,000 telemetry records for valid GPS data and stops there for non-GPS logs; GPS-positive logs are then sampled every twentieth row across the file for site detection. Generating a selected heatmap reads the matching logs and summarizes observed samples into 5 m cells, giving each flight equal weight. Flying-site names, notes, dates, centroids, channel names, and file fingerprints stay in the local application database; raw reception samples are not persisted. Telemetry values remain local, although OpenStreetMap tile requests necessarily identify the viewed map area to the tile provider.
 
 ## License And Attribution
 
