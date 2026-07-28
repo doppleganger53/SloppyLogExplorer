@@ -7,11 +7,12 @@ import re
 import time
 import traceback
 from bisect import bisect_left, bisect_right
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pandas as pd
-from PyQt6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QPoint, Qt, QTimer, QUrl
+from PyQt6.QtCore import QAbstractTableModel, QDate, QItemSelectionModel, QModelIndex, QPoint, QThreadPool, Qt, QTimer, QUrl
 from PyQt6.QtGui import QAction, QColor, QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +21,7 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QDateEdit,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -30,6 +32,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -56,7 +59,8 @@ from .analysis import (
 from .library import group_by_model, scan_library
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
-from .qt_plot import GpsPathWidget, TelemetryPlotWidget
+from .qt_plot import GpsPathWidget, ReceptionMapWidget, TelemetryPlotWidget
+from .reception_workers import ReceptionTask
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
 from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_csv
@@ -179,6 +183,19 @@ class MainWindow(QMainWindow):
         self.gps_timeline_seconds: list[float] = []
         self.gps_timeline_is_monotonic = True
         self.gps_marker_value_combos: list[QComboBox] = []
+        self.reception_sites: list[dict[str, Any]] = []
+        self._reception_scan_generation = 0
+        self._reception_heatmap_generation = 0
+        self._reception_scan_task: ReceptionTask | None = None
+        self._reception_heatmap_task: ReceptionTask | None = None
+        self._reception_map_payload: dict[str, object] | None = None
+        self._reception_view_loaded = False
+        self._reception_tasks: set[ReceptionTask] = set()
+        self._reception_pool = QThreadPool(self)
+        # Library scans and heatmap builds both perform sustained file I/O. Keep
+        # them serialized so a cloud-backed library is never hammered by two
+        # reception jobs at once.
+        self._reception_pool.setMaxThreadCount(1)
         self.sync_candidates: list[SyncCandidate] = []
         self.voice_items: list[VoiceItem] = []
         self.gps_playback_timer = QTimer(self)
@@ -323,6 +340,7 @@ class MainWindow(QMainWindow):
         self._build_statistics_tab()
         self._build_raw_log_tab()
         self._build_gps_tab()
+        self._build_reception_tab()
         self._build_flight_tab()
         self._build_battery_tab()
         self._build_sync_tab()
@@ -508,6 +526,528 @@ class MainWindow(QMainWindow):
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
         self.populate_gps_value_combos()
+
+    def _build_reception_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        scan_row = QHBoxLayout()
+        self.reception_scan_status = QLabel("Open a log library to detect flying sites.")
+        self.reception_scan_status.setObjectName("summary")
+        self.reception_scan_status.setWordWrap(True)
+        scan_row.addWidget(self.reception_scan_status, 1)
+        self.reception_scan_progress = QProgressBar()
+        self.reception_scan_progress.setRange(0, 1)
+        self.reception_scan_progress.setValue(0)
+        self.reception_scan_progress.setTextVisible(True)
+        self.reception_scan_progress.setMaximumWidth(260)
+        scan_row.addWidget(self.reception_scan_progress)
+        self.reception_scan_refresh_button = QPushButton("Refresh Index")
+        self.reception_scan_refresh_button.clicked.connect(self.start_reception_scan)
+        self.reception_scan_refresh_button.setEnabled(False)
+        scan_row.addWidget(self.reception_scan_refresh_button)
+        self.reception_scan_cancel_button = QPushButton("Cancel")
+        self.reception_scan_cancel_button.clicked.connect(self.cancel_reception_scan)
+        self.reception_scan_cancel_button.setEnabled(False)
+        scan_row.addWidget(self.reception_scan_cancel_button)
+        layout.addLayout(scan_row)
+
+        selection = QFormLayout()
+        self.reception_site_combo = QComboBox()
+        self.reception_site_combo.currentIndexChanged.connect(self.reception_site_changed)
+        selection.addRow("Flying site", self.reception_site_combo)
+
+        date_row = QHBoxLayout()
+        self.reception_date_from = QDateEdit()
+        self.reception_date_from.setCalendarPopup(True)
+        self.reception_date_from.setDisplayFormat("yyyy-MM-dd")
+        self.reception_date_from.dateChanged.connect(self.reception_filters_changed)
+        self.reception_date_to = QDateEdit()
+        self.reception_date_to.setCalendarPopup(True)
+        self.reception_date_to.setDisplayFormat("yyyy-MM-dd")
+        self.reception_date_to.dateChanged.connect(self.reception_filters_changed)
+        date_row.addWidget(QLabel("From"))
+        date_row.addWidget(self.reception_date_from)
+        date_row.addWidget(QLabel("To"))
+        date_row.addWidget(self.reception_date_to)
+        date_row.addStretch()
+        selection.addRow("Date range", date_row)
+
+        self.reception_channel_combo = QComboBox()
+        self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
+        selection.addRow("Telemetry item", self.reception_channel_combo)
+
+        site_name_row = QHBoxLayout()
+        self.reception_site_name = QLineEdit()
+        self.reception_site_name.setPlaceholderText("Flying-site name")
+        site_name_row.addWidget(self.reception_site_name, 1)
+        self.reception_save_site_button = QPushButton("Save Name / Notes")
+        self.reception_save_site_button.clicked.connect(self.save_reception_site_metadata)
+        site_name_row.addWidget(self.reception_save_site_button)
+        selection.addRow("Site name", site_name_row)
+
+        self.reception_site_notes = QTextEdit()
+        self.reception_site_notes.setPlaceholderText("Optional flying-site notes")
+        self.reception_site_notes.setMaximumHeight(72)
+        selection.addRow("Notes", self.reception_site_notes)
+        layout.addLayout(selection)
+
+        range_row = QHBoxLayout()
+        self.reception_auto_range_check = QCheckBox("Auto range")
+        self.reception_auto_range_check.setChecked(True)
+        self.reception_auto_range_check.toggled.connect(self._update_reception_range_enabled)
+        range_row.addWidget(self.reception_auto_range_check)
+        range_row.addWidget(QLabel("Min"))
+        self.reception_min_spin = self._gps_range_spinbox()
+        range_row.addWidget(self.reception_min_spin)
+        range_row.addWidget(QLabel("Max"))
+        self.reception_max_spin = self._gps_range_spinbox()
+        range_row.addWidget(self.reception_max_spin)
+        self.reception_reverse_check = QCheckBox("Reverse")
+        range_row.addWidget(self.reception_reverse_check)
+        self.reception_generate_button = QPushButton("Generate Heatmap")
+        self.reception_generate_button.clicked.connect(self.generate_reception_heatmap)
+        range_row.addWidget(self.reception_generate_button)
+        range_row.addStretch()
+        layout.addLayout(range_row)
+
+        self.reception_result_status = QLabel("No reception heatmap generated.")
+        self.reception_result_status.setObjectName("summary")
+        self.reception_result_status.setWordWrap(True)
+        layout.addWidget(self.reception_result_status)
+
+        self.reception_view = ReceptionMapWidget()
+        layout.addWidget(self.reception_view, 1)
+        self.reception_tab = tab
+        self.tabs.addTab(tab, "Reception Map")
+        self._update_reception_range_enabled()
+        self._update_reception_generate_enabled()
+
+    @staticmethod
+    def _reception_record_date(record: dict[str, object]) -> date | None:
+        value = record.get("flight_date")
+        if value is None:
+            return None
+        try:
+            return date.fromisoformat(str(value)[:10])
+        except ValueError:
+            return None
+
+    def _selected_reception_site(self) -> dict[str, Any] | None:
+        site_id = self.reception_site_combo.currentData()
+        for site in self.reception_sites:
+            if site.get("id") == site_id:
+                return site
+        return None
+
+    def _reception_selection_token(self) -> tuple[str | None, int | None, date, date, str | None]:
+        root = str(self.library_root.resolve(strict=False)) if self.library_root is not None else None
+        raw_site_id = self.reception_site_combo.currentData()
+        site_id = raw_site_id if isinstance(raw_site_id, int) else None
+        start, end = self._reception_date_bounds()
+        raw_channel = self.reception_channel_combo.currentData()
+        channel = str(raw_channel) if raw_channel else None
+        return root, site_id, start, end, channel
+
+    def _set_reception_map_payload(self, payload: dict[str, object] | None, force: bool = False) -> None:
+        self._reception_map_payload = dict(payload) if payload is not None else None
+        if not force and not self._tab_is_active("reception_tab"):
+            self._reception_view_loaded = False
+            return
+        self.reception_view.set_heatmap(self._reception_map_payload, dark=self.dark_mode)
+        self._reception_view_loaded = True
+
+    def _load_cached_reception_sites(self, preserve_selection: bool = True) -> None:
+        previous_site_id = self.reception_site_combo.currentData() if preserve_selection else None
+        self.reception_sites = []
+        if self.library_root is not None:
+            for raw_site in self.store.list_flying_sites(self.library_root):
+                site = dict(raw_site)
+                site_id = int(site["id"])
+                site["records"] = self.store.list_flying_site_records(site_id)
+                self.reception_sites.append(site)
+
+        self.reception_site_combo.blockSignals(True)
+        self.reception_site_combo.clear()
+        for site in self.reception_sites:
+            records = site.get("records")
+            count = len(records) if isinstance(records, list) else 0
+            name = str(site.get("name") or f"Flying Site {site.get('id')}")
+            self.reception_site_combo.addItem(f"{name} ({count} logs)", site.get("id"))
+        selected_index = self.reception_site_combo.findData(previous_site_id)
+        self.reception_site_combo.setCurrentIndex(selected_index if selected_index >= 0 else (0 if self.reception_sites else -1))
+        self.reception_site_combo.blockSignals(False)
+        self.reception_site_changed(preserve_dates=selected_index >= 0)
+
+    def reception_site_changed(self, *_args, preserve_dates: bool = False) -> None:
+        self._invalidate_reception_heatmap("Site changed; generate the heatmap to refresh the map.")
+        site = self._selected_reception_site()
+        enabled = site is not None
+        self.reception_site_name.setEnabled(enabled)
+        self.reception_site_notes.setEnabled(enabled)
+        self.reception_save_site_button.setEnabled(enabled)
+        if site is None:
+            self.reception_site_name.clear()
+            self.reception_site_notes.clear()
+            self.reception_channel_combo.clear()
+            self.reception_result_status.setText("No indexed flying sites are available.")
+            self._set_reception_map_payload(None)
+            self._update_reception_generate_enabled()
+            return
+
+        self.reception_site_name.setText(str(site.get("name") or ""))
+        self.reception_site_notes.setPlainText(str(site.get("notes") or ""))
+        raw_records = site.get("records")
+        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
+        dates = [value for value in (self._reception_record_date(record) for record in records) if value is not None]
+        if dates and not preserve_dates:
+            start, end = min(dates), max(dates)
+            self.reception_date_from.blockSignals(True)
+            self.reception_date_to.blockSignals(True)
+            self.reception_date_from.setDate(QDate(start.year, start.month, start.day))
+            self.reception_date_to.setDate(QDate(end.year, end.month, end.day))
+            self.reception_date_from.blockSignals(False)
+            self.reception_date_to.blockSignals(False)
+        self.populate_reception_channels()
+        self._set_reception_map_payload(None)
+        self.reception_result_status.setText("Choose a telemetry item and generate the heatmap.")
+
+    def reception_filters_changed(self, *_args) -> None:
+        self._invalidate_reception_heatmap("Filters changed; generate the heatmap to refresh the map.")
+        self.populate_reception_channels()
+
+    def reception_channel_changed(self, *_args) -> None:
+        self._invalidate_reception_heatmap("Telemetry item changed; generate the heatmap to refresh the map.")
+
+    def _invalidate_reception_heatmap(self, message: str) -> None:
+        self.cancel_reception_heatmap(silent=True)
+        self._set_reception_map_payload(None)
+        self.reception_result_status.setText(message)
+        self._update_reception_generate_enabled()
+
+    def _reception_date_bounds(self) -> tuple[date, date]:
+        return self.reception_date_from.date().toPyDate(), self.reception_date_to.date().toPyDate()
+
+    def _eligible_reception_records(self, require_channel: str | None = None) -> list[dict[str, object]]:
+        site = self._selected_reception_site()
+        if site is None:
+            return []
+        start, end = self._reception_date_bounds()
+        if end < start:
+            return []
+        raw_records = site.get("records")
+        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
+        eligible: list[dict[str, object]] = []
+        for raw_record in records:
+            record = dict(raw_record)
+            record_date = self._reception_record_date(record)
+            if record.get("status") != "ok" or record_date is None or not (start <= record_date <= end):
+                continue
+            channels = record.get("channels")
+            if require_channel and (not isinstance(channels, list) or require_channel not in channels):
+                continue
+            eligible.append(record)
+        return eligible
+
+    def populate_reception_channels(self) -> None:
+        current_channel = self.reception_channel_combo.currentData()
+        records = self._eligible_reception_records()
+        coverage: dict[str, int] = {}
+        for record in records:
+            channels = record.get("channels")
+            if not isinstance(channels, list):
+                continue
+            for channel in set(str(value) for value in channels):
+                coverage[channel] = coverage.get(channel, 0) + 1
+
+        def channel_key(channel: str) -> tuple[int, str]:
+            name = channel.casefold()
+            radio_priority = 0 if any(token in name for token in ("vfr", "rssi", "rqly", "signal")) else 1
+            return radio_priority, name
+
+        self.reception_channel_combo.blockSignals(True)
+        self.reception_channel_combo.clear()
+        total = len(records)
+        for channel in sorted(coverage, key=channel_key):
+            self.reception_channel_combo.addItem(f"{channel} — {coverage[channel]}/{total} logs", channel)
+        selected_index = self.reception_channel_combo.findData(current_channel)
+        if selected_index >= 0:
+            self.reception_channel_combo.setCurrentIndex(selected_index)
+        self.reception_channel_combo.blockSignals(False)
+        self._update_reception_generate_enabled()
+
+    def _update_reception_range_enabled(self, *_args) -> None:
+        manual = not self.reception_auto_range_check.isChecked()
+        self.reception_min_spin.setEnabled(manual)
+        self.reception_max_spin.setEnabled(manual)
+
+    def _update_reception_generate_enabled(self, *_args) -> None:
+        has_site = self._selected_reception_site() is not None
+        has_channel = bool(self.reception_channel_combo.currentData())
+        start, end = self._reception_date_bounds()
+        busy = self._reception_heatmap_task is not None
+        self.reception_generate_button.setEnabled(has_site and has_channel and start <= end and not busy)
+
+    def save_reception_site_metadata(self) -> None:
+        site = self._selected_reception_site()
+        if site is None:
+            return
+        name = self.reception_site_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Flying site name", "Enter a non-empty flying-site name.")
+            return
+        notes = self.reception_site_notes.toPlainText().strip()
+        site_id = site.get("id")
+        if not isinstance(site_id, int):
+            raise TypeError("Flying site is missing its numeric database ID")
+        self.store.update_flying_site(site_id, name, notes)
+        site["name"] = name
+        site["notes"] = notes
+        index = self.reception_site_combo.currentIndex()
+        raw_records = site.get("records")
+        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
+        self.reception_site_combo.setItemText(index, f"{name} ({len(records)} logs)")
+        self.reception_result_status.setText(f"Saved metadata for {name}.")
+
+    @staticmethod
+    def _reception_result_value(result: object, name: str, default: object = None) -> object:
+        if isinstance(result, dict):
+            return result.get(name, default)
+        return getattr(result, name, default)
+
+    @classmethod
+    def _reception_result_int(cls, result: object, name: str) -> int:
+        value = cls._reception_result_value(result, name, 0)
+        if isinstance(value, (int, float, str)):
+            try:
+                return int(value)
+            except ValueError:
+                return 0
+        return 0
+
+    def start_reception_scan(self, *_args) -> None:
+        if self.library_root is None:
+            return
+        self.cancel_reception_scan(silent=True)
+        self._reception_scan_generation += 1
+        generation = self._reception_scan_generation
+        root = self.library_root
+        logs = list(self.library_logs)
+        cached_records = self.store.list_reception_records(root)
+
+        def work(progress, is_cancelled):
+            from .reception import refresh_reception_index
+
+            return refresh_reception_index(
+                logs,
+                cached_records,
+                root,
+                sample_stride=20,
+                progress=progress,
+                is_cancelled=is_cancelled,
+            )
+
+        task = ReceptionTask(work)
+        self._reception_scan_task = task
+        self._reception_tasks.add(task)
+        task.signals.progress.connect(
+            lambda completed, total, message: self._reception_scan_progress(
+                generation, completed, total, message
+            )
+        )
+        task.signals.result.connect(lambda result: self._reception_scan_completed(generation, root, result))
+        task.signals.failed.connect(lambda details: self._reception_scan_failed(generation, details))
+        task.signals.finished.connect(lambda: self._reception_task_finished("scan", task, generation))
+        self.reception_scan_progress.setRange(0, max(1, len(logs)))
+        self.reception_scan_progress.setValue(0)
+        self.reception_scan_status.setText(f"Refreshing flying-site index for {len(logs)} logs…")
+        self.reception_scan_refresh_button.setEnabled(False)
+        self.reception_scan_cancel_button.setEnabled(True)
+        self._reception_pool.start(task)
+
+    def cancel_reception_scan(self, *_args, silent: bool = False) -> None:
+        # Reject progress/results that may already be queued when cancellation
+        # is requested, even if the worker stops before opening another file.
+        self._reception_scan_generation += 1
+        task = self._reception_scan_task
+        if task is None:
+            return
+        task.cancel()
+        if not silent:
+            self.reception_scan_status.setText("Canceling flying-site index refresh…")
+        self.reception_scan_cancel_button.setEnabled(False)
+
+    def _reception_scan_progress(self, generation: int, completed: int, total: int, message: str) -> None:
+        if generation != self._reception_scan_generation:
+            return
+        self.reception_scan_progress.setRange(0, max(1, total))
+        self.reception_scan_progress.setValue(max(0, min(completed, max(1, total))))
+        detail = f" — {message}" if message else ""
+        self.reception_scan_status.setText(f"Indexing telemetry logs: {completed}/{total}{detail}")
+
+    def _reception_scan_completed(self, generation: int, root: Path, result: object) -> None:
+        if generation != self._reception_scan_generation or self.library_root != root:
+            return
+        records = self._reception_result_value(result, "records", [])
+        clusters = self._reception_result_value(result, "clusters", [])
+        if not isinstance(records, (list, tuple)) or not isinstance(clusters, (list, tuple)):
+            raise TypeError("Reception scan returned an invalid result")
+        self.store.upsert_reception_records(root, records)
+        self.store.remove_missing_reception_records(root, [log.path for log in self.library_logs])
+        self.store.apply_reception_clusters(root, clusters)
+        self._load_cached_reception_sites(preserve_selection=True)
+
+        scanned = self._reception_result_int(result, "scanned_count")
+        cached = self._reception_result_int(result, "cached_count")
+        errors = self._reception_result_int(result, "error_count")
+        gps_count = sum(1 for record in records if getattr(record, "status", None) == "ok" or (isinstance(record, dict) and record.get("status") == "ok"))
+        self.reception_scan_progress.setValue(self.reception_scan_progress.maximum())
+        self.reception_scan_status.setText(
+            f"Indexed {len(records)} logs: {gps_count} with GPS, {scanned} read, "
+            f"{cached} cached, {errors} errors; {len(self.reception_sites)} flying sites."
+        )
+
+    def _reception_scan_failed(self, generation: int, details: str) -> None:
+        if generation != self._reception_scan_generation:
+            return
+        message = details.strip().splitlines()[-1] if details.strip() else "Unknown error"
+        self.reception_scan_status.setText(f"Flying-site index refresh failed; cached sites were retained. {message}")
+
+    def generate_reception_heatmap(self, *_args) -> None:
+        site = self._selected_reception_site()
+        channel = self.reception_channel_combo.currentData()
+        if site is None or not channel:
+            return
+        # Pass every date/site-matching log so the core can report exact channel
+        # coverage and missing-channel counts instead of silently hiding them.
+        records = self._eligible_reception_records()
+        if not records:
+            self.reception_result_status.setText("No indexed logs match the selected site, dates, and telemetry item.")
+            self._set_reception_map_payload({"status": "empty", "message": self.reception_result_status.text()})
+            return
+
+        self.cancel_reception_heatmap(silent=True)
+        self._reception_heatmap_generation += 1
+        generation = self._reception_heatmap_generation
+        selection_token = self._reception_selection_token()
+        raw_latitude = site.get("center_latitude")
+        raw_longitude = site.get("center_longitude")
+        if not isinstance(raw_latitude, (int, float)) or not isinstance(raw_longitude, (int, float)):
+            self.reception_result_status.setText("The selected flying site has no valid center coordinate.")
+            return
+        center = (float(raw_latitude), float(raw_longitude))
+        telemetry_column = str(channel)
+
+        def work(progress, is_cancelled):
+            from .reception import build_reception_heatmap
+
+            return build_reception_heatmap(
+                records,
+                telemetry_column,
+                center,
+                cell_size_m=5.0,
+                progress=progress,
+                is_cancelled=is_cancelled,
+            )
+
+        task = ReceptionTask(work)
+        self._reception_heatmap_task = task
+        self._reception_tasks.add(task)
+        task.signals.progress.connect(
+            lambda completed, total, message: self._reception_heatmap_progress(
+                generation, completed, total, message
+            )
+        )
+        task.signals.result.connect(
+            lambda result: self._reception_heatmap_completed(generation, selection_token, result)
+        )
+        task.signals.failed.connect(lambda details: self._reception_heatmap_failed(generation, details))
+        task.signals.finished.connect(lambda: self._reception_task_finished("heatmap", task, generation))
+        self.reception_result_status.setText(f"Generating 5 m heatmap from {len(records)} matching logs…")
+        self.reception_generate_button.setText("Generating…")
+        self.reception_generate_button.setEnabled(False)
+        self._reception_pool.start(task)
+
+    def cancel_reception_heatmap(self, *_args, silent: bool = False) -> None:
+        # Invalidate before signaling cancellation. A worker may already have
+        # queued its result on the GUI thread even though it still appears
+        # active here; advancing the token prevents that stale payload from
+        # being applied after a site, date, channel, or library change.
+        self._reception_heatmap_generation += 1
+        task = self._reception_heatmap_task
+        if task is None:
+            return
+        task.cancel()
+        if not silent:
+            self.reception_result_status.setText("Canceling reception heatmap generation…")
+
+    def _reception_heatmap_progress(self, generation: int, completed: int, total: int, message: str) -> None:
+        if generation != self._reception_heatmap_generation:
+            return
+        detail = f" — {message}" if message else ""
+        self.reception_result_status.setText(f"Generating 5 m heatmap: {completed}/{total} logs{detail}")
+
+    def _reception_heatmap_completed(
+        self,
+        generation: int,
+        selection_token: tuple[str | None, int | None, date, date, str | None],
+        result: object,
+    ) -> None:
+        if (
+            generation != self._reception_heatmap_generation
+            or selection_token != self._reception_selection_token()
+            or not isinstance(result, dict)
+        ):
+            return
+        payload = dict(result)
+        auto_range = self.reception_auto_range_check.isChecked()
+        payload["auto_range"] = auto_range
+        payload["reverse"] = self.reception_reverse_check.isChecked()
+        if auto_range:
+            minimum = payload.get("value_min")
+            maximum = payload.get("value_max")
+            if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
+                self.reception_min_spin.setValue(float(minimum))
+            if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
+                self.reception_max_spin.setValue(float(maximum))
+        else:
+            payload["range_min"] = self.reception_min_spin.value()
+            payload["range_max"] = self.reception_max_spin.value()
+
+        self._set_reception_map_payload(payload)
+        status = str(payload.get("status") or "empty")
+        if status == "ok":
+            cells = len(payload.get("cells") or []) if isinstance(payload.get("cells"), list) else 0
+            used = int(payload.get("logs_used") or 0)
+            considered = int(payload.get("logs_considered") or 0)
+            missing = int(payload.get("missing_channel_count") or 0)
+            errors = int(payload.get("error_count") or 0)
+            inferred = int(payload.get("date_inferred_count") or 0)
+            off_site = int(payload.get("off_site_sample_count") or 0)
+            self.reception_result_status.setText(
+                f"Rendered {cells} observed 5 m cells from {used}/{considered} logs "
+                f"({missing} missing channel, {errors} read errors, {inferred} inferred dates, "
+                f"{off_site} off-site GPS samples removed)."
+            )
+        else:
+            self.reception_result_status.setText(str(payload.get("message") or "No reception samples matched the filters."))
+
+    def _reception_heatmap_failed(self, generation: int, details: str) -> None:
+        if generation != self._reception_heatmap_generation:
+            return
+        message = details.strip().splitlines()[-1] if details.strip() else "Unknown error"
+        self.reception_result_status.setText(f"Reception heatmap generation failed. {message}")
+
+    def _reception_task_finished(self, kind: str, task: ReceptionTask, generation: int) -> None:
+        self._reception_tasks.discard(task)
+        if kind == "scan" and self._reception_scan_task is task:
+            self._reception_scan_task = None
+            self.reception_scan_refresh_button.setEnabled(self.library_root is not None)
+            self.reception_scan_cancel_button.setEnabled(False)
+        elif kind == "heatmap" and self._reception_heatmap_task is task:
+            self._reception_heatmap_task = None
+            self.reception_generate_button.setText("Generate Heatmap")
+            self._update_reception_generate_enabled()
 
     def _build_flight_tab(self) -> None:
         tab = QWidget()
@@ -1062,10 +1602,15 @@ class MainWindow(QMainWindow):
             self.load_library(Path(path))
 
     def load_library(self, path: Path) -> None:
+        self.cancel_reception_scan()
+        self.cancel_reception_heatmap()
         self.library_root = path
         self.store.set_setting("library_root", str(path))
         self.library_logs = scan_library(path)
         self.populate_library_tree()
+        self.reception_scan_refresh_button.setEnabled(True)
+        self._load_cached_reception_sites(preserve_selection=False)
+        self.start_reception_scan()
         self.status.showMessage(f"Loaded {len(self.library_logs)} logs from {path}")
 
     def populate_library_tree(self) -> None:
@@ -1672,6 +2217,11 @@ class MainWindow(QMainWindow):
             if not self._gps_view_loaded or "gps" in self._deferred_views_dirty:
                 self.refresh_gps(force=True)
             self.gps_view.refresh_viewport(fit=True)
+        if hasattr(self, "reception_tab") and self.tabs.widget(index) is self.reception_tab:
+            if not self._reception_view_loaded:
+                self._set_reception_map_payload(self._reception_map_payload, force=True)
+            else:
+                self.reception_view.refresh_viewport(fit=False)
 
     def populate_gps_color_combo(self) -> None:
         self.gps_color_combo.blockSignals(True)
@@ -1735,6 +2285,8 @@ class MainWindow(QMainWindow):
         self.dark_mode = self.dark_action.isChecked()
         self._apply_style()
         self.refresh_plots()
+        if self._reception_view_loaded:
+            self._set_reception_map_payload(self._reception_map_payload, force=True)
 
     def set_telemetry_interaction_mode(self, mode: str) -> None:
         mode = mode if mode in {"pan", "zoom"} else "zoom"
@@ -2138,5 +2690,9 @@ class MainWindow(QMainWindow):
         return f"{size / (1024 * 1024):.1f} MB"
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        self.cancel_reception_scan()
+        self.cancel_reception_heatmap()
+        self._reception_pool.clear()
+        self._reception_pool.waitForDone(2000)
         self.store.close()
         super().closeEvent(a0)

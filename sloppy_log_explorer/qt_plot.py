@@ -16,6 +16,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
 from .models import GpsGradientOptions, LoadedLog
+from .reception_map_renderer import build_reception_map_html
 from .plotting import (
     MAX_RENDERED_TELEMETRY_TRACES,
     MAX_TELEMETRY_TRACE_POINTS_HARD_CAP,
@@ -124,6 +125,18 @@ def _remove_file(path: Path | None) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _new_local_map_page(view: QWebEngineView) -> QWebEnginePage:
+    """Create a map page with the shared persistent cache and local-file access."""
+    page = QWebEnginePage(_persistent_web_profile(), view)
+    settings = page.settings()
+    if settings is None:
+        raise RuntimeError("QWebEnginePage.settings() returned None")
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+    view.setPage(page)
+    return page
 
 
 def _json_plotly_value(value: Any) -> object:
@@ -438,12 +451,7 @@ class GpsPathWidget(QWidget):
         self._web_engine = _use_web_engine()
         if self._web_engine:
             self._view = QWebEngineView(self)
-            self._page = QWebEnginePage(_persistent_web_profile(), self._view)
-            settings = self._page.settings()
-            if settings is None:
-                raise RuntimeError("QWebEnginePage.settings() returned None")
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            self._page = _new_local_map_page(self._view)
             self._bridge = _GpsBridge()
             self._bridge.elapsed_seeked.connect(self.elapsed_seeked.emit)
             self._bridge.playing_changed.connect(self.playing_changed.emit)
@@ -452,7 +460,6 @@ class GpsPathWidget(QWidget):
             self._channel.registerObject("gpsBridge", self._bridge)
             self._page.setWebChannel(self._channel)
             self._page.loadFinished.connect(self._map_page_loaded)
-            self._view.setPage(self._page)
         else:
             self._view = QTextEdit(self)
             self._view.setReadOnly(True)
@@ -530,6 +537,164 @@ class GpsPathWidget(QWidget):
         self._schedule_viewport_refresh(fit=False)
 
     def closeEvent(self, a0) -> None:
+        _remove_file(self._html_path)
+        self._html_path = None
+        super().closeEvent(a0)
+
+
+class ReceptionMapWidget(QWidget):
+    """Qt WebEngine host for a generated multi-flight reception map."""
+
+    ready_changed = pyqtSignal(bool)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.payload: dict[str, object] | None = None
+        self.dark = True
+        self._view: QWebEngineView | QTextEdit
+        self._html_path: Path | None = None
+        self._page: QWebEnginePage | None = None
+        self._ready = False
+        self._ready_state: dict[str, object] | None = None
+        self._render_generation = 0
+        self._ready_poll_attempts = 0
+        self._ready_poll_timer = QTimer(self)
+        self._ready_poll_timer.setSingleShot(True)
+        self._ready_poll_timer.timeout.connect(self._poll_ready_state)
+        self._pending_viewport_fit = False
+        self._viewport_refresh_timer = QTimer(self)
+        self._viewport_refresh_timer.setSingleShot(True)
+        self._viewport_refresh_timer.timeout.connect(self._run_scheduled_viewport_refresh)
+        self._auto_fitted_generation = -1
+        self.setMinimumHeight(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._web_engine = _use_web_engine()
+        if self._web_engine:
+            self._view = QWebEngineView(self)
+            self._page = _new_local_map_page(self._view)
+            self._page.loadFinished.connect(self._map_page_loaded)
+        else:
+            self._view = QTextEdit(self)
+            self._view.setReadOnly(True)
+        layout.addWidget(self._view)
+
+    @property
+    def ready(self) -> bool:
+        """Whether the current WebEngine document reports its map layers ready."""
+        return self._ready
+
+    @property
+    def ready_state(self) -> dict[str, object] | None:
+        """Return the latest JSON-safe state reported by the map document."""
+        return dict(self._ready_state) if self._ready_state is not None else None
+
+    def _set_ready(self, ready: bool) -> None:
+        ready = bool(ready)
+        if ready == self._ready:
+            return
+        self._ready = ready
+        self.ready_changed.emit(ready)
+
+    def set_heatmap(self, payload: dict[str, object] | None, dark: bool = True) -> None:
+        """Render a JSON-safe reception payload, replacing the previous map."""
+        self.payload = dict(payload) if payload is not None else None
+        self.dark = dark
+        self._render_generation += 1
+        self._ready_poll_timer.stop()
+        self._ready_poll_attempts = 0
+        self._ready_state = None
+        self._auto_fitted_generation = -1
+        self._set_ready(False)
+        html_document = build_reception_map_html(self.payload, dark=dark)
+        if self._web_engine:
+            previous_path = self._html_path
+            self._html_path = _write_temp_html(html_document, "reception-map-")
+            cast(QWebEngineView, self._view).setUrl(QUrl.fromLocalFile(str(self._html_path)))
+            _remove_file(previous_path)
+            ReceptionMapWidget._schedule_viewport_refresh(self, fit=True)
+        else:
+            cast(QTextEdit, self._view).setHtml(html_document)
+
+    def refresh_viewport(self, fit: bool = False) -> None:
+        """Resize the live map and optionally fit all observed cells."""
+        if not self._web_engine or self._page is None:
+            return
+        options = json.dumps({"fit": fit})
+        self._page.runJavaScript(
+            f"window.sloppyReceptionMap ? window.sloppyReceptionMap.refresh({options}) : false;"
+        )
+
+    def _schedule_viewport_refresh(self, fit: bool = False) -> None:
+        try:
+            web_engine = self._web_engine
+            timer = self._viewport_refresh_timer
+        except (AttributeError, RuntimeError):
+            return
+        if not web_engine:
+            return
+        self._pending_viewport_fit = self._pending_viewport_fit or fit
+        if not timer.isActive():
+            timer.start(90)
+
+    def _run_scheduled_viewport_refresh(self) -> None:
+        fit = self._pending_viewport_fit
+        self._pending_viewport_fit = False
+        self.refresh_viewport(fit=fit)
+
+    def _map_page_loaded(self, ok: bool) -> None:
+        if not ok:
+            self._set_ready(False)
+            return
+        self._schedule_viewport_refresh(fit=True)
+        self._ready_poll_attempts = 0
+        self._poll_ready_state()
+
+    def _poll_ready_state(self) -> None:
+        page = self._page
+        if not self._web_engine or page is None:
+            return
+        generation = self._render_generation
+        page.runJavaScript(
+            "window.sloppyReceptionMap && window.sloppyReceptionMap.getState "
+            "? window.sloppyReceptionMap.getState() : null;",
+            lambda result: self._ready_state_received(result, generation),
+        )
+
+    def _ready_state_received(self, result: object, generation: int) -> None:
+        if generation != self._render_generation:
+            return
+        state = cast(dict[str, object], result) if isinstance(result, dict) else None
+        self._ready_state = dict(state) if state is not None else None
+        if (
+            state is not None
+            and state.get("state") == "ready"
+            and getattr(self, "_auto_fitted_generation", -1) != generation
+        ):
+            self._auto_fitted_generation = generation
+            ReceptionMapWidget._schedule_viewport_refresh(self, fit=True)
+        if state is not None and bool(state.get("ready")):
+            self._set_ready(True)
+            return
+        self._set_ready(False)
+        if state is not None and state.get("state") in {"error", "empty"}:
+            return
+        self._ready_poll_attempts += 1
+        if self._ready_poll_attempts < 150:
+            self._ready_poll_timer.start(100)
+
+    def showEvent(self, a0) -> None:
+        super().showEvent(a0)
+        self._schedule_viewport_refresh(fit=True)
+
+    def resizeEvent(self, a0) -> None:
+        super().resizeEvent(a0)
+        self._schedule_viewport_refresh(fit=False)
+
+    def closeEvent(self, a0) -> None:
+        self._ready_poll_timer.stop()
+        self._viewport_refresh_timer.stop()
         _remove_file(self._html_path)
         self._html_path = None
         super().closeEvent(a0)
