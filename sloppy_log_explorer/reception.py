@@ -57,6 +57,7 @@ SITE_TOLERANCE_KM = 2.0
 DEFAULT_CELL_SIZE_METERS = 5.0
 HEATMAP_SITE_RADIUS_KM = 10.0
 EARTH_RADIUS_METERS = 6_371_008.8
+_OBSERVED_NUMERIC_COLUMNS_ATTR = "sloppy_observed_numeric_columns"
 _CALENDAR_LITERAL_RE = re.compile(
     r"(?:\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b|\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b)"
 )
@@ -76,7 +77,7 @@ def _sampled_csv(
     max_records: int | None = None,
     full_scan_if_position_hint: bool = False,
 ) -> pd.DataFrame:
-    """Read each Nth row, unless a position-hinted header overrides the limit."""
+    """Read each Nth row while retaining whole-pass numeric-column evidence."""
     stride = max(1, int(sample_stride))
     requested_record_limit = max(1, int(max_records)) if max_records is not None else None
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -100,6 +101,7 @@ def _sampled_csv(
         width = len(header)
         rows: list[list[str]] = []
         short_log_rows: list[list[str]] = []
+        observed_numeric_columns: set[str] = set()
         data_index = 0
         for row in reader:
             if not row:
@@ -110,6 +112,15 @@ def _sampled_csv(
                 row = row + [""] * (width - len(row))
             elif len(row) > width:
                 row = row[:width]
+            for column, value in zip(columns, row):
+                if column in observed_numeric_columns:
+                    continue
+                try:
+                    numeric_value = float(value.strip())
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(numeric_value):
+                    observed_numeric_columns.add(column)
             if data_index < stride:
                 # Logs shorter than one stride are cheap to retain in full and
                 # need at least two rows for the shared GPS detector to prove a
@@ -120,7 +131,11 @@ def _sampled_csv(
             data_index += 1
         if data_index <= stride:
             rows = short_log_rows
-    return pd.DataFrame(rows, columns=pd.Index(columns))
+    dataframe = pd.DataFrame(rows, columns=pd.Index(columns))
+    dataframe.attrs[_OBSERVED_NUMERIC_COLUMNS_ATTR] = tuple(
+        column for column in columns if column in observed_numeric_columns
+    )
+    return dataframe
 
 
 def _inspect_index_sample(
@@ -136,13 +151,31 @@ def _inspect_index_sample(
     date,
     bool,
 ]:
+    observed_numeric_columns = tuple(
+        str(column)
+        for column in dataframe.attrs.get(_OBSERVED_NUMERIC_COLUMNS_ATTR, ())
+    )
     dataframe = _clean_columns(dataframe)
     _validate_table_structure(dataframe, file_path)
     parsed_time, timeline_columns = _detect_time(dataframe)
-    numeric_columns = _numeric_columns(dataframe, timeline_columns)
+    numeric_columns = list(
+        dict.fromkeys(
+            (
+                *_numeric_columns(dataframe, timeline_columns),
+                *(column for column in observed_numeric_columns if column in dataframe.columns),
+            )
+        )
+    )
     dataframe = dataframe.copy()
     gps = detect_gps_columns(dataframe, numeric_columns)
-    numeric_columns = _numeric_columns(dataframe, timeline_columns)
+    numeric_columns = list(
+        dict.fromkeys(
+            (
+                *_numeric_columns(dataframe, timeline_columns),
+                *(column for column in observed_numeric_columns if column in dataframe.columns),
+            )
+        )
+    )
     if not numeric_columns:
         raise InvalidTelemetryLogError(
             f"{file_path.name} has no usable numeric telemetry columns."
@@ -715,7 +748,12 @@ def refresh_reception_index(
 def _local_xy(latitude: float, longitude: float, center: tuple[float, float]) -> tuple[float, float]:
     center_latitude, center_longitude = center
     y = EARTH_RADIUS_METERS * math.radians(latitude - center_latitude)
-    x = EARTH_RADIUS_METERS * math.cos(math.radians(center_latitude)) * math.radians(longitude - center_longitude)
+    longitude_delta = ((longitude - center_longitude + 180.0) % 360.0) - 180.0
+    x = (
+        EARTH_RADIUS_METERS
+        * math.cos(math.radians(center_latitude))
+        * math.radians(longitude_delta)
+    )
     return x, y
 
 

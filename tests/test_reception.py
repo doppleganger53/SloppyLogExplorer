@@ -79,6 +79,27 @@ def test_index_log_samples_every_twentieth_row_and_uses_recorded_date(tmp_path: 
     assert record.channels == ("VFR 2.4G(%)",)
 
 
+def test_index_log_discovers_channels_between_stride_aligned_rows(tmp_path: Path) -> None:
+    path = tmp_path / "between-samples.csv"
+    rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]
+    for index in range(41):
+        sampled_row = index % 20 == 0
+        latitude = f"{39.0 + index * 0.00001:.8f}" if sampled_row else ""
+        longitude = "-75.00000000" if sampled_row else ""
+        channel_value = "" if sampled_row else str(90 - index)
+        rows.append(
+            f"2026-04-01,12:00:{index % 60:02d},"
+            f"{latitude},{longitude},{channel_value}"
+        )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    record = index_log(path, tmp_path, sample_stride=20)
+
+    assert record.status == "ok"
+    assert record.center_latitude == pytest.approx(39.0002, abs=1e-6)
+    assert record.channels == ("VFR 2.4G(%)",)
+
+
 def test_index_log_uses_file_modified_date_for_elapsed_only_log(tmp_path: Path) -> None:
     path = tmp_path / "undated.csv"
     _write_gps_log(path, [80.0, 81.0], dated=False)
@@ -459,6 +480,37 @@ def test_heatmap_splits_observed_samples_across_five_meter_boundaries(tmp_path: 
     assert payload["status"] == "ok"
     assert len(payload["cells"]) == 2
     assert sorted(cell["value"] for cell in payload["cells"]) == [10.0, 20.0]
+
+
+def test_heatmap_wraps_longitude_cells_across_the_antimeridian(tmp_path: Path) -> None:
+    path = tmp_path / "antimeridian.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)",
+                "2026-04-01,12:00:00,0.00000000,179.99998000,90",
+                "2026-04-01,12:00:01,0.00000000,-179.99998000,80",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record], "VFR 2.4G(%)", (0.0, 180.0), cell_size_m=5.0
+    )
+
+    assert payload["status"] == "ok"
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["sample_count"] == 2
+    assert cells[0]["value"] == pytest.approx(85.0)
+    assert all(abs(float(cell["longitude"]) - 180.0) < 0.001 for cell in cells)
+    assert all(
+        abs(float(longitude) - 180.0) < 0.001
+        for cell in cells
+        for longitude, _latitude in cell["polygon"]
+    )
 
 
 def test_heatmap_removes_repeated_gps_dropouts_far_from_selected_site(tmp_path: Path) -> None:
