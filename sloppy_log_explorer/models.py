@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,101 @@ class LibraryLogInfo:
     name: str
     modified: float
     size: int
+
+
+@dataclass(frozen=True)
+class ReceptionLogRecord:
+    library_root: Path
+    file_path: Path
+    file_size: int
+    mtime_ns: int
+    status: str
+    flight_date: date
+    date_inferred: bool
+    center_latitude: float | None
+    center_longitude: float | None
+    channels: tuple[str, ...] = ()
+    error: str = ""
+    site_id: int | None = None
+
+    @property
+    def path(self) -> Path:
+        return self.file_path
+
+    @property
+    def size(self) -> int:
+        return self.file_size
+
+    @property
+    def modified_ns(self) -> int:
+        return self.mtime_ns
+
+    @property
+    def date_is_inferred(self) -> bool:
+        return self.date_inferred
+
+    @property
+    def centroid_latitude(self) -> float | None:
+        return self.center_latitude
+
+    @property
+    def centroid_longitude(self) -> float | None:
+        return self.center_longitude
+
+    @property
+    def numeric_channels(self) -> tuple[str, ...]:
+        return self.channels
+
+
+@dataclass(frozen=True)
+class DetectedSiteCluster:
+    center_latitude: float
+    center_longitude: float
+    records: tuple[ReceptionLogRecord, ...] = ()
+    file_paths: tuple[str | Path, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.file_paths:
+            object.__setattr__(self, "file_paths", tuple(record.file_path for record in self.records))
+
+
+@dataclass(frozen=True)
+class FlyingSite:
+    id: int
+    library_root: Path
+    name: str
+    notes: str
+    active: bool
+    center_latitude: float
+    center_longitude: float
+    log_count: int = 0
+
+
+@dataclass(frozen=True)
+class ReceptionCell:
+    latitude: float
+    longitude: float
+    polygon: tuple[tuple[float, float], ...]
+    value: float
+    sample_count: int
+    flight_count: int
+
+
+@dataclass(frozen=True)
+class TelemetryChannelCoverage:
+    channel: str
+    count: int
+    total: int
+
+
+@dataclass(frozen=True)
+class ReceptionScanResult:
+    records: tuple[ReceptionLogRecord, ...]
+    clusters: tuple[DetectedSiteCluster, ...]
+    scanned_count: int
+    cached_count: int
+    error_count: int
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
