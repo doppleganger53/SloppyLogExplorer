@@ -667,6 +667,13 @@ class MainWindow(QMainWindow):
                 site["records"] = self.store.list_flying_site_records(site_id)
                 self.reception_sites.append(site)
 
+        self.reception_sites.sort(
+            key=lambda site: (
+                str(site.get("name") or f"Flying Site {site.get('id')}").casefold(),
+                int(site["id"]),
+            )
+        )
+
         self.reception_site_combo.blockSignals(True)
         self.reception_site_combo.clear()
         for site in self.reception_sites:

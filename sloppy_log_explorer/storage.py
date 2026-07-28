@@ -11,6 +11,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from .models import RECEPTION_INDEX_VERSION
+
 
 _MISSING = object()
 
@@ -167,6 +169,7 @@ class AppStore:
                 channels_json text not null default '[]',
                 error text not null default '',
                 site_id integer references flying_sites(id) on delete set null,
+                index_version integer not null default 0,
                 updated_at text not null default current_timestamp,
                 primary key(library_root, file_path)
             );
@@ -180,6 +183,23 @@ class AppStore:
         self._ensure_column("flights", "notes", "text default ''")
         self._ensure_column("flights", "video_path", "text default ''")
         self._ensure_column("flights", "updated_at", "text")
+        reception_columns = {
+            row["name"]
+            for row in self.conn.execute("pragma table_info(reception_logs)").fetchall()
+        }
+        reception_index_version_added = "index_version" not in reception_columns
+        self._ensure_column("reception_logs", "index_version", "integer not null default 0")
+        if reception_index_version_added:
+            # Malformed and unavailable files are unaffected by GPS indexing
+            # changes. Successful and prior no-GPS records are deliberately
+            # refreshed because the header-aware scan can recover late fixes.
+            self.conn.execute(
+                """
+                update reception_logs set index_version = ?
+                where status in ('malformed', 'io_error')
+                """,
+                (RECEPTION_INDEX_VERSION,),
+            )
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -364,6 +384,9 @@ class AppStore:
                 )
             )
             error = str(_item_value(record, "error", "error_message", default="") or "")
+            index_version = int(
+                _item_value(record, "index_version", default=RECEPTION_INDEX_VERSION)
+            )
             values.append(
                 (
                     root,
@@ -377,6 +400,7 @@ class AppStore:
                     center_longitude,
                     json.dumps(channels, ensure_ascii=False),
                     error,
+                    index_version,
                 )
             )
 
@@ -386,9 +410,9 @@ class AppStore:
                 insert into reception_logs(
                     library_root, file_path, file_size, mtime_ns, status,
                     flight_date, date_inferred, center_latitude,
-                    center_longitude, channels_json, error
+                    center_longitude, channels_json, error, index_version
                 )
-                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(library_root, file_path) do update set
                     file_size = excluded.file_size,
                     mtime_ns = excluded.mtime_ns,
@@ -399,6 +423,7 @@ class AppStore:
                     center_longitude = excluded.center_longitude,
                     channels_json = excluded.channels_json,
                     error = excluded.error,
+                    index_version = excluded.index_version,
                     updated_at = current_timestamp
                 """,
                 values,

@@ -92,7 +92,7 @@ def test_index_log_uses_file_modified_date_for_elapsed_only_log(tmp_path: Path) 
     assert record.date_inferred is True
 
 
-def test_index_log_stops_after_bounded_probe_when_gps_is_not_found(
+def test_index_log_scans_position_hinted_logs_past_the_probe_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -119,12 +119,14 @@ def test_index_log_stops_after_bounded_probe_when_gps_is_not_found(
         sample_stride: int,
         *,
         max_records: int | None = None,
+        full_scan_if_position_hint: bool = False,
     ):
         limits.append(max_records)
         return sampled_csv(
             sampled_path,
             sample_stride,
             max_records=max_records,
+            full_scan_if_position_hint=full_scan_if_position_hint,
         )
 
     monkeypatch.setattr(reception, "_sampled_csv", recording_sample)
@@ -133,10 +135,49 @@ def test_index_log_stops_after_bounded_probe_when_gps_is_not_found(
     limits.clear()
     complete = index_log(path, tmp_path, sample_stride=1, gps_probe_records=5)
 
-    assert bounded.status == "no_gps"
+    assert bounded.status == "ok"
     assert bounded_limits == [3]
     assert complete.status == "ok"
-    assert limits == [5, None]
+    assert limits == [5]
+
+
+def test_index_log_keeps_unhinted_non_gps_probe_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "plain.csv"
+    path.write_text(
+        "Date,Time,VFAS(V)\n"
+        "2026-04-01,12:00:00,16.8\n"
+        "2026-04-01,12:00:01,16.7\n"
+        "2026-04-01,12:00:02,16.6\n"
+        "2026-04-01,12:00:03,16.5\n",
+        encoding="utf-8",
+    )
+    sampled_csv = reception._sampled_csv
+    calls: list[tuple[int, int | None, bool]] = []
+
+    def recording_sample(
+        sampled_path: Path,
+        sample_stride: int,
+        *,
+        max_records: int | None = None,
+        full_scan_if_position_hint: bool = False,
+    ):
+        calls.append((sample_stride, max_records, full_scan_if_position_hint))
+        return sampled_csv(
+            sampled_path,
+            sample_stride,
+            max_records=max_records,
+            full_scan_if_position_hint=full_scan_if_position_hint,
+        )
+
+    monkeypatch.setattr(reception, "_sampled_csv", recording_sample)
+
+    record = index_log(path, tmp_path, sample_stride=20, gps_probe_records=3)
+
+    assert record.status == "no_gps"
+    assert calls == [(20, 3, True)]
 
 
 def test_index_log_supports_coordinate_text_and_split_gps_formats(tmp_path: Path) -> None:
@@ -224,6 +265,64 @@ def test_index_and_heatmap_share_origin_and_isolated_outlier_cleanup(tmp_path: P
     assert outlier.center_latitude == pytest.approx(39.00075, abs=1e-5)
     assert outlier.center_longitude == pytest.approx(-75.00075, abs=1e-5)
     assert sum(cell["sample_count"] for cell in outlier_payload["cells"]) == 4
+
+
+def test_index_uses_dominant_local_gps_cloud_and_ignores_partial_lock_rows(tmp_path: Path) -> None:
+    path = tmp_path / "startup-gps-errors.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)",
+                "2026-04-01,12:00:00,46.663220,-66.232376,10",
+                "2026-04-01,12:00:01,46.662421,-66.212856,20",
+                "2026-04-01,12:00:02,0.0,-75.204900,30",
+                "2026-04-01,12:00:03,0.0,-75.204900,40",
+                "2026-04-01,12:00:04,39.774300,-75.204900,90",
+                "2026-04-01,12:00:05,39.774400,-75.204800,80",
+                "2026-04-01,12:00:06,39.774500,-75.204700,70",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    assert record.status == "ok"
+    assert record.center_latitude == pytest.approx(39.7744, abs=1e-5)
+    assert record.center_longitude == pytest.approx(-75.2048, abs=1e-5)
+
+
+def test_index_rejects_gps_samples_without_a_dominant_local_cloud(tmp_path: Path) -> None:
+    path = tmp_path / "incoherent-gps.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)",
+                "2026-04-01,12:00:00,10.0,-20.0,90",
+                "2026-04-01,12:00:01,30.0,-50.0,80",
+                "2026-04-01,12:00:02,50.0,-80.0,70",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    assert record.status == "no_gps"
+
+
+def test_refresh_reindexes_records_from_an_older_index_algorithm(tmp_path: Path) -> None:
+    path = tmp_path / "flight.csv"
+    _write_gps_log(path, [90.0, 80.0])
+    logs = scan_library(tmp_path)
+    current = index_log(path, tmp_path, sample_stride=1)
+    stale = replace(current, index_version=0)
+
+    result = refresh_reception_index(logs, [stale], tmp_path, sample_stride=1)
+
+    assert result.scanned_count == 1
+    assert result.cached_count == 0
+    assert result.records[0].index_version == reception.RECEPTION_INDEX_VERSION
 
 
 def test_refresh_reception_index_reuses_unchanged_fingerprints_and_cancels(tmp_path: Path) -> None:

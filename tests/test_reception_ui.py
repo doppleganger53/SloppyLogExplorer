@@ -97,6 +97,46 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     app.quit()
 
 
+def test_reception_site_selector_sorts_display_names_case_insensitively(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    root = tmp_path / "library"
+    root.mkdir()
+    records = [
+        _record(root / "one.csv", "2026-04-01"),
+        _record(root / "two.csv", "2026-04-02"),
+        _record(root / "three.csv", "2026-04-03"),
+    ]
+    window.store.upsert_reception_records(root, records)
+    sites = window.store.apply_reception_clusters(
+        root,
+        [
+            {"file_paths": [records[0]["file_path"]], "center_latitude": 39.70, "center_longitude": -75.20},
+            {"file_paths": [records[1]["file_path"]], "center_latitude": 39.80, "center_longitude": -75.30},
+            {"file_paths": [records[2]["file_path"]], "center_latitude": 39.90, "center_longitude": -75.40},
+        ],
+    )
+    window.store.update_flying_site(int(sites[0]["id"]), "Zulu", "")
+    window.store.update_flying_site(int(sites[1]["id"]), "", "")
+    window.store.update_flying_site(int(sites[2]["id"]), "alpha", "")
+    window.library_root = root
+
+    window._load_cached_reception_sites(preserve_selection=False)
+
+    labels = [window.reception_site_combo.itemText(index) for index in range(3)]
+    assert labels[0] == "alpha (1 logs)"
+    assert labels[1].startswith("Flying Site ")
+    assert labels[2] == "Zulu (1 logs)"
+    window.close()
+    app.quit()
+
+
 def test_reception_filter_change_rejects_a_queued_stale_heatmap(
     tmp_path: Path, monkeypatch
 ) -> None:

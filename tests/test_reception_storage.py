@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from sloppy_log_explorer.models import DetectedSiteCluster, ReceptionLogRecord
+from sloppy_log_explorer.models import (
+    RECEPTION_INDEX_VERSION,
+    DetectedSiteCluster,
+    ReceptionLogRecord,
+)
 from sloppy_log_explorer.storage import AppStore
 
 
@@ -77,8 +81,57 @@ def test_reception_schema_migrates_idempotently_from_existing_database(tmp_path:
         "channels_json",
         "error",
         "site_id",
+        "index_version",
     } <= reception_columns
     second.close()
+
+
+def test_index_version_migration_refreshes_prior_gps_and_no_gps_records(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        create table reception_logs (
+            library_root text not null,
+            file_path text not null,
+            file_size integer not null,
+            mtime_ns integer not null,
+            status text not null,
+            flight_date text,
+            date_inferred integer not null default 0,
+            center_latitude real,
+            center_longitude real,
+            channels_json text not null default '[]',
+            error text not null default '',
+            site_id integer,
+            updated_at text not null default current_timestamp,
+            primary key(library_root, file_path)
+        );
+        insert into reception_logs(
+            library_root, file_path, file_size, mtime_ns, status, flight_date
+        ) values
+            ('library', 'gps.csv', 1, 1, 'ok', '2026-01-01'),
+            ('library', 'plain.csv', 1, 1, 'no_gps', '2026-01-01'),
+            ('library', 'bad.csv', 1, 1, 'malformed', '2026-01-01');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    store = AppStore(database)
+    versions = {
+        row["file_path"]: row["index_version"]
+        for row in store.conn.execute(
+            "select file_path, index_version from reception_logs"
+        ).fetchall()
+    }
+
+    assert versions == {
+        "gps.csv": 0,
+        "plain.csv": 0,
+        "bad.csv": RECEPTION_INDEX_VERSION,
+    }
+    store.close()
 
 
 @dataclass(frozen=True)
@@ -141,6 +194,7 @@ def test_reception_cache_upsert_remove_and_library_isolation(tmp_path: Path) -> 
     assert first_records[0]["flight_date"] == "2026-06-02"
     assert first_records[0]["date_inferred"] is True
     assert first_records[0]["channels"] == ["RSSI(dB)", "VFR 2.4G(%)"]
+    assert first_records[0]["index_version"] == RECEPTION_INDEX_VERSION
     assert first_records[1]["status"] == "no_gps"
     assert first_records[1]["channels"] == ["RxBt(V)"]
 

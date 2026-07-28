@@ -260,10 +260,10 @@ def write_gps_course_only_sample(path: Path) -> None:
     path.write_text(
         "\n".join(
             [
-                "Date,Time,TxBat(V),Pot1,GPS course(°),Current(A),Altitude(m)",
-                "2026-01-01,12:00:00,7.6,12,359.8,0.2,10",
-                "2026-01-01,12:00:01,7.5,13,359.9,0.3,11",
-                "2026-01-01,12:00:02,7.4,14,359.9,0.1,12",
+                "Date,Time,TxBat(V),Pot1,GPS course(°),Current(A),GPS alt(m)",
+                "2026-01-01,12:00:00,7.6,12,58.0,0.2,0",
+                "2026-01-01,12:00:01,7.5,13,58.1,0.3,0",
+                "2026-01-01,12:00:02,7.4,14,58.2,0.1,0",
             ]
         ),
         encoding="utf-8",

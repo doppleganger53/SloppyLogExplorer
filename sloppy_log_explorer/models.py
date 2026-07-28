@@ -9,6 +9,8 @@ from typing import Any
 
 import pandas as pd
 
+RECEPTION_INDEX_VERSION = 1
+
 
 @dataclass(frozen=True)
 class GpsColumns:
@@ -57,6 +59,7 @@ class ReceptionLogRecord:
     channels: tuple[str, ...] = ()
     error: str = ""
     site_id: int | None = None
+    index_version: int = RECEPTION_INDEX_VERSION
 
     @property
     def path(self) -> Path:

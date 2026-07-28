@@ -20,6 +20,7 @@ from .models import (
     DetectedSiteCluster,
     GpsColumns,
     LibraryLogInfo,
+    RECEPTION_INDEX_VERSION,
     ReceptionCell,
     ReceptionLogRecord,
     ReceptionScanResult,
@@ -32,6 +33,7 @@ from .parser import (
     _deduplicate_columns,
     _detect_time,
     _has_date_header,
+    _has_position_header_hint,
     _numeric_columns,
     _validate_table_structure,
     detect_gps_columns,
@@ -48,7 +50,9 @@ from .plotting import (
 
 
 SAMPLE_STRIDE = 20
-GPS_PROBE_RECORDS = 2_000
+# Position-hinted logs bypass this limit and receive one whole-file sparse pass.
+# This bounded prefix only protects support for unknown, unhinted GPS formats.
+GPS_PROBE_RECORDS = 200
 SITE_TOLERANCE_KM = 2.0
 DEFAULT_CELL_SIZE_METERS = 5.0
 HEATMAP_SITE_RADIUS_KM = 10.0
@@ -70,10 +74,11 @@ def _sampled_csv(
     sample_stride: int,
     *,
     max_records: int | None = None,
+    full_scan_if_position_hint: bool = False,
 ) -> pd.DataFrame:
-    """Read each Nth logical data row, optionally stopping at a record limit."""
+    """Read each Nth row, unless a position-hinted header overrides the limit."""
     stride = max(1, int(sample_stride))
-    record_limit = max(1, int(max_records)) if max_records is not None else None
+    requested_record_limit = max(1, int(max_records)) if max_records is not None else None
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         sniff_sample = handle.read(4096)
         handle.seek(0)
@@ -86,6 +91,12 @@ def _sampled_csv(
             header = next(reader)
         except StopIteration:
             return pd.DataFrame()
+        columns = _deduplicate_columns(header)
+        record_limit = (
+            None
+            if full_scan_if_position_hint and _has_position_header_hint(columns)
+            else requested_record_limit
+        )
         width = len(header)
         rows: list[list[str]] = []
         short_log_rows: list[list[str]] = []
@@ -109,7 +120,7 @@ def _sampled_csv(
             data_index += 1
         if data_index <= stride:
             rows = short_log_rows
-    return pd.DataFrame(rows, columns=pd.Index(_deduplicate_columns(header)))
+    return pd.DataFrame(rows, columns=pd.Index(columns))
 
 
 def _inspect_index_sample(
@@ -241,6 +252,68 @@ def _haversine_km(left_lat: float, left_lon: float, right_lat: float, right_lon:
     return (2.0 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(value)))) / 1000.0
 
 
+def _site_local_gps_candidates(
+    candidates: Sequence[GpsCandidate],
+    radius_km: float = HEATMAP_SITE_RADIUS_KM,
+) -> list[GpsCandidate]:
+    """Keep the dominant local fix cloud used to identify a flying site."""
+    if len(candidates) < 2:
+        return []
+
+    localized = list(candidates)
+    fully_resolved = [
+        candidate
+        for candidate in localized
+        if abs(float(candidate[0]["lat"])) > 1e-9
+        and abs(float(candidate[0]["lon"])) > 1e-9
+    ]
+    if len(fully_resolved) >= 2:
+        # A receiver awaiting lock commonly reports one axis as exactly zero
+        # while retaining the other. Preserve true equator/prime-meridian logs
+        # when no fully resolved alternative exists.
+        localized = fully_resolved
+
+    reference_longitude = float(localized[0][0]["lon"])
+    unwrapped_longitudes = [
+        reference_longitude
+        + ((float(candidate[0]["lon"]) - reference_longitude + 180.0) % 360.0)
+        - 180.0
+        for candidate in localized
+    ]
+    seed_latitude = float(statistics.median(float(candidate[0]["lat"]) for candidate in localized))
+    seed_longitude = ((float(statistics.median(unwrapped_longitudes)) + 180.0) % 360.0) - 180.0
+    inliers = [
+        candidate
+        for candidate in localized
+        if _haversine_km(
+            seed_latitude,
+            seed_longitude,
+            float(candidate[0]["lat"]),
+            float(candidate[0]["lon"]),
+        )
+        <= radius_km + 1e-9
+    ]
+    if len(inliers) < 2 or len(inliers) * 2 <= len(localized):
+        return []
+
+    center_latitude, center_longitude = _spherical_centroid(
+        (float(candidate[0]["lat"]), float(candidate[0]["lon"]))
+        for candidate in inliers
+    )
+    refined = [
+        candidate
+        for candidate in localized
+        if _haversine_km(
+            center_latitude,
+            center_longitude,
+            float(candidate[0]["lat"]),
+            float(candidate[0]["lon"]),
+        )
+        <= radius_km + 1e-9
+    ]
+    return refined if len(refined) >= 2 and len(refined) * 2 > len(localized) else []
+
+
 def _file_metadata(path: Path) -> tuple[int, int, float]:
     stat = path.stat()
     return stat.st_size, stat.st_mtime_ns, stat.st_mtime
@@ -275,9 +348,11 @@ def index_log(
     try:
         probe = _sampled_csv(
             file_path,
-            1,
+            sample_stride,
             max_records=gps_probe_records,
+            full_scan_if_position_hint=True,
         )
+        probe_is_full_sample = _has_position_header_hint(probe.columns)
         (
             probe,
             probe_time,
@@ -311,19 +386,27 @@ def index_log(
                 probe_channels,
             )
 
-        (
-            dataframe,
-            parsed_time,
-            _timeline_columns,
-            gps,
-            sampled_channels,
-            sampled_flight_date,
-            sampled_date_inferred,
-        ) = _inspect_index_sample(
-            _sampled_csv(file_path, sample_stride),
-            file_path,
-            modified,
-        )
+        if probe_is_full_sample:
+            dataframe = probe
+            parsed_time = probe_time
+            gps = probe_gps
+            sampled_channels = probe_channels
+            sampled_flight_date = probe_flight_date
+            sampled_date_inferred = probe_date_inferred
+        else:
+            (
+                dataframe,
+                parsed_time,
+                _timeline_columns,
+                gps,
+                sampled_channels,
+                sampled_flight_date,
+                sampled_date_inferred,
+            ) = _inspect_index_sample(
+                _sampled_csv(file_path, sample_stride),
+                file_path,
+                modified,
+            )
         channels = tuple(dict.fromkeys((*probe_channels, *sampled_channels)))
         flight_date = probe_flight_date if not probe_date_inferred else sampled_flight_date
         date_inferred = probe_date_inferred and sampled_date_inferred
@@ -341,11 +424,13 @@ def index_log(
                 channels,
             )
         time_values = list(parsed_time) if parsed_time is not None else None
-        candidates = _valid_gps_candidates(
-            dataframe,
-            gps.latitude,
-            gps.longitude,
-            time_values=time_values,
+        candidates = _site_local_gps_candidates(
+            _valid_gps_candidates(
+                dataframe,
+                gps.latitude,
+                gps.longitude,
+                time_values=time_values,
+            )
         )
         if not candidates:
             return ReceptionLogRecord(
@@ -430,6 +515,7 @@ def _coerce_record(value: ReceptionLogRecord | Mapping[str, Any]) -> ReceptionLo
         tuple(str(channel) for channel in (value.get("channels") or value.get("numeric_channels") or ())),
         str(value.get("error") or value.get("error_message") or ""),
         int(value["site_id"]) if value.get("site_id") is not None else None,
+        int(value.get("index_version") or 0),
     )
 
 
@@ -599,7 +685,12 @@ def refresh_reception_index(
             size, mtime_ns = int(item.size), int(float(item.modified) * 1_000_000_000)
             metadata_from_library = True
         existing = cached.get(_canonical_path(path))
-        if existing is not None and existing.file_size == size and existing.mtime_ns == mtime_ns:
+        if (
+            existing is not None
+            and existing.file_size == size
+            and existing.mtime_ns == mtime_ns
+            and existing.index_version == RECEPTION_INDEX_VERSION
+        ):
             record = existing
             cached_count += 1
         else:
