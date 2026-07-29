@@ -17,7 +17,9 @@ from sloppy_log_explorer.reception import (
     cluster_reception_records,
     filter_site_records,
     index_log,
+    logical_telemetry_groups,
     refresh_reception_index,
+    telemetry_group_columns,
     telemetry_channel_coverage,
 )
 
@@ -611,6 +613,192 @@ def test_heatmap_uses_all_rows_five_meter_cells_and_equal_flight_medians(tmp_pat
     assert len(cells[0]["polygon"]) == 5
     assert cells[0]["polygon"][0] == cells[0]["polygon"][-1]
     json.dumps(payload, allow_nan=False)
+
+
+def test_logical_telemetry_groups_only_combine_supported_dot_number_siblings() -> None:
+    groups = logical_telemetry_groups(
+        ["RSSI(dB)", "RSSI(dB).1", "RSSI(dB).2", "Cell1", "Cell2", "Literal.1"]
+    )
+
+    assert groups["RSSI(dB)"] == ("RSSI(dB)", "RSSI(dB).1", "RSSI(dB).2")
+    assert groups["Cell1"] == ("Cell1",)
+    assert groups["Cell2"] == ("Cell2",)
+    assert groups["Literal.1"] == ("Literal.1",)
+    assert telemetry_group_columns(groups["RSSI(dB)"], "RSSI(dB)") == groups["RSSI(dB)"]
+
+
+def test_heatmap_combines_indexed_source_variants_once_per_row(tmp_path: Path) -> None:
+    path = tmp_path / "indexed-source.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),VFR(%)",
+                "2026-04-01,12:00:00,39.75,-75.25,80,100",
+                "2026-04-01,12:00:01,39.75,-75.25,,60",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap([record], "VFR(%)", (39.75, -75.25))
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["sample_count"] == 2
+    assert cells[0]["value"] == pytest.approx(75.0)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("difference", 40.0),
+        ("db_power", 60.0 - 10.0 * math.log10(20.0)),
+    ],
+)
+def test_heatmap_normalizes_paired_row_values(
+    tmp_path: Path,
+    mode: str,
+    expected: float,
+) -> None:
+    path = tmp_path / f"{mode}.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,80,5",
+                "2026-04-01,12:00:01,39.75,-75.25,60,20",
+                "2026-04-01,12:00:02,39.75,-75.25,40,200",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record],
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode=mode,
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == pytest.approx(expected)
+    assert cells[0]["sample_count"] == 3
+    assert payload["reference_observed_min"] == 5.0
+    assert payload["reference_observed_max"] == 200.0
+
+
+@pytest.mark.parametrize("bounds", [(10.0, 100.0), (100.0, 10.0)])
+def test_ratio_normalization_clamps_manual_reference_bounds(
+    tmp_path: Path,
+    bounds: tuple[float, float],
+) -> None:
+    path = tmp_path / "ratio.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,80,5",
+                "2026-04-01,12:00:01,39.75,-75.25,60,20",
+                "2026-04-01,12:00:02,39.75,-75.25,40,200",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record],
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode="ratio",
+        reference_range=bounds,
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == pytest.approx(3.0)
+    assert payload["reference_range_min"] == 10.0
+    assert payload["reference_range_max"] == 100.0
+    assert payload["reference_observed_min"] == 5.0
+    assert payload["reference_observed_max"] == 200.0
+    assert payload["clamped_reference_sample_count"] == 2
+    assert "clamp(Power 900M(mW), 10, 100)" in str(payload["telemetry_label"])
+
+
+def test_ratio_auto_range_and_zero_reference_handling(tmp_path: Path) -> None:
+    path = tmp_path / "auto-ratio.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,100,0",
+                "2026-04-01,12:00:01,39.75,-75.25,100,10",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record],
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode="ratio",
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == 10.0
+    assert cells[0]["sample_count"] == 1
+    assert payload["reference_auto_range"] is True
+    assert payload["reference_range_min"] == 0.0
+    assert payload["reference_range_max"] == 10.0
+    assert payload["invalid_reference_sample_count"] == 1
+    assert payload["clamped_reference_sample_count"] == 0
+
+
+def test_ratio_combines_indexed_reference_variants_and_reports_missing_logs(tmp_path: Path) -> None:
+    paired_path = tmp_path / "indexed-reference.csv"
+    paired_path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,100,10,30",
+                "2026-04-01,12:00:01,39.75,-75.25,100,10,30",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    missing_path = tmp_path / "missing-reference.csv"
+    _write_gps_log(missing_path, [50.0, 50.0], channel="VFR(%)")
+    records = [
+        index_log(paired_path, tmp_path, sample_stride=1),
+        index_log(missing_path, tmp_path, sample_stride=1),
+    ]
+
+    payload = build_reception_heatmap(
+        records,
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode="ratio",
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == 5.0
+    assert cells[0]["sample_count"] == 2
+    assert payload["reference_observed_min"] == 20.0
+    assert payload["reference_observed_max"] == 20.0
+    assert payload["missing_reference_count"] == 1
+    assert payload["logs_considered"] == 2
+    assert payload["logs_used"] == 1
 
 
 def test_heatmap_splits_observed_samples_across_five_meter_boundaries(tmp_path: Path) -> None:

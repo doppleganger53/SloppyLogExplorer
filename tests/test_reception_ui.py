@@ -70,6 +70,110 @@ def test_reception_tab_uses_cached_site_dates_and_exact_channel_coverage(
     app.quit()
 
 
+def test_reception_tab_groups_indexed_channels_and_configures_normalization(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    root = tmp_path / "library"
+    root.mkdir()
+    records = [
+        _record(
+            root / "first.csv",
+            "2026-04-01",
+            channels=["VFR 900M(%)", "VFR 900M(%).1", "Power 900M(mW)", "Cell1"],
+        ),
+        _record(
+            root / "second.csv",
+            "2026-04-02",
+            channels=["VFR 900M(%).2", "Power 900M(mW).1", "Cell2", "Literal.1"],
+        ),
+    ]
+    window.store.upsert_reception_records(root, records)
+    window.store.apply_reception_clusters(
+        root,
+        [{"file_paths": [record["file_path"] for record in records], "center_latitude": 39.75, "center_longitude": -75.25}],
+    )
+    window.library_root = root
+    window._load_cached_reception_sites(preserve_selection=False)
+
+    source_choices = [
+        window.reception_channel_combo.itemText(index)
+        for index in range(window.reception_channel_combo.count())
+    ]
+    assert "VFR 900M(%) — 2/2 logs" in source_choices
+    assert not any("VFR 900M(%).1" in choice or "VFR 900M(%).2" in choice for choice in source_choices)
+    assert "Cell1 — 1/2 logs" in source_choices
+    assert "Cell2 — 1/2 logs" in source_choices
+    assert "Literal.1 — 1/2 logs" in source_choices
+
+    source_index = window.reception_channel_combo.findData("VFR 900M(%)")
+    window.reception_channel_combo.setCurrentIndex(source_index)
+    reference_choices = [
+        window.reception_reference_combo.itemText(index)
+        for index in range(window.reception_reference_combo.count())
+    ]
+    assert reference_choices[0] == "Power 900M(mW) — 2/2 source logs"
+    assert window.reception_opacity_slider.value() == 72
+    assert not window.reception_normalize_check.isChecked()
+    assert not window.reception_reference_combo.isEnabled()
+
+    window.reception_normalize_check.setChecked(True)
+    assert window.reception_reference_combo.isEnabled()
+    assert window.reception_normalization_mode_combo.currentData() == "ratio"
+    assert window.reception_reference_auto_range_check.isEnabled()
+    assert window.reception_reference_auto_range_check.isChecked()
+    assert not window.reception_reference_min_spin.isEnabled()
+
+    generation = window._reception_heatmap_generation
+    token = window._reception_selection_token()
+    window._reception_heatmap_completed(
+        generation,
+        token,
+        {
+            "status": "ok",
+            "cells": [],
+            "value_min": 0.1,
+            "value_max": 10.0,
+            "normalization_mode": "ratio",
+            "reference_range_min": 5.0,
+            "reference_range_max": 1_000.0,
+            "logs_used": 2,
+            "logs_considered": 2,
+        },
+    )
+    assert window.reception_reference_min_spin.value() == 5.0
+    assert window.reception_reference_max_spin.value() == 1_000.0
+    assert window._reception_heatmap_generation == generation
+
+    window.reception_reference_auto_range_check.setChecked(False)
+    assert window.reception_reference_min_spin.isEnabled()
+    before_bounds = window._reception_selection_token()
+    window.reception_reference_min_spin.setValue(10.0)
+    assert window._reception_selection_token() != before_bounds
+
+    difference_index = window.reception_normalization_mode_combo.findData("difference")
+    window.reception_normalization_mode_combo.setCurrentIndex(difference_index)
+    assert not window.reception_reference_auto_range_check.isEnabled()
+    assert not window.reception_reference_min_spin.isEnabled()
+
+    opacity_updates: list[float] = []
+    monkeypatch.setattr(window.reception_view, "set_opacity", opacity_updates.append)
+    window._reception_map_payload = {"status": "ok"}
+    heatmap_generation = window._reception_heatmap_generation
+    window.reception_opacity_slider.setValue(35)
+    assert opacity_updates == [0.35]
+    assert window._reception_map_payload["opacity"] == 0.35
+    assert window.reception_opacity_label.text() == "35%"
+    assert window._reception_heatmap_generation == heatmap_generation
+    window.close()
+    app.quit()
+
+
 def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     tmp_path: Path, monkeypatch
 ) -> None:

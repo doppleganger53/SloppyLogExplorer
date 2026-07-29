@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QProgressBar,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -60,6 +61,7 @@ from .library import group_by_model, scan_library
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
 from .qt_plot import GpsPathWidget, ReceptionMapWidget, TelemetryPlotWidget
+from .reception import logical_telemetry_groups
 from .reception_workers import ReceptionTask
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
@@ -577,6 +579,43 @@ class MainWindow(QMainWindow):
         self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
         selection.addRow("Telemetry item", self.reception_channel_combo)
 
+        normalize_row = QHBoxLayout()
+        self.reception_normalize_check = QCheckBox("Normalize")
+        self.reception_normalize_check.toggled.connect(self.reception_normalization_changed)
+        normalize_row.addWidget(self.reception_normalize_check)
+        self.reception_reference_combo = QComboBox()
+        self.reception_reference_combo.currentIndexChanged.connect(self.reception_normalization_changed)
+        normalize_row.addWidget(self.reception_reference_combo, 1)
+        self.reception_normalization_mode_combo = QComboBox()
+        self.reception_normalization_mode_combo.addItem("Ratio", "ratio")
+        self.reception_normalization_mode_combo.addItem("Difference", "difference")
+        self.reception_normalization_mode_combo.addItem("dB power correction", "db_power")
+        self.reception_normalization_mode_combo.currentIndexChanged.connect(
+            self.reception_normalization_changed
+        )
+        normalize_row.addWidget(self.reception_normalization_mode_combo)
+        selection.addRow("Reference", normalize_row)
+
+        reference_range_row = QHBoxLayout()
+        self.reception_reference_auto_range_check = QCheckBox("Auto reference range")
+        self.reception_reference_auto_range_check.setChecked(True)
+        self.reception_reference_auto_range_check.toggled.connect(
+            self.reception_normalization_changed
+        )
+        reference_range_row.addWidget(self.reception_reference_auto_range_check)
+        reference_range_row.addWidget(QLabel("Min"))
+        self.reception_reference_min_spin = self._gps_range_spinbox()
+        self.reception_reference_min_spin.setValue(0.0)
+        self.reception_reference_min_spin.valueChanged.connect(self.reception_normalization_changed)
+        reference_range_row.addWidget(self.reception_reference_min_spin)
+        reference_range_row.addWidget(QLabel("Max"))
+        self.reception_reference_max_spin = self._gps_range_spinbox()
+        self.reception_reference_max_spin.setValue(100.0)
+        self.reception_reference_max_spin.valueChanged.connect(self.reception_normalization_changed)
+        reference_range_row.addWidget(self.reception_reference_max_spin)
+        reference_range_row.addStretch()
+        selection.addRow("Reference range", reference_range_row)
+
         site_name_row = QHBoxLayout()
         self.reception_site_name = QLineEdit()
         self.reception_site_name.setPlaceholderText("Flying-site name")
@@ -611,6 +650,20 @@ class MainWindow(QMainWindow):
         range_row.addStretch()
         layout.addLayout(range_row)
 
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(QLabel("Heatmap opacity"))
+        self.reception_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.reception_opacity_slider.setRange(0, 100)
+        self.reception_opacity_slider.setValue(72)
+        self.reception_opacity_slider.setSingleStep(1)
+        self.reception_opacity_slider.setPageStep(10)
+        opacity_row.addWidget(self.reception_opacity_slider, 1)
+        self.reception_opacity_label = QLabel("72%")
+        self.reception_opacity_label.setMinimumWidth(42)
+        opacity_row.addWidget(self.reception_opacity_label)
+        self.reception_opacity_slider.valueChanged.connect(self.reception_opacity_changed)
+        layout.addLayout(opacity_row)
+
         self.reception_result_status = QLabel("No reception heatmap generated.")
         self.reception_result_status.setObjectName("summary")
         self.reception_result_status.setWordWrap(True)
@@ -621,6 +674,7 @@ class MainWindow(QMainWindow):
         self.reception_tab = tab
         self.tabs.addTab(tab, "Reception Map")
         self._update_reception_range_enabled()
+        self._update_reception_normalization_enabled()
         self._update_reception_generate_enabled()
 
     @staticmethod
@@ -640,17 +694,27 @@ class MainWindow(QMainWindow):
                 return site
         return None
 
-    def _reception_selection_token(self) -> tuple[str | None, int | None, date, date, str | None]:
+    def _reception_selection_token(self) -> tuple[object, ...]:
         root = str(self.library_root.resolve(strict=False)) if self.library_root is not None else None
         raw_site_id = self.reception_site_combo.currentData()
         site_id = raw_site_id if isinstance(raw_site_id, int) else None
         start, end = self._reception_date_bounds()
         raw_channel = self.reception_channel_combo.currentData()
         channel = str(raw_channel) if raw_channel else None
-        return root, site_id, start, end, channel
+        normalize = self.reception_normalize_check.isChecked()
+        reference = str(self.reception_reference_combo.currentData() or "") if normalize else ""
+        mode = str(self.reception_normalization_mode_combo.currentData() or "") if normalize else ""
+        reference_auto = self.reception_reference_auto_range_check.isChecked() if mode == "ratio" else True
+        reference_range = (
+            self.reception_reference_min_spin.value(),
+            self.reception_reference_max_spin.value(),
+        ) if mode == "ratio" and not reference_auto else None
+        return root, site_id, start, end, channel, normalize, reference, mode, reference_range
 
     def _set_reception_map_payload(self, payload: dict[str, object] | None, force: bool = False) -> None:
         self._reception_map_payload = dict(payload) if payload is not None else None
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["opacity"] = self.reception_opacity_slider.value() / 100.0
         if not force and not self._tab_is_active("reception_tab"):
             self._reception_view_loaded = False
             return
@@ -702,6 +766,7 @@ class MainWindow(QMainWindow):
             self.reception_site_name.clear()
             self.reception_site_notes.clear()
             self.reception_channel_combo.clear()
+            self.reception_reference_combo.clear()
             self.reception_result_status.setText("No indexed flying sites are available.")
             self._set_reception_map_payload(None)
             self._update_reception_generate_enabled()
@@ -730,6 +795,20 @@ class MainWindow(QMainWindow):
 
     def reception_channel_changed(self, *_args) -> None:
         self._invalidate_reception_heatmap("Telemetry item changed; generate the heatmap to refresh the map.")
+        self.populate_reception_references()
+
+    def reception_normalization_changed(self, *_args) -> None:
+        self._update_reception_normalization_enabled()
+        self._invalidate_reception_heatmap(
+            "Normalization changed; generate the heatmap to refresh the map."
+        )
+
+    def reception_opacity_changed(self, value: int) -> None:
+        opacity = max(0.0, min(1.0, int(value) / 100.0))
+        self.reception_opacity_label.setText(f"{int(value)}%")
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["opacity"] = opacity
+        self.reception_view.set_opacity(opacity)
 
     def _invalidate_reception_heatmap(self, message: str) -> None:
         self.cancel_reception_heatmap(silent=True)
@@ -739,6 +818,11 @@ class MainWindow(QMainWindow):
 
     def _reception_date_bounds(self) -> tuple[date, date]:
         return self.reception_date_from.date().toPyDate(), self.reception_date_to.date().toPyDate()
+
+    @staticmethod
+    def _reception_channels(record: dict[str, object]) -> list[str]:
+        channels = record.get("channels")
+        return [str(channel) for channel in channels] if isinstance(channels, list) else []
 
     def _eligible_reception_records(self, require_channel: str | None = None) -> list[dict[str, object]]:
         site = self._selected_reception_site()
@@ -764,13 +848,21 @@ class MainWindow(QMainWindow):
     def populate_reception_channels(self) -> None:
         current_channel = self.reception_channel_combo.currentData()
         records = self._eligible_reception_records()
-        coverage: dict[str, int] = {}
+        all_channels = [
+            str(channel)
+            for record in records
+            for channel in self._reception_channels(record)
+        ]
+        groups = logical_telemetry_groups(all_channels)
+        coverage: dict[str, int] = {channel: 0 for channel in groups}
         for record in records:
             channels = record.get("channels")
             if not isinstance(channels, list):
                 continue
-            for channel in set(str(value) for value in channels):
-                coverage[channel] = coverage.get(channel, 0) + 1
+            channel_set = {str(value) for value in channels}
+            for logical_name, members in groups.items():
+                if channel_set.intersection(members):
+                    coverage[logical_name] += 1
 
         def channel_key(channel: str) -> tuple[int, str]:
             name = channel.casefold()
@@ -786,6 +878,54 @@ class MainWindow(QMainWindow):
         if selected_index >= 0:
             self.reception_channel_combo.setCurrentIndex(selected_index)
         self.reception_channel_combo.blockSignals(False)
+        self.populate_reception_references()
+        self._update_reception_generate_enabled()
+
+    def populate_reception_references(self) -> None:
+        current_reference = self.reception_reference_combo.currentData()
+        source = self.reception_channel_combo.currentData()
+        records = self._eligible_reception_records()
+        all_channels = [
+            str(channel)
+            for record in records
+            for channel in self._reception_channels(record)
+        ]
+        groups = logical_telemetry_groups(all_channels)
+        source_members = set(groups.get(str(source), (str(source),))) if source else set()
+        source_records = []
+        for record in records:
+            raw_channels = record.get("channels")
+            channel_set = {str(value) for value in raw_channels} if isinstance(raw_channels, list) else set()
+            if source_members and channel_set.intersection(source_members):
+                source_records.append(channel_set)
+
+        coverage: dict[str, int] = {}
+        for logical_name, members in groups.items():
+            if logical_name == source:
+                continue
+            member_set = set(members)
+            count = sum(bool(channels.intersection(member_set)) for channels in source_records)
+            if count:
+                coverage[logical_name] = count
+
+        def reference_key(channel: str) -> tuple[int, str]:
+            name = channel.casefold()
+            power_priority = 0 if any(token in name for token in ("power", "tpwr", "tx power")) else 1
+            return power_priority, name
+
+        self.reception_reference_combo.blockSignals(True)
+        self.reception_reference_combo.clear()
+        total = len(source_records)
+        for channel in sorted(coverage, key=reference_key):
+            self.reception_reference_combo.addItem(
+                f"{channel} — {coverage[channel]}/{total} source logs",
+                channel,
+            )
+        selected_index = self.reception_reference_combo.findData(current_reference)
+        if selected_index >= 0:
+            self.reception_reference_combo.setCurrentIndex(selected_index)
+        self.reception_reference_combo.blockSignals(False)
+        self._update_reception_normalization_enabled()
         self._update_reception_generate_enabled()
 
     def _update_reception_range_enabled(self, *_args) -> None:
@@ -793,12 +933,29 @@ class MainWindow(QMainWindow):
         self.reception_min_spin.setEnabled(manual)
         self.reception_max_spin.setEnabled(manual)
 
+    def _update_reception_normalization_enabled(self, *_args) -> None:
+        normalize = self.reception_normalize_check.isChecked()
+        has_references = self.reception_reference_combo.count() > 0
+        self.reception_reference_combo.setEnabled(normalize and has_references)
+        self.reception_normalization_mode_combo.setEnabled(normalize and has_references)
+        ratio = normalize and self.reception_normalization_mode_combo.currentData() == "ratio"
+        self.reception_reference_auto_range_check.setEnabled(ratio and has_references)
+        manual_ratio = ratio and has_references and not self.reception_reference_auto_range_check.isChecked()
+        self.reception_reference_min_spin.setEnabled(manual_ratio)
+        self.reception_reference_max_spin.setEnabled(manual_ratio)
+
     def _update_reception_generate_enabled(self, *_args) -> None:
         has_site = self._selected_reception_site() is not None
         has_channel = bool(self.reception_channel_combo.currentData())
+        normalization_ready = (
+            not self.reception_normalize_check.isChecked()
+            or bool(self.reception_reference_combo.currentData())
+        )
         start, end = self._reception_date_bounds()
         busy = self._reception_heatmap_task is not None
-        self.reception_generate_button.setEnabled(has_site and has_channel and start <= end and not busy)
+        self.reception_generate_button.setEnabled(
+            has_site and has_channel and normalization_ready and start <= end and not busy
+        )
 
     def save_reception_site_metadata(self) -> None:
         site = self._selected_reception_site()
@@ -946,6 +1103,26 @@ class MainWindow(QMainWindow):
             return
         center = (float(raw_latitude), float(raw_longitude))
         telemetry_column = str(channel)
+        normalize = self.reception_normalize_check.isChecked()
+        reference_column = (
+            str(self.reception_reference_combo.currentData())
+            if normalize and self.reception_reference_combo.currentData()
+            else None
+        )
+        normalization_mode = (
+            str(self.reception_normalization_mode_combo.currentData())
+            if reference_column is not None
+            else None
+        )
+        reference_range = None
+        if (
+            normalization_mode == "ratio"
+            and not self.reception_reference_auto_range_check.isChecked()
+        ):
+            reference_range = (
+                self.reception_reference_min_spin.value(),
+                self.reception_reference_max_spin.value(),
+            )
 
         def work(progress, is_cancelled):
             from .reception import build_reception_heatmap
@@ -957,6 +1134,9 @@ class MainWindow(QMainWindow):
                 cell_size_m=5.0,
                 progress=progress,
                 is_cancelled=is_cancelled,
+                reference_column=reference_column,
+                normalization_mode=normalization_mode,
+                reference_range=reference_range,
             )
 
         task = ReceptionTask(work)
@@ -999,7 +1179,7 @@ class MainWindow(QMainWindow):
     def _reception_heatmap_completed(
         self,
         generation: int,
-        selection_token: tuple[str | None, int | None, date, date, str | None],
+        selection_token: tuple[object, ...],
         result: object,
     ) -> None:
         if (
@@ -1023,6 +1203,21 @@ class MainWindow(QMainWindow):
             payload["range_min"] = self.reception_min_spin.value()
             payload["range_max"] = self.reception_max_spin.value()
 
+        if (
+            payload.get("normalization_mode") == "ratio"
+            and self.reception_reference_auto_range_check.isChecked()
+        ):
+            reference_minimum = payload.get("reference_range_min")
+            reference_maximum = payload.get("reference_range_max")
+            self.reception_reference_min_spin.blockSignals(True)
+            self.reception_reference_max_spin.blockSignals(True)
+            if isinstance(reference_minimum, (int, float)) and math.isfinite(float(reference_minimum)):
+                self.reception_reference_min_spin.setValue(float(reference_minimum))
+            if isinstance(reference_maximum, (int, float)) and math.isfinite(float(reference_maximum)):
+                self.reception_reference_max_spin.setValue(float(reference_maximum))
+            self.reception_reference_min_spin.blockSignals(False)
+            self.reception_reference_max_spin.blockSignals(False)
+
         self._set_reception_map_payload(payload)
         status = str(payload.get("status") or "empty")
         if status == "ok":
@@ -1030,12 +1225,17 @@ class MainWindow(QMainWindow):
             used = int(payload.get("logs_used") or 0)
             considered = int(payload.get("logs_considered") or 0)
             missing = int(payload.get("missing_channel_count") or 0)
+            missing_reference = int(payload.get("missing_reference_count") or 0)
+            invalid_reference = int(payload.get("invalid_reference_sample_count") or 0)
+            clamped_reference = int(payload.get("clamped_reference_sample_count") or 0)
             errors = int(payload.get("error_count") or 0)
             inferred = int(payload.get("date_inferred_count") or 0)
             off_site = int(payload.get("off_site_sample_count") or 0)
             self.reception_result_status.setText(
                 f"Rendered {cells} observed 5 m cells from {used}/{considered} logs "
-                f"({missing} missing channel, {errors} read errors, {inferred} inferred dates, "
+                f"({missing} missing channel, {missing_reference} missing reference, "
+                f"{invalid_reference} invalid reference samples, {clamped_reference} clamped, "
+                f"{errors} read errors, {inferred} inferred dates, "
                 f"{off_site} off-site GPS samples removed)."
             )
         else:

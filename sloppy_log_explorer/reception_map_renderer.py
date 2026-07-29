@@ -274,6 +274,16 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       return Math.max(minimum, Math.min(maximum, value));
     }
 
+    let heatmapOpacity = clamp(
+      finiteNumber(firstValue(receptionData, ["opacity", "heatmap_opacity", "heatmapOpacity"], 0.72)) ?? 0.72,
+      0,
+      1
+    );
+
+    function outlineOpacity() {
+      return clamp(heatmapOpacity * 1.25, 0, 1);
+    }
+
     function wrapLongitude(longitude) {
       const numeric = Number(longitude);
       const wrapped = ((numeric + 180) % 360 + 360) % 360 - 180;
@@ -492,7 +502,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     }
 
     function telemetryLabel() {
-      return String(firstValue(receptionData, ["telemetry_column", "telemetryColumn", "telemetry_item", "telemetryItem", "channel", "label"], "Radio reception"));
+      return String(firstValue(receptionData, ["telemetry_label", "telemetryLabel", "normalization_label", "normalizationLabel", "telemetry_column", "telemetryColumn", "telemetry_item", "telemetryItem", "channel", "label"], "Radio reception"));
     }
 
     function telemetryUnit() {
@@ -735,17 +745,31 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         id: "reception-cells-fill",
         type: "fill",
         source: "reception-cells",
-        paint: {"fill-color": colorExpression(range), "fill-opacity": 0.72}
+        paint: {"fill-color": colorExpression(range), "fill-opacity": heatmapOpacity}
       });
       map.addLayer({
         id: "reception-cells-outline",
         type: "line",
         source: "reception-cells",
-        paint: {"line-color": "__OUTLINE__", "line-width": 0.7, "line-opacity": 0.9}
+        paint: {"line-color": "__OUTLINE__", "line-width": 0.7, "line-opacity": outlineOpacity()}
       });
       layersAdded = true;
       bindHover();
       renderLegend(range);
+      return true;
+    }
+
+    function setOpacity(value) {
+      const numeric = finiteNumber(value);
+      if (numeric === null) return false;
+      heatmapOpacity = clamp(numeric, 0, 1);
+      if (map && map.getLayer("reception-cells-fill")) {
+        map.setPaintProperty("reception-cells-fill", "fill-opacity", heatmapOpacity);
+      }
+      if (map && map.getLayer("reception-cells-outline")) {
+        map.setPaintProperty("reception-cells-outline", "line-opacity", outlineOpacity());
+      }
+      if (map && typeof map.triggerRepaint === "function") map.triggerRepaint();
       return true;
     }
 
@@ -801,6 +825,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
           flightCount: viewportFocus.flightCount
         } : null,
         viewportRadiusMeters: visibleViewportRadiusMeters(viewportFocus),
+        opacity: heatmapOpacity,
         error: mapError
       };
     }
@@ -874,6 +899,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     window.sloppyReceptionMap = {
       fit: fitReceptionBounds,
       refresh: refreshMapViewport,
+      setOpacity,
       getState: debugState
     };
 

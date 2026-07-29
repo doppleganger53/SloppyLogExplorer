@@ -63,12 +63,50 @@ EARTH_RADIUS_METERS = 6_371_008.8
 VIEWPORT_MAX_RADIUS_METERS = 2_000.0
 _VIEWPORT_BUCKET_METERS = 250.0
 _OBSERVED_NUMERIC_COLUMNS_ATTR = "sloppy_observed_numeric_columns"
+_INDEXED_CHANNEL_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<index>[1-9]\d*)$")
 _CALENDAR_LITERAL_RE = re.compile(
     r"(?:\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b|\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b)"
 )
 
 ProgressCallback = Callable[[int, int, str], None]
 CancellationCheck = Callable[[], bool]
+
+
+def logical_telemetry_groups(channels: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    """Group pandas-style ``Name.1`` aliases without merging lone literals."""
+    names = list(dict.fromkeys(str(channel) for channel in channels))
+    name_set = set(names)
+    indexed: dict[str, list[str]] = defaultdict(list)
+    for name in names:
+        match = _INDEXED_CHANNEL_SUFFIX_RE.fullmatch(name)
+        if match is not None:
+            indexed[match.group("base")].append(name)
+    grouped_bases = {
+        base
+        for base, variants in indexed.items()
+        if base in name_set or len(variants) > 1
+    }
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        match = _INDEXED_CHANNEL_SUFFIX_RE.fullmatch(name)
+        logical_name = (
+            match.group("base")
+            if match is not None and match.group("base") in grouped_bases
+            else name
+        )
+        groups.setdefault(logical_name, []).append(name)
+    return {name: tuple(members) for name, members in groups.items()}
+
+
+def telemetry_group_columns(channels: Iterable[str], logical_name: str) -> tuple[str, ...]:
+    """Resolve one logical item to its exact and terminal dot-number columns."""
+    resolved: list[str] = []
+    for raw_channel in channels:
+        channel = str(raw_channel)
+        match = _INDEXED_CHANNEL_SUFFIX_RE.fullmatch(channel)
+        if channel == logical_name or (match is not None and match.group("base") == logical_name):
+            resolved.append(channel)
+    return tuple(dict.fromkeys(resolved))
 
 
 class _ReceptionScanCancelled(RuntimeError):
@@ -352,10 +390,19 @@ def _valid_gps_candidates(
     time_values: Sequence[object] | None = None,
     elapsed_values: Sequence[float] | None = None,
     value_column: str | None = None,
+    value_values: Sequence[object] | pd.Series | None = None,
 ) -> list[GpsCandidate]:
+    if value_column is not None and value_values is not None:
+        raise ValueError("provide value_column or value_values, not both")
     latitude = _coerce_numeric_series(dataframe[latitude_column])
     longitude = _coerce_numeric_series(dataframe[longitude_column])
-    values = _coerce_numeric_series(dataframe[value_column]) if value_column else None
+    if value_column is not None:
+        values = _coerce_numeric_series(dataframe[value_column])
+    elif value_values is not None:
+        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(value_values)
+        values = _coerce_numeric_series(raw_values).reset_index(drop=True)
+    else:
+        values = None
     candidates: list[GpsCandidate] = []
     for index in range(len(dataframe)):
         lat = _coerce_float(latitude.iloc[index])
@@ -913,6 +960,47 @@ def _telemetry_unit(column: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _row_median(dataframe: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
+    numeric_columns: list[pd.Series] = []
+    for column in columns:
+        numeric = _coerce_numeric_series(dataframe[column])
+        finite = numeric.map(lambda value: bool(pd.notna(value) and math.isfinite(float(value))))
+        numeric_columns.append(numeric.where(finite))
+    if not numeric_columns:
+        return pd.Series(math.nan, index=dataframe.index, dtype="float64")
+    return pd.concat(numeric_columns, axis=1).median(axis=1, skipna=True)
+
+
+def _normalization_label(
+    source: str,
+    reference: str | None,
+    mode: str | None,
+    reference_bounds: tuple[float, float] | None,
+) -> str:
+    if reference is None or mode is None:
+        return source
+    if mode == "ratio":
+        if reference_bounds is None:
+            return f"{source} ÷ {reference}"
+        lower, upper = reference_bounds
+        return f"{source} ÷ clamp({reference}, {lower:g}, {upper:g})"
+    if mode == "difference":
+        return f"{source} − {reference}"
+    return f"{source} − 10·log10({reference})"
+
+
+def _normalized_unit(source: str, reference: str | None, mode: str | None) -> str:
+    source_unit = _telemetry_unit(source)
+    if reference is None or mode is None:
+        return source_unit
+    reference_unit = _telemetry_unit(reference)
+    if mode == "difference" and source_unit and source_unit == reference_unit:
+        return source_unit
+    if mode == "db_power" and "db" in source_unit.casefold():
+        return source_unit
+    return ""
+
+
 def _reception_viewport_focus(
     cell_points: Sequence[tuple[float, float, int, int]],
     site_center: tuple[float, float],
@@ -1066,6 +1154,9 @@ def build_reception_heatmap(
     cell_size_m: float = DEFAULT_CELL_SIZE_METERS,
     progress: ProgressCallback | None = None,
     is_cancelled: CancellationCheck | None = None,
+    reference_column: str | None = None,
+    normalization_mode: str | None = None,
+    reference_range: tuple[float, float] | None = None,
 ) -> dict[str, object]:
     """Aggregate full-log reception values into observed equal-flight cells."""
     normalized_records = [_coerce_record(record) for record in records]
@@ -1080,10 +1171,27 @@ def build_reception_heatmap(
     ):
         raise ValueError("site_center must contain a finite latitude and longitude")
     site_center = (float(site_center[0]), float(site_center[1]))
+    if normalization_mode not in {None, "ratio", "difference", "db_power"}:
+        raise ValueError("normalization_mode must be ratio, difference, db_power, or None")
+    if (reference_column is None) != (normalization_mode is None):
+        raise ValueError("reference_column and normalization_mode must be provided together")
+    if reference_column == telemetry_column and reference_column is not None:
+        raise ValueError("reference_column must differ from telemetry_column")
+    applied_reference_range: tuple[float, float] | None = None
+    if normalization_mode == "ratio" and reference_range is not None:
+        if len(reference_range) != 2 or not all(math.isfinite(float(value)) for value in reference_range):
+            raise ValueError("reference_range must contain two finite values")
+        left, right = (float(reference_range[0]), float(reference_range[1]))
+        applied_reference_range = (min(left, right), max(left, right))
     flight_medians: dict[tuple[int, int], list[float]] = defaultdict(list)
     sample_counts: dict[tuple[int, int], int] = defaultdict(int)
     logs_used = 0
     missing_channel_count = 0
+    missing_reference_count = 0
+    invalid_reference_sample_count = 0
+    clamped_reference_sample_count = 0
+    observed_reference_min: float | None = None
+    observed_reference_max: float | None = None
     error_count = 0
     off_site_sample_count = 0
     total = len(normalized_records)
@@ -1094,6 +1202,8 @@ def build_reception_heatmap(
                 "status": "cancelled",
                 "message": "Reception heatmap generation was cancelled.",
                 "telemetry_column": telemetry_column,
+                "reference_column": reference_column,
+                "normalization_mode": normalization_mode,
                 "cells": [],
                 "value_min": None,
                 "value_max": None,
@@ -1102,9 +1212,13 @@ def build_reception_heatmap(
                 "logs_used": logs_used,
                 "date_inferred_count": sum(item.date_inferred for item in normalized_records),
                 "missing_channel_count": missing_channel_count,
+                "missing_reference_count": missing_reference_count,
+                "invalid_reference_sample_count": invalid_reference_sample_count,
+                "clamped_reference_sample_count": clamped_reference_sample_count,
                 "error_count": error_count,
             }
-        if telemetry_column not in record.channels:
+        indexed_source_columns = telemetry_group_columns(record.channels, telemetry_column)
+        if not indexed_source_columns:
             missing_channel_count += 1
             if progress is not None:
                 progress(completed, total, record.file_path.name)
@@ -1112,16 +1226,52 @@ def build_reception_heatmap(
         try:
             log = load_log(record.file_path, record.library_root)
             gps = log.gps_columns
-            if gps is None or telemetry_column not in log.dataframe.columns:
+            source_columns = telemetry_group_columns(log.dataframe.columns, telemetry_column)
+            if gps is None or not source_columns:
                 missing_channel_count += 1
                 continue
+            reference_columns: tuple[str, ...] = ()
+            if reference_column is not None:
+                if not telemetry_group_columns(record.channels, reference_column):
+                    missing_reference_count += 1
+                    continue
+                reference_columns = telemetry_group_columns(log.dataframe.columns, reference_column)
+                if not reference_columns:
+                    missing_reference_count += 1
+                    continue
+            source_values = _row_median(log.dataframe, source_columns)
+            transformed_values = source_values.copy()
+            reference_values: pd.Series | None = None
+            clamped_mask = pd.Series(False, index=log.dataframe.index)
+            if reference_columns:
+                reference_values = _row_median(log.dataframe, reference_columns)
+                if normalization_mode == "ratio":
+                    denominator = reference_values.copy()
+                    if applied_reference_range is not None:
+                        lower, upper = applied_reference_range
+                        clamped_mask = reference_values.notna() & (
+                            (reference_values < lower) | (reference_values > upper)
+                        )
+                        denominator = denominator.clip(lower=lower, upper=upper)
+                    valid = source_values.notna() & denominator.notna() & denominator.ne(0.0)
+                    transformed_values = (source_values / denominator).where(valid)
+                elif normalization_mode == "difference":
+                    valid = source_values.notna() & reference_values.notna()
+                    transformed_values = (source_values - reference_values).where(valid)
+                else:
+                    valid = source_values.notna() & reference_values.notna() & reference_values.gt(0.0)
+                    transformed_values = (
+                        source_values - 10.0 * reference_values.map(
+                            lambda value: math.log10(float(value)) if pd.notna(value) and float(value) > 0.0 else math.nan
+                        )
+                    ).where(valid)
             candidates = _valid_gps_candidates(
                 log.dataframe,
                 gps.latitude,
                 gps.longitude,
                 time_values=list(log.time) if log.time is not None else None,
                 elapsed_values=relative_seconds(log),
-                value_column=telemetry_column,
+                value_values=transformed_values,
             )
             site_candidates = [
                 candidate
@@ -1135,6 +1285,28 @@ def build_reception_heatmap(
                 <= HEATMAP_SITE_RADIUS_KM
             ]
             off_site_sample_count += len(candidates) - len(site_candidates)
+            if reference_values is not None:
+                for point, _ in site_candidates:
+                    row_index = int(point["row"]) - 1
+                    source_value = _coerce_float(source_values.iloc[row_index])
+                    if source_value is None:
+                        continue
+                    reference_value = _coerce_float(reference_values.iloc[row_index])
+                    if reference_value is not None:
+                        observed_reference_min = (
+                            reference_value
+                            if observed_reference_min is None
+                            else min(observed_reference_min, reference_value)
+                        )
+                        observed_reference_max = (
+                            reference_value
+                            if observed_reference_max is None
+                            else max(observed_reference_max, reference_value)
+                        )
+                    if _coerce_float(transformed_values.iloc[row_index]) is None:
+                        invalid_reference_sample_count += 1
+                    if bool(clamped_mask.iloc[row_index]):
+                        clamped_reference_sample_count += 1
             values_by_cell: dict[tuple[int, int], list[float]] = defaultdict(list)
             for point, _ in site_candidates:
                 value = point.get("value")
@@ -1209,11 +1381,28 @@ def build_reception_heatmap(
     values = [cell.value for cell in cells]
     status = "ok" if cells else "empty"
     message = "" if cells else "No valid GPS and telemetry samples matched the selected filters."
+    effective_reference_range = applied_reference_range
+    if normalization_mode == "ratio" and effective_reference_range is None:
+        if observed_reference_min is not None and observed_reference_max is not None:
+            effective_reference_range = (observed_reference_min, observed_reference_max)
     payload: dict[str, object] = {
         "status": status,
         "message": message,
         "telemetry_column": telemetry_column,
-        "telemetry_unit": _telemetry_unit(telemetry_column),
+        "telemetry_label": _normalization_label(
+            telemetry_column,
+            reference_column,
+            normalization_mode,
+            effective_reference_range,
+        ),
+        "telemetry_unit": _normalized_unit(telemetry_column, reference_column, normalization_mode),
+        "reference_column": reference_column,
+        "normalization_mode": normalization_mode,
+        "reference_auto_range": normalization_mode == "ratio" and reference_range is None,
+        "reference_observed_min": observed_reference_min,
+        "reference_observed_max": observed_reference_max,
+        "reference_range_min": effective_reference_range[0] if effective_reference_range is not None else None,
+        "reference_range_max": effective_reference_range[1] if effective_reference_range is not None else None,
         "cells": cell_payload,
         "value_min": min(values) if values else None,
         "value_max": max(values) if values else None,
@@ -1222,6 +1411,9 @@ def build_reception_heatmap(
         "logs_used": logs_used,
         "date_inferred_count": sum(record.date_inferred for record in normalized_records),
         "missing_channel_count": missing_channel_count,
+        "missing_reference_count": missing_reference_count,
+        "invalid_reference_sample_count": invalid_reference_sample_count,
+        "clamped_reference_sample_count": clamped_reference_sample_count,
         "error_count": error_count,
         "off_site_sample_count": off_site_sample_count,
     }

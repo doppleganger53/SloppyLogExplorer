@@ -73,7 +73,16 @@ def synthetic_payload() -> dict[str, object]:
         "status": "ok",
         "site_name": "Synthetic validation site",
         "telemetry_column": "VFR 2.4G(%)",
-        "unit": "%",
+        "telemetry_label": "VFR 2.4G(%) ÷ clamp(Power 900M(mW), 10, 500)",
+        "reference_column": "Power 900M(mW)",
+        "normalization_mode": "ratio",
+        "reference_auto_range": False,
+        "reference_observed_min": 5.0,
+        "reference_observed_max": 1_000.0,
+        "reference_range_min": 10.0,
+        "reference_range_max": 500.0,
+        "clamped_reference_sample_count": 2,
+        "opacity": 0.72,
         "cell_size_m": 5,
         "auto_range": False,
         # Match the flat payload shape emitted by MainWindow after generation.
@@ -364,6 +373,31 @@ def validate_reception_map_runtime(
             f"{error}; worker={worker_probe}; console={page.console_messages}"
         ) from error
 
+    initial_camera = state.get("camera") if isinstance(state, dict) else None
+    opacity_update = _run_js(
+        page,
+        "(() => { const updated = window.sloppyReceptionMap.setOpacity(0.35); "
+        "const current = window.sloppyReceptionMap.getState(); "
+        "return {updated, state: current, "
+        "fill: window.__sloppyReceptionDebugMap.getPaintProperty('reception-cells-fill', 'fill-opacity'), "
+        "outline: window.__sloppyReceptionDebugMap.getPaintProperty('reception-cells-outline', 'line-opacity')}; })();",
+    )
+    if not isinstance(opacity_update, dict) or opacity_update.get("updated") is not True:
+        view.close()
+        raise AssertionError(f"Reception map rejected a live opacity update: {opacity_update}")
+    opacity_state = opacity_update.get("state")
+    if not isinstance(opacity_state, dict) or abs(float(opacity_state.get("opacity") or 0) - 0.35) > 1e-9:
+        view.close()
+        raise AssertionError(f"Reception map did not retain live opacity: {opacity_update}")
+    if abs(float(opacity_update.get("fill") or 0) - 0.35) > 1e-9 or abs(
+        float(opacity_update.get("outline") or 0) - 0.4375
+    ) > 1e-9:
+        view.close()
+        raise AssertionError(f"Reception map paint opacity is wrong: {opacity_update}")
+    if opacity_state.get("camera") != initial_camera:
+        view.close()
+        raise AssertionError(f"Live opacity moved the reception camera: {opacity_update}")
+
     view.resize(max(width + 600, int(width * 1.5)), max(320, height // 2))
     _run_event_loop(250)
     _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
@@ -387,13 +421,14 @@ def validate_reception_map_runtime(
         "maximum: document.getElementById('legend-max').textContent, "
         "detail: document.getElementById('legend-detail').textContent});",
     )
-    if not isinstance(legend, dict) or legend.get("title") != "VFR 2.4G(%)":
+    expected_title = "VFR 2.4G(%) ÷ clamp(Power 900M(mW), 10, 500)"
+    if not isinstance(legend, dict) or legend.get("title") != expected_title:
         view.close()
         raise AssertionError(f"Reception map legend is missing telemetry context: {legend}")
     if "5 m cells" not in str(legend.get("detail") or ""):
         view.close()
         raise AssertionError(f"Reception map legend is missing cell resolution: {legend}")
-    if legend.get("minimum") != "2 %" or legend.get("maximum") != "85 %":
+    if legend.get("minimum") != "2" or legend.get("maximum") != "85":
         view.close()
         raise AssertionError(f"Reception map legend has the wrong manual bounds: {legend}")
     if "Manual range" not in str(legend.get("detail") or ""):
@@ -447,6 +482,7 @@ def validate_reception_map_runtime(
         "initial": state,
         "wideFit": wide_fit,
         "afterFit": after_fit,
+        "opacityUpdate": opacity_update,
         "mercatorEdge": edge_state,
         "legend": legend,
         "image": metrics,

@@ -551,6 +551,7 @@ class ReceptionMapWidget(QWidget):
         super().__init__(parent)
         self.payload: dict[str, object] | None = None
         self.dark = True
+        self.opacity = 0.72
         self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
         self._page: QWebEnginePage | None = None
@@ -600,6 +601,14 @@ class ReceptionMapWidget(QWidget):
     def set_heatmap(self, payload: dict[str, object] | None, dark: bool = True) -> None:
         """Render a JSON-safe reception payload, replacing the previous map."""
         self.payload = dict(payload) if payload is not None else None
+        if self.payload is not None:
+            fallback_opacity = float(getattr(self, "opacity", 0.72))
+            raw_opacity = self.payload.get("opacity", fallback_opacity)
+            try:
+                opacity = float(raw_opacity) if isinstance(raw_opacity, (int, float, str)) else fallback_opacity
+            except (TypeError, ValueError):
+                opacity = fallback_opacity
+            self.opacity = max(0.0, min(1.0, opacity))
         self.dark = dark
         self._render_generation += 1
         self._ready_poll_timer.stop()
@@ -616,6 +625,22 @@ class ReceptionMapWidget(QWidget):
             ReceptionMapWidget._schedule_viewport_refresh(self, fit=True)
         else:
             cast(QTextEdit, self._view).setHtml(html_document)
+
+    def set_opacity(self, opacity: float) -> None:
+        """Update reception cell opacity without rebuilding the map document."""
+        try:
+            numeric = float(opacity)
+        except (TypeError, ValueError):
+            numeric = self.opacity
+        self.opacity = max(0.0, min(1.0, numeric))
+        if self.payload is not None:
+            self.payload["opacity"] = self.opacity
+        if not self._web_engine or self._page is None:
+            return
+        value = json.dumps(self.opacity)
+        self._page.runJavaScript(
+            f"window.sloppyReceptionMap ? window.sloppyReceptionMap.setOpacity({value}) : false;"
+        )
 
     def refresh_viewport(self, fit: bool = False) -> None:
         """Resize the live map and optionally restore its density-focused camera."""

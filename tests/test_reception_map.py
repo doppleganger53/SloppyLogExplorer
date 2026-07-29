@@ -140,6 +140,23 @@ def test_reception_renderer_preserves_manual_range_and_reverse_setting() -> None
     assert 'classList.toggle("reverse", range.reverse)' in document
 
 
+def test_reception_renderer_exposes_live_opacity_and_normalization_label() -> None:
+    payload = sample_payload()
+    payload["opacity"] = 0.35
+    payload["telemetry_label"] = "VFR 900M(%) ÷ clamp(Power 900M(mW), 10, 500)"
+
+    document = build_reception_map_html(payload)
+
+    assert '"opacity":0.35' in document
+    assert r"VFR 900M(%) \u00f7 clamp(Power 900M(mW), 10, 500)" in document
+    assert '"fill-opacity": heatmapOpacity' in document
+    assert '"line-opacity": outlineOpacity()' in document
+    assert 'map.setPaintProperty("reception-cells-fill", "fill-opacity", heatmapOpacity)' in document
+    assert 'map.setPaintProperty("reception-cells-outline", "line-opacity", outlineOpacity())' in document
+    assert "setOpacity," in document
+    assert "opacity: heatmapOpacity" in document
+
+
 def test_reception_renderer_accepts_polygon_and_bounds_cells() -> None:
     payload = sample_payload()
     payload["cells"] = [
@@ -345,3 +362,29 @@ def test_reception_widget_refreshes_and_tracks_reported_ready_state() -> None:
     assert fake_widget._pending_viewport_fit is True
     assert fake_widget._auto_fitted_generation == 7
     assert viewport_timer.started == 1
+
+
+def test_reception_widget_updates_opacity_without_replacing_document() -> None:
+    scripts: list[str] = []
+
+    class FakePage:
+        def runJavaScript(self, script: str, callback=None) -> None:
+            scripts.append(script)
+
+    fake_widget = cast(Any, type("FakeReceptionWidget", (), {})())
+    fake_widget.opacity = 0.72
+    fake_widget.payload = sample_payload()
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+
+    ReceptionMapWidget.set_opacity(fake_widget, 0.35)
+
+    assert fake_widget.opacity == 0.35
+    assert fake_widget.payload["opacity"] == 0.35
+    assert scripts == [
+        "window.sloppyReceptionMap ? window.sloppyReceptionMap.setOpacity(0.35) : false;"
+    ]
+
+    ReceptionMapWidget.set_opacity(fake_widget, 2.0)
+    assert fake_widget.opacity == 1.0
+    assert scripts[-1].endswith("setOpacity(1.0) : false;")
