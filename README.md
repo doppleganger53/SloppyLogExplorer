@@ -38,17 +38,20 @@ python -m pytest
 
 ## Build A Windows Executable
 
-The recommended Windows distribution is the minimal PyInstaller `onedir` target. It starts faster than a single-file executable, handles Qt WebEngine more reliably, and excludes optional Plotly/Kaleido/devtools content that is not required for normal telemetry graphs, GPS maps, or voice-pack generation.
+The release Windows distribution is the minimal PyInstaller `onefile` target. It produces one portable executable and excludes optional Plotly/Kaleido/devtools content that is not required for normal telemetry graphs, GPS maps, or voice-pack generation. The `onedir` target remains available for local development when faster startup or Qt WebEngine troubleshooting is more important than portability.
 
 ```powershell
 .\build_windows.bat
 ```
 
-The executable is written to:
+The release executable is written to:
 
 ```text
-dist\SloppyLogExplorer\SloppyLogExplorer.exe
+dist\SloppyLogExplorer.exe
 ```
+
+The release archive also includes `README.md`, `NOTICE.md`, `LICENSE`, and
+`CHANGELOG.md`.
 
 To build the same target directly:
 
@@ -63,10 +66,10 @@ To build the broader diagnostics package, use the debug target. It keeps broad P
 .\build_windows.bat --target debug
 ```
 
-To build a single executable instead:
+To build the onedir development target instead:
 
 ```powershell
-.\build_windows.bat --onefile
+python build.py --clean --target minimal
 ```
 
 Direct Python usage supports the same target and mode flags:

@@ -203,6 +203,40 @@ def test_package_release_writes_expected_archive(tmp_path: Path) -> None:
         ]
 
 
+def test_package_release_writes_onefile_and_release_documents(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    exe = dist / "SloppyLogExplorer.exe"
+    exe.write_text("exe", encoding="utf-8")
+    docs = tmp_path / "repo"
+    docs.mkdir()
+    for filename in package_release.RELEASE_DOCUMENTS:
+        (docs / filename).write_text(filename, encoding="utf-8")
+    output = dist / package_release.default_archive_name("0.1.0")
+
+    result = package_release.package_release(exe, output, documentation_root=docs)
+
+    assert result == output
+    with zipfile.ZipFile(output) as archive:
+        assert sorted(archive.namelist()) == [
+            "CHANGELOG.md",
+            "LICENSE",
+            "NOTICE.md",
+            "README.md",
+            "SloppyLogExplorer.exe",
+        ]
+
+
+def test_resolve_dist_source_prefers_onefile(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    onefile = dist / "SloppyLogExplorer.exe"
+    onedir = dist / "SloppyLogExplorer"
+    onedir.mkdir(parents=True)
+    onefile.write_text("exe", encoding="utf-8")
+
+    assert package_release.resolve_dist_source(dist) == onefile
+
+
 def test_package_release_reads_pyproject_version(tmp_path: Path) -> None:
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text('[project]\nname = "x"\nversion = "1.2.3"\n', encoding="utf-8")

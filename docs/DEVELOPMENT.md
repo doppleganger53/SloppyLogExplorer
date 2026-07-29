@@ -18,7 +18,7 @@ references unless explicitly targeted.
   `python main.py --smoke-test`
 - Validate a log from the package entry point:
   `python -m sloppy_log_explorer --validate-log "{LOG_PATH}"`
-- Build Windows onedir executable:
+- Build the Windows release executable:
   `.\build_windows.bat`
 
 ## GitHub Issue Workflow
@@ -34,19 +34,20 @@ references unless explicitly targeted.
 ## Release Workflow
 
 1. Update `pyproject.toml` and `CHANGELOG.md` on a release branch named
-   `release/v{version}`.
+   `release/v{version}`. Ensure `CHANGELOG.md` is comprehensive at a high level.
 2. Run:
    `python tools/session_preflight.py --mode release`
 3. Run:
    `python -m pytest`
-4. Build:
+4. Build the minimal onefile executable:
    `.\build_windows.bat`
 5. Validate packaged executable when feasible:
-   - `.\dist\SloppyLogExplorer\SloppyLogExplorer.exe --smoke-test`
-   - `.\dist\SloppyLogExplorer\SloppyLogExplorer.exe --validate-log "{LOG_PATH}"`
+   - `.\dist\SloppyLogExplorer.exe --smoke-test`
+   - `.\dist\SloppyLogExplorer.exe --validate-log "{LOG_PATH}"`
 6. Generate release notes:
    `python tools\write_release_notes.py --version {version} --output validation_artifacts\release-notes-{version}.md`
-7. Create release archive:
+7. Create the release archive (onefile executable plus README, NOTICE, LICENSE,
+   and CHANGELOG):
    `python tools\package_release.py --version {version}`
 8. Publish:
    `gh release create v{version} dist/SloppyLogExplorer-{version}-windows-x64.zip --title "Sloppy Log Explorer v{version}" --notes-file validation_artifacts\release-notes-{version}.md`
