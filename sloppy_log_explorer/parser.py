@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import math
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +21,22 @@ _GPS_HELPER_ALT = "__gps_altitude"
 _COORDINATE_DECIMAL_RE = re.compile(
     r"(?P<prefix>[NSEW])?\s*(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<suffix>[NSEW])?",
     re.IGNORECASE,
+)
+_NON_POSITION_GPS_TOKENS = (
+    "alt",
+    "course",
+    "heading",
+    "bearing",
+    "speed",
+    "satellite",
+    "satellites",
+    "hdop",
+    "vdop",
+    "distance",
+    "fix",
+    "accuracy",
+    "quality",
+    "status",
 )
 
 
@@ -297,6 +314,31 @@ def _has_coordinate_name_hint(column: str) -> bool:
     )
 
 
+def _has_position_header_hint(columns: Iterable[object]) -> bool:
+    """Return whether column names identify a likely position payload."""
+    names = [str(column).strip().lower() for column in columns]
+    usable_gps_names = [
+        name
+        for name in names
+        if "gps" in name
+        and not any(token in name for token in _NON_POSITION_GPS_TOKENS)
+    ]
+    if any("position" in name or "coord" in name for name in names):
+        return True
+    if any(name in {"gps", "gps data", "gps position"} for name in usable_gps_names):
+        return True
+
+    latitude_named = any(
+        any(token in name for token in ("latitude", "lat", "northing", "north"))
+        for name in names
+    )
+    longitude_named = any(
+        any(token in name for token in ("longitude", "lon", "lng", "easting", "east"))
+        for name in names
+    )
+    return (latitude_named and longitude_named) or len(usable_gps_names) >= 2
+
+
 def _signed_coordinate(value: float, hemisphere: str | None) -> float:
     if hemisphere is None:
         return value
@@ -482,7 +524,15 @@ def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame, sample_
 
 
 def _detect_split_gps_columns(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
-    coordinate_candidates = [column for column in numeric_columns if _has_coordinate_name_hint(column)]
+    coordinate_candidates = [
+        column
+        for column in numeric_columns
+        if _has_coordinate_name_hint(column)
+        and not (
+            "gps" in column.lower()
+            and any(token in column.lower() for token in _NON_POSITION_GPS_TOKENS)
+        )
+    ]
     if len(coordinate_candidates) < 2:
         return None
 

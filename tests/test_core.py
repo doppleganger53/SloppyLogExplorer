@@ -260,10 +260,10 @@ def write_gps_course_only_sample(path: Path) -> None:
     path.write_text(
         "\n".join(
             [
-                "Date,Time,TxBat(V),Pot1,GPS course(°),Current(A),Altitude(m)",
-                "2026-01-01,12:00:00,7.6,12,359.8,0.2,10",
-                "2026-01-01,12:00:01,7.5,13,359.9,0.3,11",
-                "2026-01-01,12:00:02,7.4,14,359.9,0.1,12",
+                "Date,Time,TxBat(V),Pot1,GPS course(°),Current(A),GPS alt(m)",
+                "2026-01-01,12:00:00,7.6,12,58.0,0.2,0",
+                "2026-01-01,12:00:01,7.5,13,58.1,0.3,0",
+                "2026-01-01,12:00:02,7.4,14,58.2,0.1,0",
             ]
         ),
         encoding="utf-8",
@@ -513,6 +513,24 @@ def test_load_log_detects_split_coordinate_columns_with_arbitrary_headings(tmp_p
 def test_load_log_does_not_invent_gps_from_gps_course_only(tmp_path: Path) -> None:
     path = tmp_path / "gps_course_only.csv"
     write_gps_course_only_sample(path)
+
+    log = load_log(path)
+
+    assert log.gps_columns is None
+    assert log.info.has_gps is False
+
+
+def test_load_log_does_not_invent_gps_from_fix_accuracy_or_quality_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "gps_status_only.csv"
+    path.write_text(
+        "Date,Time,GPS fix,GPS accuracy,GPS quality,VFAS(V)\n"
+        "2026-01-01,12:00:00,1,3,2,16.8\n"
+        "2026-01-01,12:00:01,1,3,2,16.7\n"
+        "2026-01-01,12:00:02,1,3,2,16.6\n",
+        encoding="utf-8",
+    )
 
     log = load_log(path)
 
@@ -1996,6 +2014,73 @@ def test_log_file_dialogs_start_from_local_home_instead_of_cloud_library(
     assert len(dialog_calls) == 1
     assert dialog_calls[0][1] == str(Path.home())
     assert dialog_calls[0][1] != str(window.library_root)
+    assert load_calls == []
+    assert window.isEnabled()
+
+    window.close()
+    app.quit()
+
+
+def test_library_dialog_starts_from_active_library_and_loads_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    active_library = tmp_path / "active-library"
+    selected_library = tmp_path / "selected-library"
+    dialog_calls: list[tuple[str, str]] = []
+    load_calls: list[Path] = []
+
+    def fake_existing_directory(_parent, caption: str, directory: str) -> str:
+        dialog_calls.append((caption, directory))
+        return str(selected_library)
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", fake_existing_directory)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.library_root = active_library
+    monkeypatch.setattr(window, "load_library", load_calls.append)
+
+    window.open_library_dialog()
+
+    assert dialog_calls == [("Open log library", str(active_library))]
+    assert load_calls == [selected_library]
+    assert window.isEnabled()
+
+    window.close()
+    app.quit()
+
+
+def test_library_dialog_without_active_library_uses_default_and_cancel_does_not_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    dialog_calls: list[tuple[str, str]] = []
+    load_calls: list[Path] = []
+
+    def fake_existing_directory(_parent, caption: str, directory: str) -> str:
+        dialog_calls.append((caption, directory))
+        return ""
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", fake_existing_directory)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    monkeypatch.setattr(window, "load_library", load_calls.append)
+
+    window.open_library_dialog()
+
+    assert dialog_calls == [("Open log library", "")]
     assert load_calls == []
     assert window.isEnabled()
 
