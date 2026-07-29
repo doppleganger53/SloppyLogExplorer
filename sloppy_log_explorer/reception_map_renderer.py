@@ -42,6 +42,7 @@ def _message_html(message: str, dark: bool, state: str) -> str:
     window.sloppyReceptionMap = {{
       fit: function() {{ return false; }},
       refresh: function() {{ return false; }},
+      setColorScale: function() {{ return false; }},
       getState: function() {{
         return {{state: {state_json}, ready: false, cellCount: 0, layers: {{fill: false, outline: false}}}};
       }}
@@ -270,6 +271,11 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       return fallback;
     }
 
+    function configuredCellSizeMeters() {
+      return Math.max(0.1, finiteNumber(firstValue(receptionData, ["cell_size_m", "cellSizeMeters"], null))
+        || defaultCellSizeMeters);
+    }
+
     function clamp(value, minimum, maximum) {
       return Math.max(minimum, Math.min(maximum, value));
     }
@@ -354,8 +360,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       const longitude = finiteNumber(firstValue(cell, ["longitude", "lon", "lng", "center_longitude", "centerLon"], null));
       if (latitude === null || longitude === null || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
       const sizeMeters = Math.max(0.1, finiteNumber(firstValue(cell, ["cell_size_m", "cellSizeMeters", "size_m"], null))
-        || finiteNumber(firstValue(receptionData, ["cell_size_m", "cellSizeMeters"], null))
-        || defaultCellSizeMeters);
+        || configuredCellSizeMeters());
       const halfLatitude = (sizeMeters / 2) / 111320;
       const longitudeScale = Math.max(0.01, Math.cos(latitude * Math.PI / 180));
       const halfLongitude = (sizeMeters / 2) / (111320 * longitudeScale);
@@ -447,7 +452,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
           focus.longitude,
           center[1],
           center[0]
-        ) <= focus.radiusMeters + defaultCellSizeMeters;
+        ) <= focus.radiusMeters + configuredCellSizeMeters();
       });
       if (selected.length) return selected;
       const nearest = featureCollection.features
@@ -518,7 +523,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       legendMin.textContent = `${formatValue(range.minimum)}${unit ? ` ${unit}` : ""}`;
       legendMax.textContent = `${formatValue(range.maximum)}${unit ? ` ${unit}` : ""}`;
       const mode = range.autoRange ? "Automatic range" : "Manual range";
-      legendDetail.textContent = `${featureCollection.features.length.toLocaleString()} observed 5 m cells · ${mode}`;
+      legendDetail.textContent = `${featureCollection.features.length.toLocaleString()} observed ${formatValue(configuredCellSizeMeters())} m cells · ${mode}`;
     }
 
     function buildRasterBaseStyle() {
@@ -773,6 +778,31 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       return true;
     }
 
+    function setColorScale(options) {
+      if (!options || typeof options !== "object") return false;
+      const autoRange = options.autoRange !== false;
+      const minimum = finiteNumber(options.minimum);
+      const maximum = finiteNumber(options.maximum);
+      if (!autoRange && (minimum === null || maximum === null)) return false;
+      receptionData.auto_range = autoRange;
+      receptionData.reverse = Boolean(options.reverse);
+      delete receptionData.range;
+      if (autoRange) {
+        delete receptionData.range_min;
+        delete receptionData.range_max;
+      } else {
+        receptionData.range_min = minimum;
+        receptionData.range_max = maximum;
+      }
+      const range = valueRange();
+      if (map && map.getLayer("reception-cells-fill")) {
+        map.setPaintProperty("reception-cells-fill", "fill-color", colorExpression(range));
+      }
+      renderLegend(range);
+      if (map && typeof map.triggerRepaint === "function") map.triggerRepaint();
+      return true;
+    }
+
     function debugState() {
       const range = valueRange();
       const boundsArray = dataBounds ? [dataBounds.getSouthWest().toArray(), dataBounds.getNorthEast().toArray()] : null;
@@ -900,6 +930,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       fit: fitReceptionBounds,
       refresh: refreshMapViewport,
       setOpacity,
+      setColorScale,
       getState: debugState
     };
 

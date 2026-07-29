@@ -356,6 +356,38 @@ def test_site_split_keeps_metadata_on_largest_overlap(tmp_path: Path) -> None:
     store.close()
 
 
+def test_distant_replacement_does_not_inherit_site_metadata_from_path_overlap(
+    tmp_path: Path,
+) -> None:
+    store = AppStore(tmp_path / "state.sqlite3")
+    root = tmp_path / "library"
+    path = root / "flight.csv"
+    store.upsert_reception_records(root, [reception_record(path)])
+    original = store.apply_reception_clusters(
+        root,
+        [cluster([path], 39.7744, -75.2049)],
+    )[0]
+    store.update_flying_site(original["id"], "Original Field", "Keep with this location")
+
+    replacement = reception_record(path, latitude=41.0, longitude=-75.2049)
+    store.upsert_reception_records(root, [replacement])
+    active = store.apply_reception_clusters(
+        root,
+        [cluster([path], 41.0, -75.2049)],
+    )[0]
+    all_sites = {
+        site["id"]: site for site in store.list_flying_sites(root, active_only=False)
+    }
+
+    assert active["id"] != original["id"]
+    assert active["name"] == ""
+    assert active["notes"] == ""
+    assert all_sites[original["id"]]["active"] is False
+    assert all_sites[original["id"]]["name"] == "Original Field"
+    assert all_sites[original["id"]]["notes"] == "Keep with this location"
+    store.close()
+
+
 def test_site_merge_keeps_largest_overlap_site_and_inactivates_other(tmp_path: Path) -> None:
     store = AppStore(tmp_path / "state.sqlite3")
     root = tmp_path / "library"

@@ -15,6 +15,7 @@ from .models import RECEPTION_INDEX_VERSION
 
 
 _MISSING = object()
+_FLYING_SITE_MATCH_RADIUS_METERS = 2_000.0
 
 
 def _normalized_path(path: str | Path, *, relative_to: str | Path | None = None) -> str:
@@ -564,6 +565,8 @@ class AppStore:
                             float(site["center_latitude"]),
                             float(site["center_longitude"]),
                         )
+                        if distance > _FLYING_SITE_MATCH_RADIUS_METERS:
+                            continue
                         overlap_candidates.append((-overlap, distance, site_id, cluster_index))
             for _negative_overlap, _distance, site_id, cluster_index in sorted(overlap_candidates):
                 if cluster_index in assignments or site_id in used_sites:
@@ -584,7 +587,7 @@ class AppStore:
                         float(site["center_latitude"]),
                         float(site["center_longitude"]),
                     )
-                    if distance <= 2_000.0:
+                    if distance <= _FLYING_SITE_MATCH_RADIUS_METERS:
                         distance_candidates.append((distance, site_id, cluster_index))
             for _distance, site_id, cluster_index in sorted(distance_candidates):
                 if cluster_index in assignments or site_id in used_sites:

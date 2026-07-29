@@ -398,6 +398,44 @@ def validate_reception_map_runtime(
         view.close()
         raise AssertionError(f"Live opacity moved the reception camera: {opacity_update}")
 
+    color_scale_update = _run_js(
+        page,
+        "(() => { const updated = window.sloppyReceptionMap.setColorScale("
+        "{autoRange:false, minimum:12, maximum:64, reverse:true}); "
+        "const current = window.sloppyReceptionMap.getState(); "
+        "return {updated, state: current, "
+        "minimum: document.getElementById('legend-min').textContent, "
+        "maximum: document.getElementById('legend-max').textContent, "
+        "detail: document.getElementById('legend-detail').textContent}; })();",
+    )
+    if not isinstance(color_scale_update, dict) or color_scale_update.get("updated") is not True:
+        view.close()
+        raise AssertionError(f"Reception map rejected a live color-scale update: {color_scale_update}")
+    color_state = color_scale_update.get("state")
+    if not isinstance(color_state, dict):
+        view.close()
+        raise AssertionError(f"Reception map returned no live color-scale state: {color_scale_update}")
+    color_range = color_state.get("range")
+    if not isinstance(color_range, dict) or color_range != {
+        "minimum": 12,
+        "maximum": 64,
+        "auto": False,
+        "reverse": True,
+    }:
+        view.close()
+        raise AssertionError(f"Reception map retained the wrong color scale: {color_scale_update}")
+    if color_scale_update.get("minimum") != "12" or color_scale_update.get("maximum") != "64":
+        view.close()
+        raise AssertionError(f"Reception map legend ignored the live color scale: {color_scale_update}")
+    if color_state.get("camera") != initial_camera:
+        view.close()
+        raise AssertionError(f"Live color-scale update moved the reception camera: {color_scale_update}")
+    _run_js(
+        page,
+        "window.sloppyReceptionMap.setColorScale("
+        "{autoRange:false, minimum:2, maximum:85, reverse:false});",
+    )
+
     view.resize(max(width + 600, int(width * 1.5)), max(320, height // 2))
     _run_event_loop(250)
     _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
@@ -483,6 +521,7 @@ def validate_reception_map_runtime(
         "wideFit": wide_fit,
         "afterFit": after_fit,
         "opacityUpdate": opacity_update,
+        "colorScaleUpdate": color_scale_update,
         "mercatorEdge": edge_state,
         "legend": legend,
         "image": metrics,

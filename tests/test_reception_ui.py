@@ -170,6 +170,25 @@ def test_reception_tab_groups_indexed_channels_and_configures_normalization(
     assert window._reception_map_payload["opacity"] == 0.35
     assert window.reception_opacity_label.text() == "35%"
     assert window._reception_heatmap_generation == heatmap_generation
+
+    color_updates: list[tuple[bool, float, float, bool]] = []
+    monkeypatch.setattr(
+        window.reception_view,
+        "set_color_scale",
+        lambda *values: color_updates.append(values),
+    )
+    window._reception_view_loaded = True
+    window.reception_auto_range_check.setChecked(False)
+    window.reception_min_spin.setValue(2.0)
+    window.reception_max_spin.setValue(85.0)
+    window.reception_reverse_check.setChecked(True)
+
+    assert color_updates[-1] == (False, 2.0, 85.0, True)
+    assert window._reception_map_payload["auto_range"] is False
+    assert window._reception_map_payload["range_min"] == 2.0
+    assert window._reception_map_payload["range_max"] == 85.0
+    assert window._reception_map_payload["reverse"] is True
+    assert window._reception_heatmap_generation == heatmap_generation
     window.close()
     app.quit()
 

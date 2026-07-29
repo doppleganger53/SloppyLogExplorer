@@ -634,15 +634,18 @@ class MainWindow(QMainWindow):
         range_row = QHBoxLayout()
         self.reception_auto_range_check = QCheckBox("Auto range")
         self.reception_auto_range_check.setChecked(True)
-        self.reception_auto_range_check.toggled.connect(self._update_reception_range_enabled)
+        self.reception_auto_range_check.toggled.connect(self.reception_color_scale_changed)
         range_row.addWidget(self.reception_auto_range_check)
         range_row.addWidget(QLabel("Min"))
         self.reception_min_spin = self._gps_range_spinbox()
+        self.reception_min_spin.valueChanged.connect(self.reception_color_scale_changed)
         range_row.addWidget(self.reception_min_spin)
         range_row.addWidget(QLabel("Max"))
         self.reception_max_spin = self._gps_range_spinbox()
+        self.reception_max_spin.valueChanged.connect(self.reception_color_scale_changed)
         range_row.addWidget(self.reception_max_spin)
         self.reception_reverse_check = QCheckBox("Reverse")
+        self.reception_reverse_check.toggled.connect(self.reception_color_scale_changed)
         range_row.addWidget(self.reception_reverse_check)
         self.reception_generate_button = QPushButton("Generate Heatmap")
         self.reception_generate_button.clicked.connect(self.generate_reception_heatmap)
@@ -842,6 +845,26 @@ class MainWindow(QMainWindow):
         if self._reception_map_payload is not None:
             self._reception_map_payload["opacity"] = opacity
         self.reception_view.set_opacity(opacity)
+
+    def reception_color_scale_changed(self, *_args) -> None:
+        self._update_reception_range_enabled()
+        payload = self._reception_map_payload
+        if payload is None:
+            return
+        auto_range = self.reception_auto_range_check.isChecked()
+        minimum = self.reception_min_spin.value()
+        maximum = self.reception_max_spin.value()
+        reverse = self.reception_reverse_check.isChecked()
+        payload["auto_range"] = auto_range
+        payload["reverse"] = reverse
+        if auto_range:
+            payload.pop("range_min", None)
+            payload.pop("range_max", None)
+        else:
+            payload["range_min"] = minimum
+            payload["range_max"] = maximum
+        if self._reception_view_loaded:
+            self.reception_view.set_color_scale(auto_range, minimum, maximum, reverse)
 
     def _invalidate_reception_heatmap(self, message: str) -> None:
         self.cancel_reception_heatmap(silent=True)
@@ -1235,10 +1258,14 @@ class MainWindow(QMainWindow):
         if auto_range:
             minimum = payload.get("value_min")
             maximum = payload.get("value_max")
+            self.reception_min_spin.blockSignals(True)
+            self.reception_max_spin.blockSignals(True)
             if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
                 self.reception_min_spin.setValue(float(minimum))
             if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
                 self.reception_max_spin.setValue(float(maximum))
+            self.reception_min_spin.blockSignals(False)
+            self.reception_max_spin.blockSignals(False)
         else:
             payload["range_min"] = self.reception_min_spin.value()
             payload["range_max"] = self.reception_max_spin.value()

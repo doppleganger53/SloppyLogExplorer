@@ -102,7 +102,7 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert 'id: "reception-cells-outline"' in document
     assert 'source: "reception-cells"' in document
     assert "defaultCellSizeMeters = 5" in document
-    assert "observed 5 m cells" in document
+    assert "observed ${formatValue(configuredCellSizeMeters())} m cells" in document
     assert '["Samples"' in document
     assert '["Flights"' in document
     assert "pitch: 0" in document
@@ -114,8 +114,21 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert "viewportRadiusMeters: visibleViewportRadiusMeters(viewportFocus)" in document
     assert "map.jumpTo" in document
     assert "window.sloppyReceptionMap" in document
+    assert "setColorScale," in document
+    assert 'map.setPaintProperty("reception-cells-fill", "fill-color", colorExpression(range))' in document
     assert 'map.once("idle", () => refreshMapViewport({fit: true}))' in document
     assert "accessToken" not in document
+
+
+def test_reception_renderer_uses_configured_cell_size_in_legend() -> None:
+    payload = sample_payload()
+    payload["cell_size_m"] = 12.5
+
+    document = build_reception_map_html(payload)
+
+    assert '"cell_size_m":12.5' in document
+    assert '["cell_size_m", "cellSizeMeters"]' in document
+    assert "observed ${formatValue(configuredCellSizeMeters())} m cells" in document
 
 
 def test_reception_renderer_preserves_manual_range_and_reverse_setting() -> None:
@@ -388,3 +401,26 @@ def test_reception_widget_updates_opacity_without_replacing_document() -> None:
     ReceptionMapWidget.set_opacity(fake_widget, 2.0)
     assert fake_widget.opacity == 1.0
     assert scripts[-1].endswith("setOpacity(1.0) : false;")
+
+
+def test_reception_widget_updates_color_scale_without_replacing_document() -> None:
+    scripts: list[str] = []
+
+    class FakePage:
+        def runJavaScript(self, script: str, callback=None) -> None:
+            scripts.append(script)
+
+    fake_widget = cast(Any, type("FakeReceptionWidget", (), {})())
+    fake_widget.payload = sample_payload()
+    fake_widget._web_engine = True
+    fake_widget._page = FakePage()
+
+    ReceptionMapWidget.set_color_scale(fake_widget, False, 2.0, 85.0, True)
+
+    assert fake_widget.payload["auto_range"] is False
+    assert fake_widget.payload["range_min"] == 2.0
+    assert fake_widget.payload["range_max"] == 85.0
+    assert fake_widget.payload["reverse"] is True
+    assert scripts == [
+        'window.sloppyReceptionMap ? window.sloppyReceptionMap.setColorScale({"autoRange":false,"minimum":2.0,"maximum":85.0,"reverse":true}) : false;'
+    ]

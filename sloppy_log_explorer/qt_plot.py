@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import os
 import json
+import math
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, cast
@@ -640,6 +641,40 @@ class ReceptionMapWidget(QWidget):
         value = json.dumps(self.opacity)
         self._page.runJavaScript(
             f"window.sloppyReceptionMap ? window.sloppyReceptionMap.setOpacity({value}) : false;"
+        )
+
+    def set_color_scale(
+        self,
+        auto_range: bool,
+        minimum: float,
+        maximum: float,
+        reverse: bool,
+    ) -> None:
+        """Update reception colors and legend without rebuilding the map document."""
+        minimum_value = float(minimum)
+        maximum_value = float(maximum)
+        if not math.isfinite(minimum_value) or not math.isfinite(maximum_value):
+            return
+        options = {
+            "autoRange": bool(auto_range),
+            "minimum": minimum_value,
+            "maximum": maximum_value,
+            "reverse": bool(reverse),
+        }
+        if self.payload is not None:
+            self.payload["auto_range"] = bool(auto_range)
+            self.payload["reverse"] = bool(reverse)
+            if auto_range:
+                self.payload.pop("range_min", None)
+                self.payload.pop("range_max", None)
+            else:
+                self.payload["range_min"] = minimum_value
+                self.payload["range_max"] = maximum_value
+        if not self._web_engine or self._page is None:
+            return
+        data = json.dumps(options, allow_nan=False, separators=(",", ":"))
+        self._page.runJavaScript(
+            f"window.sloppyReceptionMap ? window.sloppyReceptionMap.setColorScale({data}) : false;"
         )
 
     def refresh_viewport(self, fit: bool = False) -> None:
