@@ -34,7 +34,7 @@ references unless explicitly targeted.
 ## Release Workflow
 
 1. Update `pyproject.toml` and `CHANGELOG.md` on a release branch named
-   `release/v{version}`.
+   `release/v{version}`. Ensure `CHANGELOG.md` is comprehensive at a high level.
 2. Run:
    `python tools/session_preflight.py --mode release`
 3. Run:
