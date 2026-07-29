@@ -133,6 +133,17 @@ def test_reception_site_selector_sorts_display_names_case_insensitively(
     assert labels[0] == "alpha (1 logs)"
     assert labels[1].startswith("Flying Site ")
     assert labels[2] == "Zulu (1 logs)"
+
+    renamed_site_id = int(sites[0]["id"])
+    window.reception_site_combo.setCurrentIndex(window.reception_site_combo.findData(renamed_site_id))
+    window.reception_site_name.setText("aardvark")
+    window.save_reception_site_metadata()
+
+    renamed_labels = [window.reception_site_combo.itemText(index) for index in range(3)]
+    assert renamed_labels[0] == "aardvark (1 logs)"
+    assert renamed_labels[1] == "alpha (1 logs)"
+    assert renamed_labels[2].startswith("Flying Site ")
+    assert window.reception_site_combo.currentData() == renamed_site_id
     window.close()
     app.quit()
 

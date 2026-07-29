@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import replace
 from datetime import date, datetime
@@ -100,6 +101,85 @@ def test_index_log_discovers_channels_between_stride_aligned_rows(tmp_path: Path
     assert record.channels == ("VFR 2.4G(%)",)
 
 
+def test_index_log_samples_sparse_gps_by_coordinate_cadence_not_row_phase(tmp_path: Path) -> None:
+    path = tmp_path / "off-phase-gps.csv"
+    rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]
+    for index in range(422):
+        gps_row = index % 20 == 1
+        latitude = f"{39.0 + index * 0.00001:.8f}" if gps_row else ""
+        longitude = "-75.00000000" if gps_row else ""
+        rows.append(
+            f"2026-04-01,12:00:{index % 60:02d},"
+            f"{latitude},{longitude},{90 - index}"
+        )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    record = index_log(path, tmp_path, sample_stride=20)
+
+    assert record.status == "ok"
+    assert record.center_latitude == pytest.approx(39.00201, abs=1e-6)
+    assert record.center_longitude == pytest.approx(-75.0, abs=1e-6)
+
+
+def test_index_log_repeated_partial_lock_does_not_hide_off_phase_fixes(tmp_path: Path) -> None:
+    path = tmp_path / "partial-lock-alias.csv"
+    rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]
+    for index in range(100):
+        if index in {21, 41, 61}:
+            latitude = f"{39.0 + index * 0.00001:.8f}"
+            longitude = "-75.00000000"
+        else:
+            latitude = "0.00000000"
+            longitude = "-75.00000000"
+        flight_date = "2026-04-01" if index < 20 else "2026-04-02"
+        rows.append(
+            f"{flight_date},12:00:{index % 60:02d},"
+            f"{latitude},{longitude},{90 - index}"
+        )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    record = index_log(path, tmp_path, sample_stride=20)
+
+    assert record.status == "ok"
+    assert record.flight_date == date(2026, 4, 1)
+    assert record.center_latitude == pytest.approx(39.00041, abs=1e-6)
+    assert record.center_longitude == pytest.approx(-75.0, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("stale_fix", "dominant_fix"),
+    [
+        ((30.0, -80.0), (39.0, -75.0)),
+        ((0.0, -80.0), (0.0, -75.0)),
+    ],
+)
+def test_index_log_preserves_dominant_stationary_fix_weight(
+    tmp_path: Path,
+    stale_fix: tuple[float, float],
+    dominant_fix: tuple[float, float],
+) -> None:
+    path = tmp_path / f"stationary-{dominant_fix[0]:g}.csv"
+    rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]
+    fix_index = 0
+    for index in range(1_000):
+        if index % 20 == 1:
+            latitude, longitude = stale_fix if fix_index < 2 else dominant_fix
+            fix_index += 1
+            position = f"{latitude:.8f},{longitude:.8f}"
+        else:
+            position = ","
+        rows.append(
+            f"2026-04-01,12:00:{index % 60:02d},{position},{90 - index}"
+        )
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+    record = index_log(path, tmp_path, sample_stride=20)
+
+    assert record.status == "ok"
+    assert record.center_latitude == pytest.approx(dominant_fix[0], abs=1e-6)
+    assert record.center_longitude == pytest.approx(dominant_fix[1], abs=1e-6)
+
+
 def test_index_log_uses_file_modified_date_for_elapsed_only_log(tmp_path: Path) -> None:
     path = tmp_path / "undated.csv"
     _write_gps_log(path, [80.0, 81.0], dated=False)
@@ -141,6 +221,7 @@ def test_index_log_scans_position_hinted_logs_past_the_probe_limit(
         *,
         max_records: int | None = None,
         full_scan_if_position_hint: bool = False,
+        is_cancelled=None,
     ):
         limits.append(max_records)
         return sampled_csv(
@@ -148,6 +229,7 @@ def test_index_log_scans_position_hinted_logs_past_the_probe_limit(
             sample_stride,
             max_records=max_records,
             full_scan_if_position_hint=full_scan_if_position_hint,
+            is_cancelled=is_cancelled,
         )
 
     monkeypatch.setattr(reception, "_sampled_csv", recording_sample)
@@ -184,6 +266,7 @@ def test_index_log_keeps_unhinted_non_gps_probe_bounded(
         *,
         max_records: int | None = None,
         full_scan_if_position_hint: bool = False,
+        is_cancelled=None,
     ):
         calls.append((sample_stride, max_records, full_scan_if_position_hint))
         return sampled_csv(
@@ -191,6 +274,7 @@ def test_index_log_keeps_unhinted_non_gps_probe_bounded(
             sample_stride,
             max_records=max_records,
             full_scan_if_position_hint=full_scan_if_position_hint,
+            is_cancelled=is_cancelled,
         )
 
     monkeypatch.setattr(reception, "_sampled_csv", recording_sample)
@@ -362,6 +446,29 @@ def test_refresh_reception_index_reuses_unchanged_fingerprints_and_cancels(tmp_p
     assert cancelled.records == ()
 
 
+def test_refresh_reception_index_cancels_inside_a_position_hinted_file(tmp_path: Path) -> None:
+    path = tmp_path / "large-cloud-log.csv"
+    _write_gps_log(path, [float(index) for index in range(250)])
+    checks = 0
+
+    def cancel_during_file() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 12
+
+    result = refresh_reception_index(
+        scan_library(tmp_path),
+        [],
+        tmp_path,
+        is_cancelled=cancel_during_file,
+    )
+
+    assert result.cancelled is True
+    assert result.records == ()
+    assert result.scanned_count == 0
+    assert checks == 12
+
+
 def test_refresh_caches_failures_detects_changes_and_rejects_foreign_roots(tmp_path: Path) -> None:
     no_gps_path = tmp_path / "no-gps.csv"
     no_gps_path.write_text(
@@ -374,10 +481,17 @@ def test_refresh_caches_failures_detects_changes_and_rejects_foreign_roots(tmp_p
 
     first = refresh_reception_index(logs, [], tmp_path)
     second = refresh_reception_index(logs, first.records, tmp_path)
+    stale_failure_records = [
+        replace(record, index_version=0) if record.status == "malformed" else record
+        for record in second.records
+    ]
+    stale_failure_result = refresh_reception_index(logs, stale_failure_records, tmp_path)
 
     assert {record.status for record in first.records} == {"no_gps", "malformed"}
     assert first.scanned_count == 2
     assert second.cached_count == 2
+    assert stale_failure_result.scanned_count == 0
+    assert stale_failure_result.cached_count == 2
 
     no_gps_path.write_text(
         no_gps_path.read_text(encoding="utf-8") + "2026-04-01,12:00:02,16.6\n",
@@ -400,7 +514,8 @@ def test_refresh_caches_failures_detects_changes_and_rejects_foreign_roots(tmp_p
 
     offline_log = LibraryLogInfo(tmp_path / "offline.csv", "offline", "offline.csv", 123.456, 321)
     offline_first = refresh_reception_index([offline_log], [], tmp_path)
-    offline_second = refresh_reception_index([offline_log], offline_first.records, tmp_path)
+    stale_offline = replace(offline_first.records[0], index_version=0)
+    offline_second = refresh_reception_index([offline_log], [stale_offline], tmp_path)
     assert offline_first.records[0].status == "io_error"
     assert offline_first.records[0].file_size == 321
     assert offline_first.records[0].mtime_ns == int(123.456 * 1_000_000_000)
@@ -441,6 +556,35 @@ def test_filtering_and_channel_coverage_use_inclusive_dates_and_exact_headers(tm
         ("Rx VFR(%)", 1, 2),
         ("VFR 2.4G(%)", 1, 2),
     ]
+
+
+def test_viewport_focus_uses_the_densest_sample_neighborhood_deterministically() -> None:
+    site_center = (39.774389, -75.204944)
+    points = [
+        (-30.0, -15.0, 120, 4),
+        (10.0, 5.0, 100, 3),
+        (35.0, 20.0, 80, 2),
+        (8_000.0, 0.0, 1, 1),
+    ]
+
+    focus = reception._reception_viewport_focus(points, site_center)
+    reordered = reception._reception_viewport_focus(list(reversed(points)), site_center)
+
+    assert focus == reordered
+    assert focus is not None
+    focus_latitude = focus["latitude"]
+    focus_longitude = focus["longitude"]
+    assert isinstance(focus_latitude, (int, float))
+    assert isinstance(focus_longitude, (int, float))
+    focus_x, focus_y = reception._local_xy(
+        float(focus_latitude),
+        float(focus_longitude),
+        site_center,
+    )
+    assert math.hypot(focus_x, focus_y) < 10.0
+    assert focus["radius_m"] == 2_000.0
+    assert focus["cell_count"] == 3
+    assert focus["sample_count"] == 300
 
 
 def test_heatmap_uses_all_rows_five_meter_cells_and_equal_flight_medians(tmp_path: Path) -> None:
@@ -511,6 +655,10 @@ def test_heatmap_wraps_longitude_cells_across_the_antimeridian(tmp_path: Path) -
         for cell in cells
         for longitude, _latitude in cell["polygon"]
     )
+    focus = payload["viewport_focus"]
+    assert isinstance(focus, dict)
+    assert abs(abs(float(focus["longitude"])) - 180.0) < 0.001
+    assert focus["radius_m"] == 2_000.0
 
 
 def test_heatmap_removes_repeated_gps_dropouts_far_from_selected_site(tmp_path: Path) -> None:

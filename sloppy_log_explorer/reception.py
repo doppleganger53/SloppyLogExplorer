@@ -28,13 +28,16 @@ from .models import (
 )
 from .parser import (
     InvalidTelemetryLogError,
+    _NON_POSITION_GPS_TOKENS,
     _clean_columns,
     _coerce_numeric_series,
     _deduplicate_columns,
     _detect_time,
+    _has_coordinate_name_hint,
     _has_date_header,
     _has_position_header_hint,
     _numeric_columns,
+    _parse_coordinate_text,
     _validate_table_structure,
     detect_gps_columns,
     load_log,
@@ -57,6 +60,8 @@ SITE_TOLERANCE_KM = 2.0
 DEFAULT_CELL_SIZE_METERS = 5.0
 HEATMAP_SITE_RADIUS_KM = 10.0
 EARTH_RADIUS_METERS = 6_371_008.8
+VIEWPORT_MAX_RADIUS_METERS = 2_000.0
+_VIEWPORT_BUCKET_METERS = 250.0
 _OBSERVED_NUMERIC_COLUMNS_ATTR = "sloppy_observed_numeric_columns"
 _CALENDAR_LITERAL_RE = re.compile(
     r"(?:\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b|\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b)"
@@ -66,8 +71,54 @@ ProgressCallback = Callable[[int, int, str], None]
 CancellationCheck = Callable[[], bool]
 
 
+class _ReceptionScanCancelled(RuntimeError):
+    """Stop an in-progress file scan without caching a partial record."""
+
+
 def _canonical_path(path: str | Path) -> str:
     return os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
+
+
+def _row_position_signature(
+    row: Sequence[str],
+    position_indexes: Sequence[int],
+) -> tuple[float, float] | None:
+    """Return a stable signature for a plausible joint position fix."""
+    def signature(latitude: float, longitude: float) -> tuple[float, float]:
+        wrapped_longitude = ((longitude + 180.0) % 360.0) - 180.0
+        return round(latitude, 7), round(wrapped_longitude, 7)
+
+    numeric_values: list[float] = []
+    for index in position_indexes:
+        text = str(row[index]).strip()
+        if not text:
+            continue
+        parsed = _parse_coordinate_text(text)
+        if parsed is not None:
+            latitude, longitude, _altitude = parsed
+            if (
+                -90.0 <= latitude <= 90.0
+                and -180.0 <= longitude <= 180.0
+                and (abs(latitude) > 1e-9 or abs(longitude) > 1e-9)
+            ):
+                return signature(latitude, longitude)
+        try:
+            numeric = float(text)
+        except ValueError:
+            continue
+        if math.isfinite(numeric):
+            numeric_values.append(numeric)
+    for latitude_index, latitude in enumerate(numeric_values):
+        for longitude_index, longitude in enumerate(numeric_values):
+            if latitude_index == longitude_index:
+                continue
+            if (
+                -90.0 <= latitude <= 90.0
+                and -180.0 <= longitude <= 180.0
+                and (abs(latitude) > 1e-9 or abs(longitude) > 1e-9)
+            ):
+                return signature(latitude, longitude)
+    return None
 
 
 def _sampled_csv(
@@ -76,8 +127,9 @@ def _sampled_csv(
     *,
     max_records: int | None = None,
     full_scan_if_position_hint: bool = False,
+    is_cancelled: CancellationCheck | None = None,
 ) -> pd.DataFrame:
-    """Read each Nth row while retaining whole-pass numeric-column evidence."""
+    """Read sparse data and GPS-event rows while retaining column evidence."""
     stride = max(1, int(sample_stride))
     requested_record_limit = max(1, int(max_records)) if max_records is not None else None
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -99,11 +151,28 @@ def _sampled_csv(
             else requested_record_limit
         )
         width = len(header)
-        rows: list[list[str]] = []
-        short_log_rows: list[list[str]] = []
+        selected_rows: dict[int, list[str]] = {}
+        short_log_rows: list[tuple[int, list[str]]] = []
+        position_short_rows: list[tuple[int, list[str]]] = []
+        position_sample_rows: list[tuple[int, list[str]]] = []
+        resolved_position_short_rows: list[tuple[int, list[str]]] = []
+        resolved_position_sample_rows: list[tuple[int, list[str]]] = []
+        position_indexes = [
+            index
+            for index, column in enumerate(columns)
+            if _has_coordinate_name_hint(column)
+            and not (
+                "gps" in column.lower()
+                and any(token in column.lower() for token in _NON_POSITION_GPS_TOKENS)
+            )
+        ]
         observed_numeric_columns: set[str] = set()
         data_index = 0
+        position_index = 0
+        resolved_position_index = 0
         for row in reader:
+            if is_cancelled is not None and is_cancelled():
+                raise _ReceptionScanCancelled
             if not row:
                 continue
             if record_limit is not None and data_index >= record_limit:
@@ -125,12 +194,64 @@ def _sampled_csv(
                 # Logs shorter than one stride are cheap to retain in full and
                 # need at least two rows for the shared GPS detector to prove a
                 # coordinate pair is telemetry rather than an incidental value.
-                short_log_rows.append(row)
+                short_log_rows.append((data_index, row))
             if data_index % stride == 0:
-                rows.append(row)
+                selected_rows[data_index] = row
+            position_signature = _row_position_signature(row, position_indexes)
+            if position_signature is not None:
+                # Sample against the coordinate update cadence instead of the
+                # absolute CSV row number. A sensor publishing on rows 1, 21,
+                # 41, ... must not alias with a 20-row sample at phase zero.
+                # Retaining every Nth update stays bounded while preserving the
+                # relative weight of stationary and moving fix clouds.
+                if position_index < stride:
+                    position_short_rows.append((data_index, row))
+                if position_index % stride == 0:
+                    position_sample_rows.append((data_index, row))
+                position_index += 1
+            if position_signature is not None and all(
+                abs(coordinate) > 1e-9 for coordinate in position_signature
+            ):
+                if resolved_position_index < stride:
+                    resolved_position_short_rows.append((data_index, row))
+                if resolved_position_index % stride == 0:
+                    resolved_position_sample_rows.append((data_index, row))
+                resolved_position_index += 1
             data_index += 1
         if data_index <= stride:
-            rows = short_log_rows
+            selected_rows = dict(short_log_rows)
+        elif position_index <= stride:
+            selected_rows.update(position_short_rows)
+        else:
+            selected_rows.update(position_sample_rows)
+        if resolved_position_index >= 2:
+            # Absolute-stride rows can still contain repeated one-axis startup
+            # locks. Once the full pass proves usable two-axis fixes exist,
+            # blank only those coordinates before GPS outlier filtering can
+            # mistake the startup placeholder for the dominant location. Keep
+            # the rest of each row so the earliest date and channel evidence
+            # remain available to the indexer.
+            selected_rows = {
+                index: (
+                    [
+                        "" if column_index in position_indexes else value
+                        for column_index, value in enumerate(row)
+                    ]
+                    if (row_signature := _row_position_signature(row, position_indexes))
+                    is not None
+                    and (
+                        abs(row_signature[0]) <= 1e-9
+                        or abs(row_signature[1]) <= 1e-9
+                    )
+                    else row
+                )
+                for index, row in selected_rows.items()
+            }
+            if resolved_position_index <= stride:
+                selected_rows.update(resolved_position_short_rows)
+            else:
+                selected_rows.update(resolved_position_sample_rows)
+        rows = [row for _, row in sorted(selected_rows.items())]
     dataframe = pd.DataFrame(rows, columns=pd.Index(columns))
     dataframe.attrs[_OBSERVED_NUMERIC_COLUMNS_ATTR] = tuple(
         column for column in columns if column in observed_numeric_columns
@@ -357,6 +478,7 @@ def index_log(
     library_root: str | Path,
     sample_stride: int = SAMPLE_STRIDE,
     gps_probe_records: int = GPS_PROBE_RECORDS,
+    is_cancelled: CancellationCheck | None = None,
 ) -> ReceptionLogRecord:
     """Probe for GPS, then build one cached record from a whole-file row sample."""
     file_path = Path(path).resolve(strict=False)
@@ -384,6 +506,7 @@ def index_log(
             sample_stride,
             max_records=gps_probe_records,
             full_scan_if_position_hint=True,
+            is_cancelled=is_cancelled,
         )
         probe_is_full_sample = _has_position_header_hint(probe.columns)
         (
@@ -436,7 +559,7 @@ def index_log(
                 sampled_flight_date,
                 sampled_date_inferred,
             ) = _inspect_index_sample(
-                _sampled_csv(file_path, sample_stride),
+                _sampled_csv(file_path, sample_stride, is_cancelled=is_cancelled),
                 file_path,
                 modified,
             )
@@ -493,6 +616,8 @@ def index_log(
             center_longitude,
             channels,
         )
+    except _ReceptionScanCancelled:
+        raise
     except OSError as exc:
         status = "io_error"
         message = f"{type(exc).__name__}: {exc}"
@@ -722,12 +847,30 @@ def refresh_reception_index(
             existing is not None
             and existing.file_size == size
             and existing.mtime_ns == mtime_ns
-            and existing.index_version == RECEPTION_INDEX_VERSION
+            and (
+                existing.index_version == RECEPTION_INDEX_VERSION
+                or existing.status in {"malformed", "io_error"}
+            )
         ):
             record = existing
             cached_count += 1
         else:
-            record = index_log(path, root, sample_stride=sample_stride)
+            try:
+                record = index_log(
+                    path,
+                    root,
+                    sample_stride=sample_stride,
+                    is_cancelled=is_cancelled,
+                )
+            except _ReceptionScanCancelled:
+                return ReceptionScanResult(
+                    tuple(records),
+                    tuple(cluster_reception_records(records)),
+                    scanned_count,
+                    cached_count,
+                    sum(record.status in {"malformed", "io_error"} for record in records),
+                    True,
+                )
             if metadata_from_library and record.status == "io_error":
                 # Preserve the last metadata fingerprint supplied by the
                 # library scan. Otherwise an inaccessible cloud placeholder
@@ -768,6 +911,152 @@ def _local_lon_lat(x: float, y: float, center: tuple[float, float]) -> tuple[flo
 def _telemetry_unit(column: str) -> str:
     match = re.search(r"\(([^()]*)\)\s*$", column)
     return match.group(1).strip() if match else ""
+
+
+def _reception_viewport_focus(
+    cell_points: Sequence[tuple[float, float, int, int]],
+    site_center: tuple[float, float],
+    radius_m: float = VIEWPORT_MAX_RADIUS_METERS,
+) -> dict[str, object] | None:
+    """Locate the densest observed sample neighborhood for the map camera."""
+    requested_radius = float(radius_m)
+    if not math.isfinite(requested_radius) or requested_radius <= 0.0:
+        raise ValueError("radius_m must be a positive finite number")
+    radius = min(requested_radius, VIEWPORT_MAX_RADIUS_METERS)
+    points = sorted(
+        (
+            float(x),
+            float(y),
+            max(1, int(sample_count)),
+            max(1, int(flight_count)),
+        )
+        for x, y, sample_count, flight_count in cell_points
+        if math.isfinite(float(x)) and math.isfinite(float(y))
+    )
+    if not points:
+        return None
+
+    # Aggregate into small local buckets before scoring neighborhoods. The
+    # heatmap itself can contain thousands of 5 m cells, while the selected
+    # site's candidate area is bounded to 10 km from its center. This keeps the
+    # density search effectively linear without making the camera sensitive to
+    # input order.
+    buckets: dict[tuple[int, int], list[float]] = {}
+    for x, y, sample_weight, flight_weight in points:
+        key = (
+            math.floor(x / _VIEWPORT_BUCKET_METERS),
+            math.floor(y / _VIEWPORT_BUCKET_METERS),
+        )
+        aggregate = buckets.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0.0])
+        aggregate[0] += sample_weight
+        aggregate[1] += flight_weight
+        aggregate[2] += 1.0
+        aggregate[3] += x * sample_weight
+        aggregate[4] += y * sample_weight
+
+    bucket_centers = {
+        key: (
+            aggregate[3] / aggregate[0],
+            aggregate[4] / aggregate[0],
+            aggregate[0],
+            aggregate[1],
+            aggregate[2],
+        )
+        for key, aggregate in buckets.items()
+    }
+    neighbor_span = math.ceil(radius / _VIEWPORT_BUCKET_METERS) + 1
+    best_score: tuple[float, float, float, float, float, float] | None = None
+    best_center: tuple[float, float] | None = None
+    for key in sorted(bucket_centers):
+        center_x, center_y, _samples, _flights, _cells = bucket_centers[key]
+        sample_kernel = 0.0
+        covered_samples = 0.0
+        flight_kernel = 0.0
+        covered_flights = 0.0
+        covered_cells = 0.0
+        squared_distance_sum = 0.0
+        for x_offset in range(-neighbor_span, neighbor_span + 1):
+            for y_offset in range(-neighbor_span, neighbor_span + 1):
+                neighbor = bucket_centers.get((key[0] + x_offset, key[1] + y_offset))
+                if neighbor is None:
+                    continue
+                other_x, other_y, sample_weight, flight_weight, cell_weight = neighbor
+                distance = math.hypot(other_x - center_x, other_y - center_y)
+                if distance > radius:
+                    continue
+                kernel = 1.0 - (distance / radius) ** 2
+                sample_kernel += sample_weight * kernel
+                covered_samples += sample_weight
+                flight_kernel += flight_weight * kernel
+                covered_flights += flight_weight
+                covered_cells += cell_weight
+                squared_distance_sum += sample_weight * distance * distance
+        rms_distance = math.sqrt(squared_distance_sum / covered_samples) if covered_samples else radius
+        score = (
+            sample_kernel,
+            covered_samples,
+            flight_kernel,
+            covered_flights,
+            covered_cells,
+            -rms_distance,
+        )
+        candidate_center = (center_x, center_y)
+        if (
+            best_score is None
+            or score > best_score
+            or (score == best_score and (best_center is None or candidate_center < best_center))
+        ):
+            best_score = score
+            best_center = candidate_center
+
+    if best_center is None:
+        return None
+
+    # Refine the winning bucket with a bounded flat-kernel mean shift. Sample
+    # count is the primary observation weight; flight count is retained for
+    # diagnostics and deterministic secondary scoring above.
+    focus_x, focus_y = best_center
+    members: list[tuple[float, float, int, int]] = []
+    for _ in range(8):
+        members = [
+            point
+            for point in points
+            if math.hypot(point[0] - focus_x, point[1] - focus_y) <= radius + 1e-9
+        ]
+        if not members:
+            members = [min(points, key=lambda point: (math.hypot(point[0] - focus_x, point[1] - focus_y), point))]
+        total_weight = sum(point[2] for point in members)
+        next_x = sum(point[0] * point[2] for point in members) / total_weight
+        next_y = sum(point[1] * point[2] for point in members) / total_weight
+        shift = math.hypot(next_x - focus_x, next_y - focus_y)
+        focus_x, focus_y = next_x, next_y
+        if shift < 0.05:
+            break
+
+    members = [
+        point
+        for point in points
+        if math.hypot(point[0] - focus_x, point[1] - focus_y) <= radius + 1e-9
+    ] or members
+    focus_longitude, focus_latitude = _local_lon_lat(focus_x, focus_y, site_center)
+    focus_longitude = ((focus_longitude + 180.0) % 360.0) - 180.0
+    member_samples = sum(point[2] for point in members)
+    rms_distance = math.sqrt(
+        sum(
+            point[2] * ((point[0] - focus_x) ** 2 + (point[1] - focus_y) ** 2)
+            for point in members
+        )
+        / member_samples
+    )
+    return {
+        "latitude": focus_latitude,
+        "longitude": focus_longitude,
+        "radius_m": radius,
+        "cell_count": len(members),
+        "sample_count": member_samples,
+        "flight_count": sum(point[3] for point in members),
+        "rms_distance_m": rms_distance,
+    }
 
 
 def build_reception_heatmap(
@@ -871,6 +1160,7 @@ def build_reception_heatmap(
                 progress(completed, total, record.file_path.name)
 
     cells: list[ReceptionCell] = []
+    viewport_points: list[tuple[float, float, int, int]] = []
     for (x_index, y_index), medians in sorted(flight_medians.items()):
         center_x = x_index * cell_size
         center_y = y_index * cell_size
@@ -896,6 +1186,14 @@ def build_reception_heatmap(
                 len(medians),
             )
         )
+        viewport_points.append(
+            (
+                center_x,
+                center_y,
+                sample_counts[(x_index, y_index)],
+                len(medians),
+            )
+        )
 
     cell_payload = [
         {
@@ -911,7 +1209,7 @@ def build_reception_heatmap(
     values = [cell.value for cell in cells]
     status = "ok" if cells else "empty"
     message = "" if cells else "No valid GPS and telemetry samples matched the selected filters."
-    return {
+    payload: dict[str, object] = {
         "status": status,
         "message": message,
         "telemetry_column": telemetry_column,
@@ -927,3 +1225,7 @@ def build_reception_heatmap(
         "error_count": error_count,
         "off_site_sample_count": off_site_sample_count,
     }
+    viewport_focus = _reception_viewport_focus(viewport_points, site_center)
+    if viewport_focus is not None:
+        payload["viewport_focus"] = viewport_focus
+    return payload

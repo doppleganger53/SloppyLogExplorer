@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 
 OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
-MAP_MAX_ZOOM = 19
+MAP_MAX_ZOOM = 22
 MAP_FIT_MAX_ZOOM = 17
 DEFAULT_CELL_SIZE_METERS = 5.0
+WEB_MERCATOR_MAX_LATITUDE = 85.05112878
 
 
 def _asset_uri(filename: str) -> str:
@@ -62,7 +64,8 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     ``sample_count``, and ``flight_count``. A precomputed ``polygon`` or
     ``bounds`` may be supplied instead. A few camel-case aliases are accepted
     at the renderer boundary so persisted/internal payloads do not need a UI
-    specific conversion step.
+    specific conversion step. Nonempty maps require density-focus metadata so
+    the renderer never substitutes a global centroid that can land off-data.
     """
     if payload is None:
         return _message_html("Generate a reception map to display observed coverage.", dark, "empty")
@@ -77,6 +80,45 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     if not isinstance(cells, list) or not cells:
         message = str(payload.get("message") or "No reception samples matched the selected filters.")
         return _message_html(message, dark, "empty")
+    raw_focus = payload.get("viewport_focus", payload.get("viewportFocus"))
+    if not isinstance(raw_focus, dict):
+        return _message_html(
+            "Reception map is missing density-focus metadata. Regenerate the heatmap.",
+            dark,
+            "error",
+        )
+    raw_focus_latitude = raw_focus.get("latitude", raw_focus.get("lat"))
+    raw_focus_longitude = raw_focus.get(
+        "longitude",
+        raw_focus.get("lon", raw_focus.get("lng")),
+    )
+    try:
+        focus_latitude = (
+            float(raw_focus_latitude) if raw_focus_latitude is not None else math.nan
+        )
+        focus_longitude = (
+            float(raw_focus_longitude) if raw_focus_longitude is not None else math.nan
+        )
+    except (TypeError, ValueError):
+        focus_latitude = math.nan
+        focus_longitude = math.nan
+    if not (
+        math.isfinite(focus_latitude)
+        and math.isfinite(focus_longitude)
+        and abs(focus_latitude) <= 90.0
+        and abs(focus_longitude) <= 180.0
+    ):
+        return _message_html(
+            "Reception map density-focus coordinates are invalid. Regenerate the heatmap.",
+            dark,
+            "error",
+        )
+    if abs(focus_latitude) >= WEB_MERCATOR_MAX_LATITUDE:
+        return _message_html(
+            "Reception map data lies at or beyond the Web Mercator display limit of ±85.051° latitude.",
+            dark,
+            "error",
+        )
 
     background = "#1f242b" if dark else "#ffffff"
     panel_bg = "rgba(21,24,29,0.92)" if dark else "rgba(255,255,255,0.94)"
@@ -188,9 +230,13 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       maplibregl.workerUrl = maplibreWorkerUrl;
     }
     const receptionData = __RECEPTION_DATA__;
-    const mapMaxZoom = 19;
+    const mapMaxZoom = 22;
     const fitMaxZoom = 17;
     const defaultCellSizeMeters = 5;
+    const viewportMaxRadiusMeters = 2000;
+    const earthRadiusMeters = 6371008.8;
+    const mercatorMaxLatitude = 85.05112878;
+    const mapTileSize = 512;
     const statusElement = document.getElementById("status");
     const legendTitle = document.getElementById("legend-title");
     const legendGradient = document.getElementById("legend-gradient");
@@ -204,6 +250,9 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     let popup = null;
     let featureCollection = {type: "FeatureCollection", features: []};
     let dataBounds = null;
+    let focusBounds = null;
+    let focusFeatures = [];
+    let viewportFocus = null;
 
     function finiteNumber(value) {
       if (value === null || value === undefined) return null;
@@ -219,6 +268,46 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         }
       }
       return fallback;
+    }
+
+    function clamp(value, minimum, maximum) {
+      return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    function wrapLongitude(longitude) {
+      const numeric = Number(longitude);
+      const wrapped = ((numeric + 180) % 360 + 360) % 360 - 180;
+      return wrapped === -180 && numeric > 0 ? 180 : wrapped;
+    }
+
+    function longitudeNear(longitude, reference) {
+      const delta = ((Number(longitude) - Number(reference) + 180) % 360 + 360) % 360 - 180;
+      return Number(reference) + delta;
+    }
+
+    function haversineMeters(latitudeA, longitudeA, latitudeB, longitudeB) {
+      const latitude1 = Number(latitudeA) * Math.PI / 180;
+      const latitude2 = Number(latitudeB) * Math.PI / 180;
+      const latitudeDelta = latitude2 - latitude1;
+      const longitudeDelta = longitudeNear(longitudeB, longitudeA) - Number(longitudeA);
+      const longitudeRadians = longitudeDelta * Math.PI / 180;
+      const haversine = Math.sin(latitudeDelta / 2) ** 2
+        + Math.cos(latitude1) * Math.cos(latitude2) * Math.sin(longitudeRadians / 2) ** 2;
+      return 2 * earthRadiusMeters * Math.asin(Math.min(1, Math.sqrt(Math.max(0, haversine))));
+    }
+
+    function ringCenter(ring) {
+      if (!Array.isArray(ring) || !ring.length) return null;
+      const points = ring.length > 1
+        && ring[0][0] === ring[ring.length - 1][0]
+        && ring[0][1] === ring[ring.length - 1][1]
+        ? ring.slice(0, -1)
+        : ring;
+      if (!points.length) return null;
+      const reference = points[0][0];
+      const longitude = points.reduce((total, point) => total + longitudeNear(point[0], reference), 0) / points.length;
+      const latitude = points.reduce((total, point) => total + point[1], 0) / points.length;
+      return [wrapLongitude(longitude), latitude];
     }
 
     function closeRing(coordinates) {
@@ -280,11 +369,18 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       const ring = cellRing(cell);
       const value = finiteNumber(firstValue(cell, ["value", "median", "telemetry_value", "telemetryValue"], null));
       if (!ring || value === null) return null;
+      const derivedCenter = ringCenter(ring);
+      const rawLatitude = finiteNumber(firstValue(cell, ["latitude", "lat", "center_latitude", "centerLat"], null));
+      const rawLongitude = finiteNumber(firstValue(cell, ["longitude", "lon", "lng", "center_longitude", "centerLon"], null));
+      const centerLatitude = rawLatitude !== null ? rawLatitude : derivedCenter && derivedCenter[1];
+      const centerLongitude = rawLongitude !== null ? rawLongitude : derivedCenter && derivedCenter[0];
       return {
         type: "Feature",
         geometry: {type: "Polygon", coordinates: [ring]},
         properties: {
           value,
+          centerLatitude,
+          centerLongitude,
           sampleCount: Math.max(0, Math.trunc(finiteNumber(firstValue(cell, ["sample_count", "sampleCount", "samples"], 0)) || 0)),
           flightCount: Math.max(0, Math.trunc(finiteNumber(firstValue(cell, ["flight_count", "flightCount", "log_count", "logCount", "logs"], 0)) || 0))
         }
@@ -298,6 +394,60 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         features: cells.map(cellFeature).filter(Boolean)
       };
       return featureCollection;
+    }
+
+    function featureCenter(feature) {
+      const properties = feature && feature.properties ? feature.properties : {};
+      const latitude = finiteNumber(properties.centerLatitude);
+      const longitude = finiteNumber(properties.centerLongitude);
+      if (latitude === null || longitude === null || Math.abs(latitude) > 90) return null;
+      return [wrapLongitude(longitude), latitude];
+    }
+
+    function resolveViewportFocus() {
+      const configured = firstValue(
+        receptionData,
+        ["viewport_focus", "viewportFocus", "map_focus", "mapFocus"],
+        null
+      );
+      if (configured && typeof configured === "object") {
+        const latitude = finiteNumber(firstValue(configured, ["latitude", "lat"], null));
+        const longitude = finiteNumber(firstValue(configured, ["longitude", "lon", "lng"], null));
+        if (latitude !== null && longitude !== null && Math.abs(latitude) <= 90) {
+          const requestedRadius = finiteNumber(firstValue(configured, ["radius_m", "radiusMeters"], viewportMaxRadiusMeters));
+          return {
+            latitude,
+            longitude: wrapLongitude(longitude),
+            radiusMeters: Math.min(viewportMaxRadiusMeters, Math.max(1, requestedRadius || viewportMaxRadiusMeters)),
+            cellCount: Math.max(0, Math.trunc(finiteNumber(firstValue(configured, ["cell_count", "cellCount"], 0)) || 0)),
+            sampleCount: Math.max(0, Math.trunc(finiteNumber(firstValue(configured, ["sample_count", "sampleCount"], 0)) || 0)),
+            flightCount: Math.max(0, Math.trunc(finiteNumber(firstValue(configured, ["flight_count", "flightCount"], 0)) || 0))
+          };
+        }
+      }
+      return null;
+    }
+
+    function selectFocusFeatures(focus) {
+      if (!focus) return featureCollection.features.slice();
+      const selected = featureCollection.features.filter((feature) => {
+        const center = featureCenter(feature);
+        return center && haversineMeters(
+          focus.latitude,
+          focus.longitude,
+          center[1],
+          center[0]
+        ) <= focus.radiusMeters + defaultCellSizeMeters;
+      });
+      if (selected.length) return selected;
+      const nearest = featureCollection.features
+        .map((feature) => ({feature, center: featureCenter(feature)}))
+        .filter((candidate) => candidate.center !== null)
+        .sort((left, right) => (
+          haversineMeters(focus.latitude, focus.longitude, left.center[1], left.center[0])
+          - haversineMeters(focus.latitude, focus.longitude, right.center[1], right.center[0])
+        ));
+      return nearest.length ? [nearest[0].feature] : [];
     }
 
     function valueRange() {
@@ -374,21 +524,165 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
             attribution: "&copy; OpenStreetMap contributors"
           }
         },
-        layers: [{id: "osm-raster", type: "raster", source: "osm-raster", minzoom: 0, maxzoom: 19}]
+        layers: [{id: "osm-raster", type: "raster", source: "osm-raster", minzoom: 0}]
       };
     }
 
-    function calculateBounds() {
+    function calculateBounds(features, referenceLongitude) {
       const bounds = new maplibregl.LngLatBounds();
-      for (const feature of featureCollection.features) {
-        for (const coordinate of feature.geometry.coordinates[0]) bounds.extend(coordinate);
+      for (const feature of features) {
+        for (const coordinate of feature.geometry.coordinates[0]) {
+          bounds.extend([longitudeNear(coordinate[0], referenceLongitude), coordinate[1]]);
+        }
       }
       return bounds.isEmpty() ? null : bounds;
     }
 
+    function mercatorY(latitude) {
+      const radians = clamp(Number(latitude), -mercatorMaxLatitude, mercatorMaxLatitude) * Math.PI / 180;
+      return (1 - Math.log(Math.tan(radians) + (1 / Math.cos(radians))) / Math.PI) / 2;
+    }
+
+    function mercatorLatitude(value) {
+      return Math.atan(Math.sinh(Math.PI * (1 - 2 * Number(value)))) * 180 / Math.PI;
+    }
+
+    function viewportDimensions() {
+      const container = map && map.getContainer ? map.getContainer() : null;
+      const canvas = map && map.getCanvas ? map.getCanvas() : null;
+      return {
+        width: Math.max(1, Number(container && container.clientWidth) || Number(canvas && canvas.clientWidth) || 1),
+        height: Math.max(1, Number(container && container.clientHeight) || Number(canvas && canvas.clientHeight) || 1)
+      };
+    }
+
+    function focusFitZoom(center, features, padding) {
+      const dimensions = viewportDimensions();
+      const availableX = Math.max(1, dimensions.width / 2 - padding);
+      const availableY = Math.max(1, dimensions.height / 2 - padding);
+      const centerMercatorY = mercatorY(center[1]);
+      let maximumX = 0;
+      let maximumY = 0;
+      for (const feature of features) {
+        for (const coordinate of feature.geometry.coordinates[0]) {
+          const longitudeDelta = longitudeNear(coordinate[0], center[0]) - center[0];
+          maximumX = Math.max(maximumX, Math.abs(longitudeDelta / 360));
+          maximumY = Math.max(maximumY, Math.abs(mercatorY(coordinate[1]) - centerMercatorY));
+        }
+      }
+      const horizontalZoom = maximumX > 0
+        ? Math.log2(availableX / (mapTileSize * maximumX))
+        : fitMaxZoom;
+      const verticalZoom = maximumY > 0
+        ? Math.log2(availableY / (mapTileSize * maximumY))
+        : fitMaxZoom;
+      return clamp(Math.min(horizontalZoom, verticalZoom, fitMaxZoom), 0, mapMaxZoom);
+    }
+
+    function viewportCornerRadiusMeters(center, zoom) {
+      const dimensions = viewportDimensions();
+      const worldSize = mapTileSize * (2 ** Number(zoom));
+      const centerX = (Number(center[0]) + 180) / 360;
+      const centerY = mercatorY(center[1]);
+      let maximum = 0;
+      for (const xDirection of [-1, 1]) {
+        for (const yDirection of [-1, 1]) {
+          const cornerX = centerX + xDirection * dimensions.width / (2 * worldSize);
+          const cornerY = clamp(centerY + yDirection * dimensions.height / (2 * worldSize), 0, 1);
+          const longitude = cornerX * 360 - 180;
+          const latitude = mercatorLatitude(cornerY);
+          maximum = Math.max(maximum, haversineMeters(center[1], center[0], latitude, longitude));
+        }
+      }
+      return maximum;
+    }
+
+    function minimumZoomForRadius(center, radiusMeters) {
+      if (viewportCornerRadiusMeters(center, mapMaxZoom) > radiusMeters) return mapMaxZoom;
+      let lower = 0;
+      let upper = mapMaxZoom;
+      for (let iteration = 0; iteration < 32; iteration += 1) {
+        const middle = (lower + upper) / 2;
+        if (viewportCornerRadiusMeters(center, middle) > radiusMeters) lower = middle;
+        else upper = middle;
+      }
+      return upper;
+    }
+
+    function minimumZoomForMercatorEdge(center) {
+      const dimensions = viewportDimensions();
+      const centerY = clamp(mercatorY(center[1]), 0, 1);
+      const verticalClearance = Math.min(centerY, 1 - centerY);
+      if (verticalClearance <= 0) return mapMaxZoom;
+      const requiredWorldSize = dimensions.height / (2 * verticalClearance);
+      return clamp(Math.log2(requiredWorldSize / mapTileSize), 0, mapMaxZoom);
+    }
+
+    function visibleViewportRadiusMeters(focus) {
+      if (!map || !focus) return null;
+      const focusLatitude = clamp(focus.latitude, -mercatorMaxLatitude, mercatorMaxLatitude);
+      const bounds = map.getBounds();
+      const west = bounds.getWest();
+      const east = bounds.getEast();
+      const south = bounds.getSouth();
+      const north = bounds.getNorth();
+      return Math.max(
+        haversineMeters(focusLatitude, focus.longitude, south, west),
+        haversineMeters(focusLatitude, focus.longitude, south, east),
+        haversineMeters(focusLatitude, focus.longitude, north, west),
+        haversineMeters(focusLatitude, focus.longitude, north, east)
+      );
+    }
+
     function fitReceptionBounds() {
-      if (!map || !dataBounds) return false;
-      map.fitBounds(dataBounds, {padding: 50, maxZoom: fitMaxZoom, duration: 0});
+      if (!map || !viewportFocus) return false;
+      const center = [
+        wrapLongitude(viewportFocus.longitude),
+        clamp(viewportFocus.latitude, -mercatorMaxLatitude, mercatorMaxLatitude)
+      ];
+      const fittedZoom = focusFitZoom(center, focusFeatures, 50);
+      const radiusZoom = minimumZoomForRadius(center, viewportFocus.radiusMeters);
+      const edgeZoom = minimumZoomForMercatorEdge(center);
+      const jumpToZoom = (zoom) => map.jumpTo({
+        center,
+        zoom,
+        pitch: 0,
+        bearing: 0
+      });
+      let selectedZoom = Math.min(mapMaxZoom, Math.max(fittedZoom, radiusZoom, edgeZoom));
+      jumpToZoom(selectedZoom);
+
+      // MapLibre may still constrain a near-edge center after jumpTo(). Check
+      // the real camera bounds and tighten the zoom until the visible corners
+      // are inside the requested radius.
+      if (
+        selectedZoom < mapMaxZoom
+        && Number(visibleViewportRadiusMeters(viewportFocus)) > viewportFocus.radiusMeters
+      ) {
+        let lower = selectedZoom;
+        let upper = mapMaxZoom;
+        jumpToZoom(upper);
+        if (Number(visibleViewportRadiusMeters(viewportFocus)) <= viewportFocus.radiusMeters) {
+          for (let iteration = 0; iteration < 28; iteration += 1) {
+            const middle = (lower + upper) / 2;
+            jumpToZoom(middle);
+            if (Number(visibleViewportRadiusMeters(viewportFocus)) > viewportFocus.radiusMeters) {
+              lower = middle;
+            } else {
+              upper = middle;
+            }
+          }
+          selectedZoom = upper;
+          jumpToZoom(selectedZoom);
+        }
+      }
+      const finalRadius = visibleViewportRadiusMeters(viewportFocus);
+      if (!Number.isFinite(finalRadius) || finalRadius > viewportFocus.radiusMeters + 0.5) {
+        mapState = "error";
+        mapError = "Unable to constrain the reception viewport to its requested radius";
+        setStatus(`Reception map error: ${mapError}`, "error");
+        return false;
+      }
       return true;
     }
 
@@ -458,6 +752,11 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     function debugState() {
       const range = valueRange();
       const boundsArray = dataBounds ? [dataBounds.getSouthWest().toArray(), dataBounds.getNorthEast().toArray()] : null;
+      const focusBoundsArray = focusBounds ? [focusBounds.getSouthWest().toArray(), focusBounds.getNorthEast().toArray()] : null;
+      const visibleBounds = map ? map.getBounds() : null;
+      const viewportBoundsArray = visibleBounds
+        ? [[visibleBounds.getWest(), visibleBounds.getSouth()], [visibleBounds.getEast(), visibleBounds.getNorth()]]
+        : null;
       let renderedCellCount = 0;
       let sourceCellCount = 0;
       if (map && map.getLayer("reception-cells-fill")) {
@@ -490,6 +789,18 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         } : null,
         range: {minimum: range.minimum, maximum: range.maximum, auto: range.autoRange, reverse: range.reverse},
         bounds: boundsArray,
+        focusBounds: focusBoundsArray,
+        viewportBounds: viewportBoundsArray,
+        viewportFocus: viewportFocus ? {
+          latitude: viewportFocus.latitude,
+          longitude: viewportFocus.longitude,
+          cameraLatitude: clamp(viewportFocus.latitude, -mercatorMaxLatitude, mercatorMaxLatitude),
+          radiusMeters: viewportFocus.radiusMeters,
+          cellCount: viewportFocus.cellCount,
+          sampleCount: viewportFocus.sampleCount,
+          flightCount: viewportFocus.flightCount
+        } : null,
+        viewportRadiusMeters: visibleViewportRadiusMeters(viewportFocus),
         error: mapError
       };
     }
@@ -497,7 +808,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     function refreshMapViewport(options) {
       if (!map) return false;
       map.resize();
-      if (options && options.fit) fitReceptionBounds();
+      if (options && options.fit && !fitReceptionBounds()) return false;
       if (typeof map.triggerRepaint === "function") map.triggerRepaint();
       return true;
     }
@@ -506,8 +817,17 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       if (!window.maplibregl) throw new Error("MapLibre library failed to load");
       buildFeatures();
       if (!featureCollection.features.length) throw new Error("No valid reception cells to display");
-      dataBounds = calculateBounds();
-      const center = dataBounds ? dataBounds.getCenter().toArray() : [-75, 39];
+      viewportFocus = resolveViewportFocus();
+      if (viewportFocus && Math.abs(viewportFocus.latitude) >= mercatorMaxLatitude) {
+        throw new Error("Reception map data lies at or beyond the Web Mercator display limit of ±85.051° latitude");
+      }
+      focusFeatures = selectFocusFeatures(viewportFocus);
+      const referenceLongitude = viewportFocus ? viewportFocus.longitude : 0;
+      dataBounds = calculateBounds(featureCollection.features, referenceLongitude);
+      focusBounds = calculateBounds(focusFeatures, referenceLongitude);
+      const center = viewportFocus
+        ? [wrapLongitude(viewportFocus.longitude), clamp(viewportFocus.latitude, -mercatorMaxLatitude, mercatorMaxLatitude)]
+        : [-75, 39];
       map = new maplibregl.Map({
         container: "map",
         style: buildRasterBaseStyle(),
@@ -534,7 +854,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         if (layersAdded) return;
         try {
           if (!addReceptionLayers()) return;
-          fitReceptionBounds();
+          if (!fitReceptionBounds()) return;
           mapState = "ready";
           setStatus("", "ok");
           refreshMapViewport({fit: false});

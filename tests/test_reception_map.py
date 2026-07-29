@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from PyQt6.QtCore import QSize
+from PyQt6.QtGui import QResizeEvent
 from PyQt6.QtWidgets import QApplication, QTextEdit
 
 from sloppy_log_explorer.qt_plot import ReceptionMapWidget
@@ -18,6 +20,14 @@ def sample_payload() -> dict[str, object]:
         "cell_size_m": 5,
         "auto_range": True,
         "reverse": False,
+        "viewport_focus": {
+            "latitude": 39.7744,
+            "longitude": -75.2049,
+            "radius_m": 2_000,
+            "cell_count": 2,
+            "sample_count": 27,
+            "flight_count": 5,
+        },
         "cells": [
             {
                 "latitude": 39.774389,
@@ -55,6 +65,30 @@ def test_reception_renderer_handles_initial_empty_and_error_states() -> None:
     assert 'state: "empty"' in cancelled
 
 
+@pytest.mark.parametrize("latitude", [85.05112878, 89.0, -85.05112878])
+def test_reception_renderer_rejects_focus_at_or_beyond_web_mercator_limit(
+    latitude: float,
+) -> None:
+    payload = sample_payload()
+    focus = cast(dict[str, object], payload["viewport_focus"])
+    focus["latitude"] = latitude
+
+    document = build_reception_map_html(payload)
+
+    assert "at or beyond the Web Mercator display limit" in document
+    assert 'state: "error"' in document
+
+
+def test_reception_renderer_requires_density_focus_for_nonempty_map() -> None:
+    payload = sample_payload()
+    payload.pop("viewport_focus")
+
+    document = build_reception_map_html(payload)
+
+    assert "missing density-focus metadata" in document
+    assert 'state: "error"' in document
+
+
 def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> None:
     document = build_reception_map_html(sample_payload(), dark=True)
 
@@ -62,6 +96,7 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert "assets/maplibre/maplibre-gl-csp.js" in document.replace("\\", "/")
     assert "assets/maplibre/maplibre-gl-csp-worker.js" in document.replace("\\", "/")
     assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in document
+    assert 'layers: [{id: "osm-raster", type: "raster", source: "osm-raster", minzoom: 0}]' in document
     assert "OpenStreetMap contributors" in document
     assert 'id: "reception-cells-fill"' in document
     assert 'id: "reception-cells-outline"' in document
@@ -72,6 +107,12 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert '["Flights"' in document
     assert "pitch: 0" in document
     assert "bearing: 0" in document
+    assert "const viewportMaxRadiusMeters = 2000" in document
+    assert "function minimumZoomForRadius" in document
+    assert "function minimumZoomForMercatorEdge" in document
+    assert "finalRadius > viewportFocus.radiusMeters + 0.5" in document
+    assert "viewportRadiusMeters: visibleViewportRadiusMeters(viewportFocus)" in document
+    assert "map.jumpTo" in document
     assert "window.sloppyReceptionMap" in document
     assert 'map.once("idle", () => refreshMapViewport({fit: true}))' in document
     assert "accessToken" not in document
@@ -163,6 +204,26 @@ def test_reception_widget_offscreen_keeps_payload_and_empty_ready_state(
     assert widget.dark is False
     assert widget._html_path is None
     assert widget._view.toPlainText()
+    widget.close()
+    app.processEvents()
+
+
+def test_reception_widget_resize_requests_density_focused_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    widget = ReceptionMapWidget()
+    requested_fits: list[bool] = []
+    monkeypatch.setattr(
+        widget,
+        "_schedule_viewport_refresh",
+        lambda fit=False: requested_fits.append(fit),
+    )
+
+    widget.resizeEvent(QResizeEvent(QSize(1_280, 820), QSize(800, 600)))
+
+    assert requested_fits == [True]
     widget.close()
     app.processEvents()
 

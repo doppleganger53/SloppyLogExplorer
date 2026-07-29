@@ -618,7 +618,7 @@ class ReceptionMapWidget(QWidget):
             cast(QTextEdit, self._view).setHtml(html_document)
 
     def refresh_viewport(self, fit: bool = False) -> None:
-        """Resize the live map and optionally fit all observed cells."""
+        """Resize the live map and optionally restore its density-focused camera."""
         if not self._web_engine or self._page is None:
             return
         options = json.dumps({"fit": fit})
@@ -690,7 +690,9 @@ class ReceptionMapWidget(QWidget):
 
     def resizeEvent(self, a0) -> None:
         super().resizeEvent(a0)
-        self._schedule_viewport_refresh(fit=False)
+        # Recompute the zoom floor for the new canvas dimensions so the
+        # automatic reception view cannot grow beyond its 2 km radius cap.
+        self._schedule_viewport_refresh(fit=True)
 
     def closeEvent(self, a0) -> None:
         self._ready_poll_timer.stop()

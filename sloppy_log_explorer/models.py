@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-RECEPTION_INDEX_VERSION = 2
+RECEPTION_INDEX_VERSION = 3
 
 
 @dataclass(frozen=True)

@@ -657,16 +657,8 @@ class MainWindow(QMainWindow):
         self.reception_view.set_heatmap(self._reception_map_payload, dark=self.dark_mode)
         self._reception_view_loaded = True
 
-    def _load_cached_reception_sites(self, preserve_selection: bool = True) -> None:
-        previous_site_id = self.reception_site_combo.currentData() if preserve_selection else None
-        self.reception_sites = []
-        if self.library_root is not None:
-            for raw_site in self.store.list_flying_sites(self.library_root):
-                site = dict(raw_site)
-                site_id = int(site["id"])
-                site["records"] = self.store.list_flying_site_records(site_id)
-                self.reception_sites.append(site)
-
+    def _rebuild_reception_site_combo(self, selected_site_id: object = None) -> int:
+        """Sort and rebuild the site selector without emitting a site change."""
         self.reception_sites.sort(
             key=lambda site: (
                 str(site.get("name") or f"Flying Site {site.get('id')}").casefold(),
@@ -681,9 +673,22 @@ class MainWindow(QMainWindow):
             count = len(records) if isinstance(records, list) else 0
             name = str(site.get("name") or f"Flying Site {site.get('id')}")
             self.reception_site_combo.addItem(f"{name} ({count} logs)", site.get("id"))
-        selected_index = self.reception_site_combo.findData(previous_site_id)
+        selected_index = self.reception_site_combo.findData(selected_site_id)
         self.reception_site_combo.setCurrentIndex(selected_index if selected_index >= 0 else (0 if self.reception_sites else -1))
         self.reception_site_combo.blockSignals(False)
+        return selected_index
+
+    def _load_cached_reception_sites(self, preserve_selection: bool = True) -> None:
+        previous_site_id = self.reception_site_combo.currentData() if preserve_selection else None
+        self.reception_sites = []
+        if self.library_root is not None:
+            for raw_site in self.store.list_flying_sites(self.library_root):
+                site = dict(raw_site)
+                site_id = int(site["id"])
+                site["records"] = self.store.list_flying_site_records(site_id)
+                self.reception_sites.append(site)
+
+        selected_index = self._rebuild_reception_site_combo(previous_site_id)
         self.reception_site_changed(preserve_dates=selected_index >= 0)
 
     def reception_site_changed(self, *_args, preserve_dates: bool = False) -> None:
@@ -810,10 +815,7 @@ class MainWindow(QMainWindow):
         self.store.update_flying_site(site_id, name, notes)
         site["name"] = name
         site["notes"] = notes
-        index = self.reception_site_combo.currentIndex()
-        raw_records = site.get("records")
-        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
-        self.reception_site_combo.setItemText(index, f"{name} ({len(records)} logs)")
+        self._rebuild_reception_site_combo(site_id)
         self.reception_result_status.setText(f"Saved metadata for {name}.")
 
     @staticmethod
@@ -1604,7 +1606,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Compare log failed", str(exc))
 
     def open_library_dialog(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Open log library")
+        directory = str(self.library_root) if self.library_root is not None else ""
+        path = QFileDialog.getExistingDirectory(self, "Open log library", directory)
         if path:
             self.load_library(Path(path))
 

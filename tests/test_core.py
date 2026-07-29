@@ -2003,6 +2003,73 @@ def test_log_file_dialogs_start_from_local_home_instead_of_cloud_library(
     app.quit()
 
 
+def test_library_dialog_starts_from_active_library_and_loads_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    active_library = tmp_path / "active-library"
+    selected_library = tmp_path / "selected-library"
+    dialog_calls: list[tuple[str, str]] = []
+    load_calls: list[Path] = []
+
+    def fake_existing_directory(_parent, caption: str, directory: str) -> str:
+        dialog_calls.append((caption, directory))
+        return str(selected_library)
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", fake_existing_directory)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.library_root = active_library
+    monkeypatch.setattr(window, "load_library", load_calls.append)
+
+    window.open_library_dialog()
+
+    assert dialog_calls == [("Open log library", str(active_library))]
+    assert load_calls == [selected_library]
+    assert window.isEnabled()
+
+    window.close()
+    app.quit()
+
+
+def test_library_dialog_without_active_library_uses_default_and_cancel_does_not_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_root = tmp_path / "appdata"
+    monkeypatch.setenv("APPDATA", str(app_root))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from sloppy_log_explorer.main_window import MainWindow
+
+    dialog_calls: list[tuple[str, str]] = []
+    load_calls: list[Path] = []
+
+    def fake_existing_directory(_parent, caption: str, directory: str) -> str:
+        dialog_calls.append((caption, directory))
+        return ""
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", fake_existing_directory)
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    monkeypatch.setattr(window, "load_library", load_calls.append)
+
+    window.open_library_dialog()
+
+    assert dialog_calls == [("Open log library", "")]
+    assert load_calls == []
+    assert window.isEnabled()
+
+    window.close()
+    app.quit()
+
+
 def test_scan_library_uses_metadata_only_and_groups_root_level_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "frsky"
     root.mkdir()

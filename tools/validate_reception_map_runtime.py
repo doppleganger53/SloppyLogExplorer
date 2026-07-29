@@ -18,10 +18,17 @@ if str(REPO_ROOT) not in sys.path:
 from sloppy_log_explorer.reception_map_renderer import build_reception_map_html
 
 
+FOCUS_LATITUDE = 39.774389
+FOCUS_LONGITUDE = -75.204944
+MERCATOR_EDGE_LATITUDE = 85.05
+MERCATOR_EDGE_LONGITUDE = 10.0
+MAX_VIEWPORT_RADIUS_METERS = 2_000.0
+
+
 def synthetic_payload() -> dict[str, object]:
     """Build a deterministic 5 m-cell payload that needs no telemetry files."""
-    center_latitude = 39.774389
-    center_longitude = -75.204944
+    center_latitude = FOCUS_LATITUDE
+    center_longitude = FOCUS_LONGITUDE
     cells: list[dict[str, object]] = []
     values = [18.0, 31.0, 44.0, 57.0, 69.0, 78.0, 86.0, 93.0, 99.0]
     value_index = 0
@@ -38,6 +45,30 @@ def synthetic_payload() -> dict[str, object]:
                 }
             )
             value_index += 1
+    # A sparse cell near the edge of the focus radius forces the camera's hard
+    # zoom floor to win over ordinary bounds fitting.
+    cells.append(
+        {
+            "latitude": center_latitude + 0.016,
+            "longitude": center_longitude,
+            "cell_size_m": 5,
+            "value": 15.0,
+            "sample_count": 1,
+            "flight_count": 1,
+        }
+    )
+    # Keep another valid but irrelevant observed cell well outside the density
+    # focus. It must remain in the source without zooming the map out.
+    cells.append(
+        {
+            "latitude": center_latitude + 0.065,
+            "longitude": center_longitude,
+            "cell_size_m": 5,
+            "value": 12.0,
+            "sample_count": 1,
+            "flight_count": 1,
+        }
+    )
     return {
         "status": "ok",
         "site_name": "Synthetic validation site",
@@ -49,7 +80,63 @@ def synthetic_payload() -> dict[str, object]:
         "range_min": 2.0,
         "range_max": 85.0,
         "reverse": False,
+        "viewport_focus": {
+            "latitude": center_latitude,
+            "longitude": center_longitude,
+            "radius_m": MAX_VIEWPORT_RADIUS_METERS,
+            "cell_count": 10,
+            "sample_count": 181,
+            "flight_count": 22,
+        },
         "cells": cells,
+    }
+
+
+def mercator_edge_payload() -> dict[str, object]:
+    """Build a valid focus close enough to the projection edge to constrain MapLibre."""
+    return {
+        "status": "ok",
+        "site_name": "Synthetic Mercator-edge site",
+        "telemetry_column": "VFR 2.4G(%)",
+        "unit": "%",
+        "cell_size_m": 5,
+        "auto_range": False,
+        "range_min": 2.0,
+        "range_max": 85.0,
+        "reverse": False,
+        "viewport_focus": {
+            "latitude": MERCATOR_EDGE_LATITUDE,
+            "longitude": MERCATOR_EDGE_LONGITUDE,
+            "radius_m": MAX_VIEWPORT_RADIUS_METERS,
+            "cell_count": 3,
+            "sample_count": 181,
+            "flight_count": 6,
+        },
+        "cells": [
+            {
+                "latitude": MERCATOR_EDGE_LATITUDE,
+                "longitude": MERCATOR_EDGE_LONGITUDE,
+                "value": 72.0,
+                "sample_count": 100,
+                "flight_count": 3,
+            },
+            {
+                "latitude": MERCATOR_EDGE_LATITUDE - 0.0002,
+                "longitude": MERCATOR_EDGE_LONGITUDE + 0.001,
+                "value": 64.0,
+                "sample_count": 80,
+                "flight_count": 2,
+            },
+            {
+                # About 1.8 km south: inside the declared focus, but far enough
+                # to reproduce MapLibre's near-edge center constraint.
+                "latitude": MERCATOR_EDGE_LATITUDE - 0.016,
+                "longitude": MERCATOR_EDGE_LONGITUDE,
+                "value": 22.0,
+                "sample_count": 1,
+                "flight_count": 1,
+            },
+        ],
     }
 
 
@@ -122,7 +209,13 @@ def _image_metrics(image: Any) -> dict[str, int]:
     }
 
 
-def _assert_ready_state(state: dict[str, Any] | None, expected_cells: int) -> None:
+def _assert_ready_state(
+    state: dict[str, Any] | None,
+    expected_cells: int,
+    *,
+    focus_latitude: float = FOCUS_LATITUDE,
+    focus_longitude: float = FOCUS_LONGITUDE,
+) -> None:
     if state is None or state.get("state") != "ready" or not state.get("ready"):
         raise AssertionError(f"Reception map did not become ready: {state}")
     if int(state.get("cellCount") or 0) != expected_cells:
@@ -145,19 +238,38 @@ def _assert_ready_state(state: dict[str, Any] | None, expected_cells: int) -> No
     if abs(float(camera.get("pitch") or 0)) > 0.1 or abs(float(camera.get("bearing") or 0)) > 0.1:
         raise AssertionError(f"Reception map is not top-down: {state}")
     bounds = state.get("bounds")
-    if not isinstance(bounds, list) or len(bounds) != 2:
-        raise AssertionError(f"Reception map did not report fitted data bounds: {state}")
-    center = camera.get("center")
-    if (
-        not isinstance(center, list)
-        or len(center) != 2
-        or not all(isinstance(point, list) and len(point) == 2 for point in bounds)
+    focus_bounds = state.get("focusBounds")
+    viewport_bounds = state.get("viewportBounds")
+    for label, candidate in (
+        ("data", bounds),
+        ("focus", focus_bounds),
+        ("viewport", viewport_bounds),
     ):
+        if (
+            not isinstance(candidate, list)
+            or len(candidate) != 2
+            or not all(isinstance(point, list) and len(point) == 2 for point in candidate)
+        ):
+            raise AssertionError(f"Reception map did not report valid {label} bounds: {state}")
+    center = camera.get("center")
+    if not isinstance(center, list) or len(center) != 2:
         raise AssertionError(f"Reception map did not report a valid camera center: {state}")
-    expected_longitude = (float(bounds[0][0]) + float(bounds[1][0])) / 2.0
-    expected_latitude = (float(bounds[0][1]) + float(bounds[1][1])) / 2.0
-    if abs(float(center[0]) - expected_longitude) > 0.00002 or abs(float(center[1]) - expected_latitude) > 0.00002:
-        raise AssertionError(f"Reception map camera was not fitted to its observed cells: {state}")
+    raw_focus = state.get("viewportFocus")
+    focus: dict[str, Any] = raw_focus if isinstance(raw_focus, dict) else {}
+    if abs(float(focus.get("latitude") or 0) - focus_latitude) > 0.00002 or abs(
+        float(focus.get("longitude") or 0) - focus_longitude
+    ) > 0.00002:
+        raise AssertionError(f"Reception map lost its density focus: {state}")
+    if abs(float(center[0]) - focus_longitude) > 0.00002 or abs(
+        float(center[1]) - focus_latitude
+    ) > 0.00002:
+        raise AssertionError(f"Reception map camera was not centered on its density focus: {state}")
+    declared_radius = float(focus.get("radiusMeters") or 0)
+    visible_radius = float(state.get("viewportRadiusMeters") or 0)
+    if declared_radius <= 0 or declared_radius > MAX_VIEWPORT_RADIUS_METERS:
+        raise AssertionError(f"Reception map declared an invalid focus radius: {state}")
+    if visible_radius <= 0 or visible_radius > MAX_VIEWPORT_RADIUS_METERS + 5.0:
+        raise AssertionError(f"Reception map viewport exceeds its 2 km radius cap: {state}")
 
 
 def validate_reception_map_runtime(
@@ -213,13 +325,22 @@ def validate_reception_map_runtime(
     view.setPage(page)
     view.show()
 
-    load_loop = QEventLoop()
-    loaded: dict[str, bool] = {}
-    page.loadFinished.connect(lambda ok: (loaded.setdefault("ok", ok), load_loop.quit()))
-    view.setUrl(QUrl.fromLocalFile(str(html_path)))
-    QTimer.singleShot(15000, load_loop.quit)
-    load_loop.exec()
-    if not loaded.get("ok"):
+    def load_document(path: Path) -> bool:
+        load_loop = QEventLoop()
+        loaded: list[bool] = []
+
+        def load_finished(ok: bool) -> None:
+            loaded.append(ok)
+            load_loop.quit()
+
+        page.loadFinished.connect(load_finished)
+        view.setUrl(QUrl.fromLocalFile(str(path)))
+        QTimer.singleShot(15000, load_loop.quit)
+        load_loop.exec()
+        page.loadFinished.disconnect(load_finished)
+        return bool(loaded and loaded[-1])
+
+    if not load_document(html_path):
         view.close()
         raise AssertionError("Qt WebEngine did not finish loading the reception map HTML")
 
@@ -242,6 +363,22 @@ def validate_reception_map_runtime(
         raise AssertionError(
             f"{error}; worker={worker_probe}; console={page.console_messages}"
         ) from error
+
+    view.resize(max(width + 600, int(width * 1.5)), max(320, height // 2))
+    _run_event_loop(250)
+    _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
+    _run_event_loop(500)
+    wide_fit = _wait_for_ready_state(page)
+    try:
+        _assert_ready_state(wide_fit, expected_cells)
+    except AssertionError:
+        view.close()
+        raise
+
+    view.resize(width, height)
+    _run_event_loop(250)
+    _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
+    _run_event_loop(500)
 
     legend = _run_js(
         page,
@@ -282,6 +419,22 @@ def validate_reception_map_runtime(
         view.close()
         raise AssertionError(f"Reception map screenshot looked blank or too flat: {metrics}")
 
+    edge_payload = mercator_edge_payload()
+    edge_html_path = state_root / "reception-map-runtime-mercator-edge.html"
+    edge_html_path.write_text(build_reception_map_html(edge_payload), encoding="utf-8")
+    if not load_document(edge_html_path):
+        view.close()
+        raise AssertionError("Qt WebEngine did not load the Mercator-edge reception map")
+    edge_cells = edge_payload.get("cells")
+    edge_expected_cells = len(edge_cells) if isinstance(edge_cells, list) else 0
+    edge_state = _wait_for_ready_state(page)
+    _assert_ready_state(
+        edge_state,
+        edge_expected_cells,
+        focus_latitude=MERCATOR_EDGE_LATITUDE,
+        focus_longitude=MERCATOR_EDGE_LONGITUDE,
+    )
+
     view.close()
     page.deleteLater()
     profile.deleteLater()
@@ -292,7 +445,9 @@ def validate_reception_map_runtime(
         "screenshot": str(output),
         "loaded": True,
         "initial": state,
+        "wideFit": wide_fit,
         "afterFit": after_fit,
+        "mercatorEdge": edge_state,
         "legend": legend,
         "image": metrics,
     }
