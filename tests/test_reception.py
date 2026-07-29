@@ -287,6 +287,23 @@ def test_index_log_keeps_unhinted_non_gps_probe_bounded(
     assert calls == [(20, 3, True)]
 
 
+def test_index_log_rejects_non_position_gps_role_fields(tmp_path: Path) -> None:
+    path = tmp_path / "gps-status-only.csv"
+    path.write_text(
+        "Date,Time,GPS fix,GPS accuracy,GPS quality,VFR 2.4G(%)\n"
+        "2026-04-01,12:00:00,1,3,2,90\n"
+        "2026-04-01,12:00:01,1,3,2,89\n"
+        "2026-04-01,12:00:02,1,3,2,88\n",
+        encoding="utf-8",
+    )
+
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    assert record.status == "no_gps"
+    assert record.center_latitude is None
+    assert record.center_longitude is None
+
+
 def test_index_log_supports_coordinate_text_and_split_gps_formats(tmp_path: Path) -> None:
     coordinate_path = tmp_path / "coordinate.csv"
     coordinate_path.write_text(

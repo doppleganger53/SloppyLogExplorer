@@ -181,8 +181,14 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from sloppy_log_explorer.main_window import MainWindow
 
-    starts: list[Path | None] = []
-    monkeypatch.setattr(MainWindow, "start_reception_scan", lambda self, *_args: starts.append(self.library_root))
+    starts: list[tuple[Path | None, list[str]]] = []
+    monkeypatch.setattr(
+        MainWindow,
+        "start_reception_scan",
+        lambda self, *_args: starts.append(
+            (self.library_root, [log.name for log in self.library_logs])
+        ),
+    )
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     root = tmp_path / "library"
@@ -192,11 +198,79 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     window.load_library(root)
 
     assert len(window.library_logs) == 1
-    assert starts == [root]
+    assert starts == [(root, ["flight.csv"])]
     assert window.reception_scan_refresh_button.isEnabled()
+
+    (root / "new-flight.log").write_text("also metadata only", encoding="utf-8")
+    window.reception_scan_refresh_button.click()
+
+    assert [log.name for log in window.library_logs] == ["flight.csv", "new-flight.log"]
+    assert starts[-1] == (root, ["flight.csv", "new-flight.log"])
     assert window._reception_view_loaded is False
     window.tabs.setCurrentWidget(window.reception_tab)
     assert window._reception_view_loaded is True
+    window.close()
+    app.quit()
+
+
+def test_reception_cache_reload_expands_natural_dates_and_preserves_custom_bounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    root = tmp_path / "library"
+    root.mkdir()
+    records = [
+        _record(root / "second.csv", "2026-04-02"),
+        _record(root / "fourth.csv", "2026-04-04"),
+    ]
+    window.store.upsert_reception_records(root, records)
+    sites = window.store.apply_reception_clusters(
+        root,
+        [{"file_paths": [record["file_path"] for record in records], "center_latitude": 39.75, "center_longitude": -75.25}],
+    )
+    site_id = int(sites[0]["id"])
+    window.library_root = root
+    window._load_cached_reception_sites(preserve_selection=False)
+
+    assert window.reception_date_from.date() == QDate(2026, 4, 2)
+    assert window.reception_date_to.date() == QDate(2026, 4, 4)
+
+    records = [
+        _record(root / "first.csv", "2026-04-01"),
+        *records,
+        _record(root / "fifth.csv", "2026-04-05"),
+    ]
+    window.store.upsert_reception_records(root, records)
+    window.store.apply_reception_clusters(
+        root,
+        [{"file_paths": [record["file_path"] for record in records], "center_latitude": 39.75, "center_longitude": -75.25}],
+    )
+    window._load_cached_reception_sites(preserve_selection=True)
+
+    assert window.reception_site_combo.currentData() == site_id
+    assert window.reception_date_from.date() == QDate(2026, 4, 1)
+    assert window.reception_date_to.date() == QDate(2026, 4, 5)
+
+    window.reception_date_from.setDate(QDate(2026, 4, 2))
+    records = [
+        _record(root / "march.csv", "2026-03-31"),
+        *records,
+        _record(root / "sixth.csv", "2026-04-06"),
+    ]
+    window.store.upsert_reception_records(root, records)
+    window.store.apply_reception_clusters(
+        root,
+        [{"file_paths": [record["file_path"] for record in records], "center_latitude": 39.75, "center_longitude": -75.25}],
+    )
+    window._load_cached_reception_sites(preserve_selection=True)
+
+    assert window.reception_date_from.date() == QDate(2026, 4, 2)
+    assert window.reception_date_to.date() == QDate(2026, 4, 6)
     window.close()
     app.quit()
 

@@ -33,6 +33,10 @@ _NON_POSITION_GPS_TOKENS = (
     "hdop",
     "vdop",
     "distance",
+    "fix",
+    "accuracy",
+    "quality",
+    "status",
 )
 
 

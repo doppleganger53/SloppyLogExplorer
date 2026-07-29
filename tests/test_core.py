@@ -520,6 +520,24 @@ def test_load_log_does_not_invent_gps_from_gps_course_only(tmp_path: Path) -> No
     assert log.info.has_gps is False
 
 
+def test_load_log_does_not_invent_gps_from_fix_accuracy_or_quality_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "gps_status_only.csv"
+    path.write_text(
+        "Date,Time,GPS fix,GPS accuracy,GPS quality,VFAS(V)\n"
+        "2026-01-01,12:00:00,1,3,2,16.8\n"
+        "2026-01-01,12:00:01,1,3,2,16.7\n"
+        "2026-01-01,12:00:02,1,3,2,16.6\n",
+        encoding="utf-8",
+    )
+
+    log = load_log(path)
+
+    assert log.gps_columns is None
+    assert log.info.has_gps is False
+
+
 def test_load_log_detects_cardinal_decimal_coordinate_strings(tmp_path: Path) -> None:
     path = tmp_path / "cardinal_gps.csv"
     write_cardinal_coordinate_sample(path)

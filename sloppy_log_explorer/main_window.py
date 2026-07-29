@@ -545,7 +545,7 @@ class MainWindow(QMainWindow):
         self.reception_scan_progress.setMaximumWidth(260)
         scan_row.addWidget(self.reception_scan_progress)
         self.reception_scan_refresh_button = QPushButton("Refresh Index")
-        self.reception_scan_refresh_button.clicked.connect(self.start_reception_scan)
+        self.reception_scan_refresh_button.clicked.connect(self.refresh_reception_index)
         self.reception_scan_refresh_button.setEnabled(False)
         scan_row.addWidget(self.reception_scan_refresh_button)
         self.reception_scan_cancel_button = QPushButton("Cancel")
@@ -687,6 +687,17 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
 
+    @classmethod
+    def _reception_site_date_bounds(
+        cls, site: dict[str, Any] | None
+    ) -> tuple[date, date] | None:
+        if site is None:
+            return None
+        raw_records = site.get("records")
+        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
+        dates = [value for value in (cls._reception_record_date(record) for record in records) if value is not None]
+        return (min(dates), max(dates)) if dates else None
+
     def _selected_reception_site(self) -> dict[str, Any] | None:
         site_id = self.reception_site_combo.currentData()
         for site in self.reception_sites:
@@ -743,7 +754,10 @@ class MainWindow(QMainWindow):
         return selected_index
 
     def _load_cached_reception_sites(self, preserve_selection: bool = True) -> None:
-        previous_site_id = self.reception_site_combo.currentData() if preserve_selection else None
+        previous_site = self._selected_reception_site() if preserve_selection else None
+        previous_site_id = previous_site.get("id") if previous_site is not None else None
+        previous_filter_bounds = self._reception_date_bounds() if previous_site is not None else None
+        previous_site_bounds = self._reception_site_date_bounds(previous_site)
         self.reception_sites = []
         if self.library_root is not None:
             for raw_site in self.store.list_flying_sites(self.library_root):
@@ -753,7 +767,28 @@ class MainWindow(QMainWindow):
                 self.reception_sites.append(site)
 
         selected_index = self._rebuild_reception_site_combo(previous_site_id)
-        self.reception_site_changed(preserve_dates=selected_index >= 0)
+        selection_preserved = previous_site_id is not None and selected_index >= 0
+        if selection_preserved and previous_filter_bounds is not None and previous_site_bounds is not None:
+            current_start, current_end = previous_filter_bounds
+            previous_start, previous_end = previous_site_bounds
+            current_site_bounds = self._reception_site_date_bounds(self._selected_reception_site())
+            if current_site_bounds is not None:
+                current_site_start, current_site_end = current_site_bounds
+                if current_start == previous_start:
+                    current_start = current_site_start
+                if current_end == previous_end:
+                    current_end = current_site_end
+                self.reception_date_from.blockSignals(True)
+                self.reception_date_to.blockSignals(True)
+                self.reception_date_from.setDate(
+                    QDate(current_start.year, current_start.month, current_start.day)
+                )
+                self.reception_date_to.setDate(
+                    QDate(current_end.year, current_end.month, current_end.day)
+                )
+                self.reception_date_from.blockSignals(False)
+                self.reception_date_to.blockSignals(False)
+        self.reception_site_changed(preserve_dates=selection_preserved)
 
     def reception_site_changed(self, *_args, preserve_dates: bool = False) -> None:
         self._invalidate_reception_heatmap("Site changed; generate the heatmap to refresh the map.")
@@ -774,11 +809,9 @@ class MainWindow(QMainWindow):
 
         self.reception_site_name.setText(str(site.get("name") or ""))
         self.reception_site_notes.setPlainText(str(site.get("notes") or ""))
-        raw_records = site.get("records")
-        records = cast(list[dict[str, object]], raw_records) if isinstance(raw_records, list) else []
-        dates = [value for value in (self._reception_record_date(record) for record in records) if value is not None]
-        if dates and not preserve_dates:
-            start, end = min(dates), max(dates)
+        site_date_bounds = self._reception_site_date_bounds(site)
+        if site_date_bounds is not None and not preserve_dates:
+            start, end = site_date_bounds
             self.reception_date_from.blockSignals(True)
             self.reception_date_to.blockSignals(True)
             self.reception_date_from.setDate(QDate(start.year, start.month, start.day))
@@ -1030,6 +1063,13 @@ class MainWindow(QMainWindow):
         self.reception_scan_refresh_button.setEnabled(False)
         self.reception_scan_cancel_button.setEnabled(True)
         self._reception_pool.start(task)
+
+    def refresh_reception_index(self, *_args) -> None:
+        if self.library_root is None:
+            return
+        self.library_logs = scan_library(self.library_root)
+        self.populate_library_tree()
+        self.start_reception_scan()
 
     def cancel_reception_scan(self, *_args, silent: bool = False) -> None:
         # Reject progress/results that may already be queued when cancellation
