@@ -55,9 +55,11 @@ Repo-local guidance for `SloppyLogExplorer`.
 - Keep release notes in `CHANGELOG.md`.
 - Generate GitHub release bodies with:
   `python tools/write_release_notes.py --version {version} --output validation_artifacts/release-notes-{version}.md`
-- Build Windows onedir output with the documented build command, then package it
-  with:
+- Build the minimal Windows onefile output with the documented build command,
+  then package it with:
   `python tools/package_release.py`
+- The release archive includes the executable plus `README.md`, `NOTICE.md`,
+  `LICENSE`, and `CHANGELOG.md`.
 - Publish releases with `gh release create ... --notes-file`, not long inline
   notes.
 
