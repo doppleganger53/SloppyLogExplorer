@@ -9,7 +9,7 @@ description = "A polished desktop explorer for FrSky Ethos and OpenTX telemetry 
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "GPL-3.0-or-later" }
-authors = [{ name = "Keith" }]
+authors = [{ name = "doppleganger53" }]
 dependencies = [
   "pandas>=2.0.0",
   "numpy>=1.24.0",
