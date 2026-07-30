@@ -6,9 +6,14 @@ import html
 import json
 from pathlib import Path
 
+from .map_basemaps import (
+    BASEMAP_RUNTIME_JAVASCRIPT,
+    OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
+    OPENSTREETMAP_RASTER_TILE_URL,
+    build_basemap_config,
+)
+
 MAPLIBRE_VERSION = "5.24.0"
-OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
 MAP_MAX_ZOOM = 19
 MAP_FIT_MAX_ZOOM = 17
 MAP_MAX_PITCH = 85
@@ -29,6 +34,7 @@ def _gps_message_html(message: str, dark: bool) -> str:
     border = "#3a414d" if dark else "#d1d5db"
     return f"""
 <html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
 <body style="margin:0;background:{background};color:{color};font-family:Arial,sans-serif;">
   <div style="height:100vh;display:flex;align-items:center;justify-content:center;text-align:center;">
     <div style="border:1px solid {border};border-radius:6px;padding:18px 22px;max-width:520px;">
@@ -58,6 +64,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
     worker_uri_json = json.dumps(_asset_uri("maplibre-gl-csp-worker.js"))
     data_json = json.dumps(payload, allow_nan=False)
+    basemap_config_json = json.dumps(
+        build_basemap_config(payload),
+        allow_nan=False,
+        separators=(",", ":"),
+    ).replace("</", "<\\/")
 
     # The document is a large inline template because the WebEngine path needs
     # to stay self-contained and work even when the app is packaged.
@@ -367,12 +378,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       <option value="10">10x</option>
     </select>
   </div>
-  <div id="mapAttribution">
-    Map tiles &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>
-  </div>
+  <div id="mapAttribution" aria-label="Active basemap attribution"></div>
   <script>
     maplibregl.workerUrl = __MAPLIBRE_WORKER_URI__;
     const flightData = __FLIGHT_DATA__;
+    const basemapConfig = __BASEMAP_CONFIG__;
     const mapMaxZoom = Number(flightData.mapMaxZoom) || 19;
     const mapFitMaxZoom = Number(flightData.mapFitMaxZoom) || Math.min(17, mapMaxZoom);
     const mapMaxPitch = Number(flightData.mapMaxPitch) || 85;
@@ -422,9 +432,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const playbackCurrent = document.getElementById("playbackCurrent");
     const playbackDuration = document.getElementById("playbackDuration");
     const playbackSpeed = document.getElementById("playbackSpeed");
+    const basemapAttributionElement = document.getElementById("mapAttribution");
     let gpsBridge = null;
     let statusHideTimer = null;
     let map = null;
+__BASEMAP_RUNTIME__
     let flightBounds = null;
     let initialBearing = 0;
     let flightLayersAdded = false;
@@ -517,6 +529,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     function debugMapState() {
       const layerIds = [
         "osm-raster-base",
+        "nasa-gibs-raster-base",
+        "usgs-naip-raster-base",
         "flight-underlay",
         "flight-segments",
         "flight-extrusions",
@@ -526,6 +540,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       ];
       const sourceIds = [
         "osm-raster-source",
+        "nasa-gibs-raster-source",
+        "usgs-naip-raster-source",
         "flight-underlay-source",
         "flight-segments-source",
         "flight-extrusions-source",
@@ -586,6 +602,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
           scale: altitudeScale,
           floorMeters: altitudeFloorMeters
         },
+        basemap: basemapDebugState(),
         layers: {},
         sources: {},
         status: statusOverlay && !statusOverlay.hidden ? statusOverlay.textContent : ""
@@ -1570,28 +1587,14 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     function buildRasterBaseStyle() {
       return {
         version: 8,
-        sources: {
-          "osm-raster-source": {
-            type: "raster",
-            tiles: rasterTileUrls,
-            tileSize: 256,
-            minzoom: 0,
-            maxzoom: rasterTileMaxZoom,
-            attribution: "&copy; OpenStreetMap contributors"
-          }
-        },
+        sources: basemapConfig.sources,
         layers: [
           {
             id: "background",
             type: "background",
             paint: { "background-color": "__BACKGROUND__" }
           },
-          {
-            id: "osm-raster-base",
-            type: "raster",
-            source: "osm-raster-source",
-            paint: { "raster-opacity": 1 }
-          }
+          ...basemapRasterLayers()
         ]
       };
     }
@@ -1775,10 +1778,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       map.addControl(new maplibregl.NavigationControl({
         visualizePitch: true
       }), "top-right");
-      map.addControl(new maplibregl.AttributionControl({
-        compact: true,
-        customAttribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
-      }), "bottom-right");
+      updateBasemapAttribution();
+      map.on("moveend", updateBasemapAttribution);
+      map.on("style.load", reapplyBasemapState);
       if (cameraControls) {
         cameraControls.addEventListener("click", (event) => {
           const button = event.target && event.target.closest
@@ -1794,6 +1796,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       });
 
       map.on("error", (event) => {
+        if (handleBasemapError(event)) return;
         const details = event && event.error && (event.error.message || String(event.error));
         setStatus("Map render error" + (details ? ": " + details : ""), "error");
       });
@@ -1825,6 +1828,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       setCameraMode,
       setCursor,
       setPlayback,
+      setBasemap,
+      setImageryOpacity,
       getState: debugMapState
     };
 
@@ -1844,6 +1849,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         "__MAPLIBRE_JS_URI__": js_uri,
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__FLIGHT_DATA__": data_json,
+        "__BASEMAP_CONFIG__": basemap_config_json,
+        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,

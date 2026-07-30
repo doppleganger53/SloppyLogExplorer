@@ -25,6 +25,7 @@ from .gps_map_renderer import (
     OPENSTREETMAP_RASTER_TILE_URL,
     build_gps_map_html as render_gps_map_html,
 )
+from .map_basemaps import clamp_imagery_opacity, normalize_basemap
 from .models import GpsGradientOptions, LoadedLog
 from .parser import relative_seconds
 from .storage import app_data_dir
@@ -1081,8 +1082,12 @@ def build_gps_map_html(
     log: LoadedLog | None,
     options: GpsGradientOptions | None = None,
     dark: bool = True,
+    basemap: str = "osm",
+    imagery_opacity: float = 1.0,
 ) -> str:
     payload = build_gps_map_payload(log, options)
+    payload["basemap"] = normalize_basemap(basemap)
+    payload["imagery_opacity"] = clamp_imagery_opacity(imagery_opacity)
     return render_gps_map_html(payload, dark=dark)
 
 
