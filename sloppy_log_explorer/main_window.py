@@ -58,6 +58,7 @@ from .analysis import (
     suggest_display_columns,
 )
 from .library import group_by_model, scan_library
+from .map_basemaps import BASEMAP_CHOICES, BASEMAP_IMAGERY, BASEMAP_OPENSTREETMAP
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
 from .qt_plot import GpsPathWidget, ReceptionMapWidget, TelemetryPlotWidget
@@ -518,15 +519,39 @@ class MainWindow(QMainWindow):
         marker_row.addStretch()
         layout.addLayout(marker_row)
 
+        basemap_row = QHBoxLayout()
+        basemap_row.addWidget(QLabel("Basemap"))
+        self.gps_basemap_combo = QComboBox()
+        for label, value in BASEMAP_CHOICES:
+            self.gps_basemap_combo.addItem(label, value)
+        basemap_row.addWidget(self.gps_basemap_combo)
+        basemap_row.addWidget(QLabel("Imagery opacity"))
+        self.gps_imagery_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gps_imagery_opacity_slider.setRange(0, 100)
+        self.gps_imagery_opacity_slider.setValue(100)
+        self.gps_imagery_opacity_slider.setSingleStep(1)
+        self.gps_imagery_opacity_slider.setPageStep(10)
+        basemap_row.addWidget(self.gps_imagery_opacity_slider, 1)
+        self.gps_imagery_opacity_label = QLabel("100%")
+        self.gps_imagery_opacity_label.setMinimumWidth(42)
+        basemap_row.addWidget(self.gps_imagery_opacity_label)
+        basemap_row.addStretch()
+        layout.addLayout(basemap_row)
+
         self.gps_view = GpsPathWidget()
         self.gps_view.elapsed_seeked.connect(self.seek_gps_elapsed)
         self.gps_view.playing_changed.connect(self.set_gps_playback_playing)
         self.gps_view.speed_changed.connect(self.set_gps_playback_speed)
         layout.addWidget(self.gps_view, 1)
+        self.gps_basemap_combo.currentIndexChanged.connect(self.gps_basemap_changed)
+        self.gps_imagery_opacity_slider.valueChanged.connect(
+            self.gps_imagery_opacity_changed
+        )
         self.gps_tab = tab
         self.tabs.addTab(tab, "Flight Map")
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
+        self._update_gps_basemap_controls()
         self.populate_gps_value_combos()
 
     def _build_reception_tab(self) -> None:
@@ -555,6 +580,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(scan_row)
 
         selection = QFormLayout()
+        self.reception_selection_layout = selection
         self.reception_site_combo = QComboBox()
         self.reception_site_combo.currentIndexChanged.connect(self.reception_site_changed)
         selection.addRow("Flying site", self.reception_site_combo)
@@ -579,13 +605,15 @@ class MainWindow(QMainWindow):
         self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
         selection.addRow("Telemetry item", self.reception_channel_combo)
 
-        normalize_row = QHBoxLayout()
         self.reception_normalize_check = QCheckBox("Normalize")
         self.reception_normalize_check.toggled.connect(self.reception_normalization_changed)
-        normalize_row.addWidget(self.reception_normalize_check)
+        selection.addRow("", self.reception_normalize_check)
+
+        reference_row = QHBoxLayout()
+        self.reception_reference_row = reference_row
         self.reception_reference_combo = QComboBox()
         self.reception_reference_combo.currentIndexChanged.connect(self.reception_normalization_changed)
-        normalize_row.addWidget(self.reception_reference_combo, 1)
+        reference_row.addWidget(self.reception_reference_combo, 1)
         self.reception_normalization_mode_combo = QComboBox()
         self.reception_normalization_mode_combo.addItem("Ratio", "ratio")
         self.reception_normalization_mode_combo.addItem("Difference", "difference")
@@ -593,10 +621,12 @@ class MainWindow(QMainWindow):
         self.reception_normalization_mode_combo.currentIndexChanged.connect(
             self.reception_normalization_changed
         )
-        normalize_row.addWidget(self.reception_normalization_mode_combo)
-        selection.addRow("Reference", normalize_row)
+        reference_row.addWidget(self.reception_normalization_mode_combo)
+        self.reception_reference_label = QLabel("Reference")
+        selection.addRow(self.reception_reference_label, reference_row)
 
         reference_range_row = QHBoxLayout()
+        self.reception_reference_range_row = reference_range_row
         self.reception_reference_auto_range_check = QCheckBox("Auto reference range")
         self.reception_reference_auto_range_check.setChecked(True)
         self.reception_reference_auto_range_check.toggled.connect(
@@ -653,6 +683,25 @@ class MainWindow(QMainWindow):
         range_row.addStretch()
         layout.addLayout(range_row)
 
+        basemap_row = QHBoxLayout()
+        basemap_row.addWidget(QLabel("Basemap"))
+        self.reception_basemap_combo = QComboBox()
+        for label, value in BASEMAP_CHOICES:
+            self.reception_basemap_combo.addItem(label, value)
+        basemap_row.addWidget(self.reception_basemap_combo)
+        basemap_row.addWidget(QLabel("Imagery opacity"))
+        self.reception_imagery_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.reception_imagery_opacity_slider.setRange(0, 100)
+        self.reception_imagery_opacity_slider.setValue(100)
+        self.reception_imagery_opacity_slider.setSingleStep(1)
+        self.reception_imagery_opacity_slider.setPageStep(10)
+        basemap_row.addWidget(self.reception_imagery_opacity_slider, 1)
+        self.reception_imagery_opacity_label = QLabel("100%")
+        self.reception_imagery_opacity_label.setMinimumWidth(42)
+        basemap_row.addWidget(self.reception_imagery_opacity_label)
+        basemap_row.addStretch()
+        layout.addLayout(basemap_row)
+
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Heatmap opacity"))
         self.reception_opacity_slider = QSlider(Qt.Orientation.Horizontal)
@@ -674,10 +723,17 @@ class MainWindow(QMainWindow):
 
         self.reception_view = ReceptionMapWidget()
         layout.addWidget(self.reception_view, 1)
+        self.reception_basemap_combo.currentIndexChanged.connect(
+            self.reception_basemap_changed
+        )
+        self.reception_imagery_opacity_slider.valueChanged.connect(
+            self.reception_imagery_opacity_changed
+        )
         self.reception_tab = tab
-        self.tabs.addTab(tab, "Reception Map")
+        self.tabs.addTab(tab, "HeatMap")
         self._update_reception_range_enabled()
         self._update_reception_normalization_enabled()
+        self._update_reception_basemap_controls()
         self._update_reception_generate_enabled()
 
     @staticmethod
@@ -729,6 +785,12 @@ class MainWindow(QMainWindow):
         self._reception_map_payload = dict(payload) if payload is not None else None
         if self._reception_map_payload is not None:
             self._reception_map_payload["opacity"] = self.reception_opacity_slider.value() / 100.0
+            self._reception_map_payload["basemap"] = str(
+                self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
+            )
+            self._reception_map_payload["imagery_opacity"] = (
+                self.reception_imagery_opacity_slider.value() / 100.0
+            )
         if not force and not self._tab_is_active("reception_tab"):
             self._reception_view_loaded = False
             return
@@ -845,6 +907,27 @@ class MainWindow(QMainWindow):
         if self._reception_map_payload is not None:
             self._reception_map_payload["opacity"] = opacity
         self.reception_view.set_opacity(opacity)
+
+    def reception_basemap_changed(self, *_args) -> None:
+        basemap = str(
+            self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
+        )
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["basemap"] = basemap
+        self.reception_view.set_basemap(basemap)
+        self._update_reception_basemap_controls()
+
+    def reception_imagery_opacity_changed(self, value: int) -> None:
+        opacity = max(0.0, min(1.0, int(value) / 100.0))
+        self.reception_imagery_opacity_label.setText(f"{int(value)}%")
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["imagery_opacity"] = opacity
+        self.reception_view.set_imagery_opacity(opacity)
+
+    def _update_reception_basemap_controls(self) -> None:
+        self.reception_imagery_opacity_slider.setEnabled(
+            self.reception_basemap_combo.currentData() == BASEMAP_IMAGERY
+        )
 
     def reception_color_scale_changed(self, *_args) -> None:
         self._update_reception_range_enabled()
@@ -992,6 +1075,14 @@ class MainWindow(QMainWindow):
     def _update_reception_normalization_enabled(self, *_args) -> None:
         normalize = self.reception_normalize_check.isChecked()
         has_references = self.reception_reference_combo.count() > 0
+        self.reception_selection_layout.setRowVisible(
+            self.reception_reference_row,
+            normalize,
+        )
+        self.reception_selection_layout.setRowVisible(
+            self.reception_reference_range_row,
+            normalize,
+        )
         self.reception_reference_combo.setEnabled(normalize and has_references)
         self.reception_normalization_mode_combo.setEnabled(normalize and has_references)
         ratio = normalize and self.reception_normalization_mode_combo.currentData() == "ratio"
@@ -1509,6 +1600,21 @@ class MainWindow(QMainWindow):
 
     def gps_marker_values_changed(self, *_args) -> None:
         self.sync_gps_cursor()
+
+    def gps_basemap_changed(self, *_args) -> None:
+        basemap = str(self.gps_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP)
+        self.gps_view.set_basemap(basemap)
+        self._update_gps_basemap_controls()
+
+    def gps_imagery_opacity_changed(self, value: int) -> None:
+        opacity = max(0.0, min(1.0, int(value) / 100.0))
+        self.gps_imagery_opacity_label.setText(f"{int(value)}%")
+        self.gps_view.set_imagery_opacity(opacity)
+
+    def _update_gps_basemap_controls(self) -> None:
+        self.gps_imagery_opacity_slider.setEnabled(
+            self.gps_basemap_combo.currentData() == BASEMAP_IMAGERY
+        )
 
     def populate_gps_value_combos(self) -> None:
         current_values = [combo.currentText() for combo in self.gps_marker_value_combos]
