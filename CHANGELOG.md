@@ -7,6 +7,15 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 ### Added
 
 - GitHub issue and release workflow support for agent-assisted development.
+- Added a shared `Imagery (NAIP → NASA GIBS)` basemap with OpenStreetMap fallback, live imagery opacity, and provider attribution to Flight Map and HeatMap.
+
+### Changed
+
+- Renamed the Reception Map tab to HeatMap and hide optional reference inputs until normalization is enabled.
+
+### Fixed
+
+- Reapply the latest HeatMap opacity and color-range controls after the current WebEngine document finishes loading.
 
 ## [0.1.0] - 2026-06-19
 

@@ -218,6 +218,56 @@ def _image_metrics(image: Any) -> dict[str, int]:
     }
 
 
+def _image_difference_metrics(reference: Any, candidate: Any) -> dict[str, int | float]:
+    """Measure map-body pixel changes while excluding controls and attribution."""
+    from PyQt6.QtGui import QColor
+
+    width = min(reference.width(), candidate.width())
+    height = min(reference.height(), candidate.height())
+    x_start = max(0, width // 12)
+    x_stop = max(x_start + 1, width - width // 12)
+    y_start = max(0, height // 8)
+    y_stop = max(y_start + 1, height - height // 7)
+    x_step = max(1, (x_stop - x_start) // 100)
+    y_step = max(1, (y_stop - y_start) // 60)
+    changed = 0
+    total_delta = 0.0
+    samples = 0
+    for y in range(y_start, y_stop, y_step):
+        for x in range(x_start, x_stop, x_step):
+            before = QColor(reference.pixel(x, y))
+            after = QColor(candidate.pixel(x, y))
+            deltas = (
+                abs(before.red() - after.red()),
+                abs(before.green() - after.green()),
+                abs(before.blue() - after.blue()),
+            )
+            samples += 1
+            total_delta += sum(deltas) / 3.0
+            if max(deltas) >= 18:
+                changed += 1
+    return {
+        "samples": samples,
+        "changedSamples": changed,
+        "changedRatio": changed / samples if samples else 0.0,
+        "meanAbsoluteDelta": total_delta / samples if samples else 0.0,
+    }
+
+
+def _assert_imagery_pixels(
+    reference: Any,
+    candidate: Any,
+    label: str,
+) -> dict[str, int | float]:
+    """Require the imagery layer to visibly change the fixed map viewport."""
+    metrics = _image_difference_metrics(reference, candidate)
+    if float(metrics["changedRatio"]) < 0.2 or float(metrics["meanAbsoluteDelta"]) < 8.0:
+        raise AssertionError(
+            f"{label} did not visibly replace the OpenStreetMap pixels: {metrics}"
+        )
+    return metrics
+
+
 def _assert_ready_state(
     state: dict[str, Any] | None,
     expected_cells: int,
@@ -436,6 +486,102 @@ def validate_reception_map_runtime(
         "{autoRange:false, minimum:2, maximum:85, reverse:false});",
     )
 
+    _run_event_loop(750)
+    osm_image = view.grab().toImage().copy()
+
+    _run_js(
+        page,
+        "window.sloppyReceptionMap.setBasemap('imagery');"
+        "window.sloppyReceptionMap.setImageryOpacity(0.8); true;",
+    )
+    _run_event_loop(2000)
+    imagery_state = _run_js(page, "window.sloppyReceptionMap.getState();")
+    _assert_ready_state(imagery_state, expected_cells)
+    imagery_basemap = imagery_state.get("basemap") if isinstance(imagery_state, dict) else None
+    if not isinstance(imagery_basemap, dict):
+        view.close()
+        raise AssertionError(f"Reception map did not report imagery state: {imagery_state}")
+    if imagery_basemap.get("selected") != "imagery" or abs(
+        float(imagery_basemap.get("imageryOpacity") or 0) - 0.8
+    ) > 1e-9:
+        view.close()
+        raise AssertionError(f"Reception imagery controls were not applied: {imagery_state}")
+    if imagery_basemap.get("provider") not in {"naip", "gibs"}:
+        view.close()
+        raise AssertionError(f"Reception imagery did not retain a usable provider: {imagery_state}")
+    if imagery_state.get("camera") != initial_camera:
+        view.close()
+        raise AssertionError(f"Reception imagery switch moved the camera: {imagery_state}")
+    if abs(float(imagery_state.get("opacity") or 0) - 0.35) > 1e-9:
+        view.close()
+        raise AssertionError(f"Imagery opacity changed HeatMap opacity: {imagery_state}")
+    imagery_image = view.grab().toImage().copy()
+    try:
+        imagery_difference = _assert_imagery_pixels(
+            osm_image,
+            imagery_image,
+            "HeatMap NAIP imagery",
+        )
+    except AssertionError:
+        view.close()
+        raise
+
+    naip_fallback_state = _run_js(
+        page,
+        "handleBasemapError({sourceId:'usgs-naip-raster-source'});"
+        "window.sloppyReceptionMap.getState();",
+    )
+    naip_fallback_basemap = (
+        naip_fallback_state.get("basemap") if isinstance(naip_fallback_state, dict) else None
+    )
+    if not isinstance(naip_fallback_basemap, dict) or naip_fallback_basemap.get("provider") != "gibs":
+        view.close()
+        raise AssertionError(
+            f"Reception map did not fall back from NAIP to GIBS: {naip_fallback_state}"
+        )
+    _run_event_loop(750)
+    gibs_image = view.grab().toImage().copy()
+    try:
+        gibs_difference = _assert_imagery_pixels(
+            osm_image,
+            gibs_image,
+            "HeatMap NASA GIBS fallback",
+        )
+        naip_contribution = _assert_imagery_pixels(
+            gibs_image,
+            imagery_image,
+            "HeatMap NAIP contribution over NASA GIBS",
+        )
+    except AssertionError:
+        view.close()
+        raise
+
+    osm_fallback_state = _run_js(
+        page,
+        "handleBasemapError({sourceId:'nasa-gibs-raster-source'});"
+        "window.sloppyReceptionMap.getState();",
+    )
+    osm_fallback_basemap = (
+        osm_fallback_state.get("basemap") if isinstance(osm_fallback_state, dict) else None
+    )
+    if not isinstance(osm_fallback_basemap, dict) or osm_fallback_basemap.get("provider") != "osmFallback":
+        view.close()
+        raise AssertionError(
+            f"Reception map did not fall back from GIBS to OSM: {osm_fallback_state}"
+        )
+
+    _run_js(page, "window.sloppyReceptionMap.setBasemap('imagery'); true;")
+    _run_event_loop(2000)
+    imagery_retry_state = _run_js(page, "window.sloppyReceptionMap.getState();")
+    retry_basemap = (
+        imagery_retry_state.get("basemap") if isinstance(imagery_retry_state, dict) else None
+    )
+    if not isinstance(retry_basemap, dict) or retry_basemap.get("provider") not in {"naip", "gibs"}:
+        view.close()
+        raise AssertionError(
+            f"Reception imagery providers did not recover on retry: {imagery_retry_state}"
+        )
+
     view.resize(max(width + 600, int(width * 1.5)), max(320, height // 2))
     _run_event_loop(250)
     _run_js(page, "window.sloppyReceptionMap.refresh({fit:true}); true;")
@@ -522,6 +668,13 @@ def validate_reception_map_runtime(
         "afterFit": after_fit,
         "opacityUpdate": opacity_update,
         "colorScaleUpdate": color_scale_update,
+        "imagery": imagery_state,
+        "imageryDifference": imagery_difference,
+        "naipContribution": naip_contribution,
+        "naipFallback": naip_fallback_state,
+        "gibsDifference": gibs_difference,
+        "osmFallback": osm_fallback_state,
+        "imageryRetry": imagery_retry_state,
         "mercatorEdge": edge_state,
         "legend": legend,
         "image": metrics,

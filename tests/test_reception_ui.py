@@ -70,6 +70,126 @@ def test_reception_tab_uses_cached_site_dates_and_exact_channel_coverage(
     app.quit()
 
 
+def test_heatmap_tab_hides_reference_inputs_until_normalize_is_checked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    reference_inputs = (
+        window.reception_reference_combo,
+        window.reception_normalization_mode_combo,
+        window.reception_reference_auto_range_check,
+        window.reception_reference_min_spin,
+        window.reception_reference_max_spin,
+    )
+
+    tab_index = window.tabs.indexOf(window.reception_tab)
+    assert window.tabs.tabText(tab_index) == "HeatMap"
+    assert not window.reception_normalize_check.isHidden()
+    assert all(widget.isHidden() for widget in reference_inputs)
+    assert window.reception_reference_label.isHidden()
+    assert not window.reception_selection_layout.isRowVisible(
+        window.reception_reference_row
+    )
+    assert not window.reception_selection_layout.isRowVisible(
+        window.reception_reference_range_row
+    )
+
+    minimum = window.reception_reference_min_spin.value()
+    maximum = window.reception_reference_max_spin.value()
+    window.reception_normalize_check.setChecked(True)
+
+    assert all(not widget.isHidden() for widget in reference_inputs)
+    assert not window.reception_reference_label.isHidden()
+    assert window.reception_selection_layout.isRowVisible(
+        window.reception_reference_row
+    )
+    assert window.reception_selection_layout.isRowVisible(
+        window.reception_reference_range_row
+    )
+    assert not window.reception_reference_combo.isEnabled()
+
+    window.reception_normalize_check.setChecked(False)
+
+    assert all(widget.isHidden() for widget in reference_inputs)
+    assert window.reception_reference_label.isHidden()
+    assert not window.reception_selection_layout.isRowVisible(
+        window.reception_reference_row
+    )
+    assert window.reception_reference_min_spin.value() == minimum
+    assert window.reception_reference_max_spin.value() == maximum
+    window.close()
+    app.quit()
+
+
+def test_map_tabs_share_live_basemap_and_imagery_opacity_controls(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    gps_basemaps: list[str] = []
+    gps_opacities: list[float] = []
+    reception_basemaps: list[str] = []
+    reception_opacities: list[float] = []
+    monkeypatch.setattr(window.gps_view, "set_basemap", gps_basemaps.append)
+    monkeypatch.setattr(window.gps_view, "set_imagery_opacity", gps_opacities.append)
+    monkeypatch.setattr(window.reception_view, "set_basemap", reception_basemaps.append)
+    monkeypatch.setattr(
+        window.reception_view,
+        "set_imagery_opacity",
+        reception_opacities.append,
+    )
+    window._reception_map_payload = {"status": "ok", "opacity": 0.72}
+
+    gps_choices = [
+        (window.gps_basemap_combo.itemText(index), window.gps_basemap_combo.itemData(index))
+        for index in range(window.gps_basemap_combo.count())
+    ]
+    reception_choices = [
+        (
+            window.reception_basemap_combo.itemText(index),
+            window.reception_basemap_combo.itemData(index),
+        )
+        for index in range(window.reception_basemap_combo.count())
+    ]
+    assert gps_choices == reception_choices == [
+        ("OpenStreetMap", "osm"),
+        ("Imagery (NAIP \N{RIGHTWARDS ARROW} NASA GIBS)", "imagery"),
+    ]
+    assert not window.gps_imagery_opacity_slider.isEnabled()
+    assert not window.reception_imagery_opacity_slider.isEnabled()
+
+    window.gps_basemap_combo.setCurrentIndex(window.gps_basemap_combo.findData("imagery"))
+    window.reception_basemap_combo.setCurrentIndex(
+        window.reception_basemap_combo.findData("imagery")
+    )
+    window.gps_imagery_opacity_slider.setValue(45)
+    window.reception_imagery_opacity_slider.setValue(35)
+
+    assert window.gps_imagery_opacity_slider.isEnabled()
+    assert window.reception_imagery_opacity_slider.isEnabled()
+    assert gps_basemaps == ["imagery"]
+    assert reception_basemaps == ["imagery"]
+    assert gps_opacities == [0.45]
+    assert reception_opacities == [0.35]
+    assert window.gps_imagery_opacity_label.text() == "45%"
+    assert window.reception_imagery_opacity_label.text() == "35%"
+    assert window.reception_opacity_slider.value() == 72
+    assert window._reception_map_payload["basemap"] == "imagery"
+    assert window._reception_map_payload["imagery_opacity"] == 0.35
+    assert window._reception_map_payload["opacity"] == 0.72
+    window.close()
+    app.quit()
+
+
 def test_reception_tab_groups_indexed_channels_and_configures_normalization(
     tmp_path: Path, monkeypatch
 ) -> None:
