@@ -971,6 +971,17 @@ def _row_median(dataframe: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
     return pd.concat(numeric_columns, axis=1).median(axis=1, skipna=True)
 
 
+def _replace_zero_references_with_lowest_positive(reference_values: pd.Series) -> pd.Series:
+    """Treat zero power samples as the lowest positive power in this log."""
+    positive_values = reference_values[reference_values.notna() & reference_values.gt(0.0)]
+    if positive_values.empty:
+        return reference_values
+    replacement = positive_values.min()
+    if pd.isna(replacement):
+        return reference_values
+    return reference_values.mask(reference_values.eq(0.0), float(replacement))
+
+
 def _normalization_label(
     source: str,
     reference: str | None,
@@ -1259,9 +1270,16 @@ def build_reception_heatmap(
                     valid = source_values.notna() & reference_values.notna()
                     transformed_values = (source_values - reference_values).where(valid)
                 else:
-                    valid = source_values.notna() & reference_values.notna() & reference_values.gt(0.0)
+                    normalization_reference_values = _replace_zero_references_with_lowest_positive(
+                        reference_values
+                    )
+                    valid = (
+                        source_values.notna()
+                        & normalization_reference_values.notna()
+                        & normalization_reference_values.gt(0.0)
+                    )
                     transformed_values = (
-                        source_values - 10.0 * reference_values.map(
+                        source_values - 10.0 * normalization_reference_values.map(
                             lambda value: math.log10(float(value)) if pd.notna(value) and float(value) > 0.0 else math.nan
                         )
                     ).where(valid)

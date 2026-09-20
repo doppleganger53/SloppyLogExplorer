@@ -708,6 +708,40 @@ def test_heatmap_normalizes_paired_row_values(
     assert payload["reference_observed_max"] == 200.0
 
 
+def test_db_power_normalization_replaces_zero_with_lowest_positive_reference(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "zero-power.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,80,0",
+                "2026-04-01,12:00:01,39.75,-75.25,60,5",
+                "2026-04-01,12:00:02,39.75,-75.25,40,20",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record],
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode="db_power",
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == pytest.approx(60.0 - 10.0 * math.log10(5.0))
+    assert cells[0]["sample_count"] == 3
+    assert payload["reference_observed_min"] == 0.0
+    assert payload["reference_observed_max"] == 20.0
+    assert payload["invalid_reference_sample_count"] == 0
+
+
 @pytest.mark.parametrize("bounds", [(10.0, 100.0), (100.0, 10.0)])
 def test_ratio_normalization_clamps_manual_reference_bounds(
     tmp_path: Path,
