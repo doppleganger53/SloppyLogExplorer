@@ -33,5 +33,5 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Build output:
-echo   dist\SloppyLogExplorer\SloppyLogExplorer.exe
+echo   dist\SloppyLogExplorer.exe
 echo.

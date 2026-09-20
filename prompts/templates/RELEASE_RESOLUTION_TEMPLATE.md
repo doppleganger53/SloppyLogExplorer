@@ -17,7 +17,9 @@ placeholders before execution.
 ## Mission
 
 Package and publish `Sloppy Log Explorer v{VERSION}` with explicit validation,
-auditable release notes, and a Windows onedir archive.
+auditable release notes, and a Windows archive containing the minimal onefile
+executable and release documentation. Use the release workflow in `AGENTS.md`
+and the build commands in `README.md` as the canonical packaging instructions.
 
 ## Mandatory Startup Workflow
 
@@ -49,8 +51,8 @@ auditable release notes, and a Windows onedir archive.
 2. Build the executable:
    - `.\build_windows.bat`
 3. Validate packaged executable when feasible:
-   - `.\dist\SloppyLogExplorer\SloppyLogExplorer.exe --smoke-test`
-   - `.\dist\SloppyLogExplorer\SloppyLogExplorer.exe --validate-log "{REPRESENTATIVE_LOG}"`
+   - `.\dist\SloppyLogExplorer.exe --smoke-test`
+   - `.\dist\SloppyLogExplorer.exe --validate-log "{REPRESENTATIVE_LOG}"`
 4. Generate release notes:
    - `python tools\write_release_notes.py --version {VERSION} --output {RELEASE_NOTES_FILE}`
 5. Create the archive:
