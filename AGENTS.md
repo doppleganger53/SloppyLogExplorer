@@ -6,8 +6,8 @@ Repo-local guidance for `SloppyLogExplorer`.
 
 - Treat `SloppyLogExplorer/` as the active implementation repo.
 - If launched from the parent `EthosLua` workspace, keep the parent workspace as
-  orchestration-only and run repo commands from `SloppyLogExplorer/` or with
-  `git -C SloppyLogExplorer`.
+  orchestration-only. Resolve the selected SloppyLogExplorer checkout's absolute
+  root, then run tools there or scope Git commands with `git -C "<repo-root>"`.
 - Treat sibling repositories, including `sloppy-ethos/`, as read-only reference
   evidence unless the user explicitly targets them.
 - Keep changes scoped to the user request. Avoid broad refactors and unrelated
@@ -16,9 +16,11 @@ Repo-local guidance for `SloppyLogExplorer`.
 
 ## Startup Workflow
 
-1. Check the active Git scope before editing:
-   - parent workspace: `git status --short --branch`
-   - this repo: `git -C SloppyLogExplorer status --short --branch`
+1. Check the active Git scope before editing, using resolved absolute roots:
+   - this checkout: `git -C "<repo-root>" status --short --branch`
+   - when using the parent workspace: `git -C "<workspace-root>" status --short --branch`
+   Do not infer a checkout's location from its folder name; review worktrees may
+   be elsewhere.
 2. Read this file before applying repository policy.
 3. When changing behavior, packaging, or commands, check `README.md` and
    `pyproject.toml` first.
