@@ -22,6 +22,10 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 
 ## Install And Run
 
+Source installations require Python 3.10 or newer. Qt and Qt WebEngine 6.11.2
+or newer are required to include current security fixes. The portable Windows
+executable includes Python and Qt; no separate installation is needed.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -57,7 +61,7 @@ To build the same target directly:
 
 ```powershell
 python -m pip install -r requirements.txt
-python build.py --clean --target minimal
+python build.py --clean --target minimal --onefile
 ```
 
 To build the broader diagnostics package, use the debug target. It keeps broad Plotly collection enabled for packaging investigation and may report harmless optional-import warnings when optional tools such as matplotlib are not installed.
