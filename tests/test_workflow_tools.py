@@ -242,3 +242,52 @@ def test_package_release_reads_pyproject_version(tmp_path: Path) -> None:
     pyproject.write_text('[project]\nname = "x"\nversion = "1.2.3"\n', encoding="utf-8")
 
     assert package_release.read_project_version(pyproject) == "1.2.3"
+
+
+def test_failed_package_preserves_previous_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    exe = tmp_path / "app.exe"
+    exe.write_bytes(b"application")
+    output = tmp_path / "release.zip"
+    output.write_bytes(b"previous release")
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(zipfile.ZipFile, "write", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        package_release.package_release(exe, output)
+    assert output.read_bytes() == b"previous release"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_missing_release_document_preserves_previous_archive(tmp_path: Path) -> None:
+    exe = tmp_path / "app.exe"
+    exe.write_bytes(b"application")
+    output = tmp_path / "release.zip"
+    output.write_bytes(b"previous release")
+    with pytest.raises(FileNotFoundError):
+        package_release.package_release(exe, output, documentation_root=tmp_path)
+    assert output.read_bytes() == b"previous release"
+
+
+def test_package_rejects_overwriting_source(tmp_path: Path) -> None:
+    exe = tmp_path / "app.exe"
+    exe.write_bytes(b"application")
+    with pytest.raises(ValueError, match="input file"):
+        package_release.package_release(exe, exe)
+    assert exe.read_bytes() == b"application"
+
+
+def test_package_rejects_output_inside_source_directory(tmp_path: Path) -> None:
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "app.exe").write_bytes(b"application")
+    with pytest.raises(ValueError, match="outside"):
+        package_release.package_release(app, app / "release.zip")
+    assert not (app / "release.zip").exists()
+
+
+def test_runtime_version_matches_canonical_project_version() -> None:
+    from sloppy_log_explorer import __version__
+
+    assert __version__ == package_release.read_project_version()

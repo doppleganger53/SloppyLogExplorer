@@ -7,9 +7,11 @@ import argparse
 import importlib.util
 import os
 import shutil
+import sys
 import textwrap
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 
 APP_NAME = "SloppyLogExplorer"
@@ -100,6 +102,8 @@ def _base_pyinstaller_args(project_root: Path, one_file: bool) -> list[str]:
         str(project_root),
         "--add-data",
         _add_data_arg(assets_dir, "sloppy_log_explorer/assets"),
+        "--add-data",
+        _add_data_arg(project_root / "pyproject.toml", "."),
     ]
 
     icon = project_root / "icon.ico"
@@ -156,6 +160,7 @@ def _minimal_spec_text(project_root: Path, one_file: bool) -> str:
     datas = [
         _add_data_spec(assets_dir, "sloppy_log_explorer/assets"),
         _add_data_spec(plotly_js, "plotly/package_data"),
+        _add_data_spec(project_root / "pyproject.toml", "."),
     ]
     hidden_imports = [
         *MINIMAL_PLOTLY_HIDDEN_IMPORTS,
@@ -316,6 +321,38 @@ def _exe_path(project_root: Path, one_file: bool) -> Path:
     return dist_dir / APP_NAME / f"{APP_NAME}.exe"
 
 
+@contextmanager
+def _isolated_windows_build_path() -> Iterator[None]:
+    """Resolve native dependencies from this environment and Windows only.
+
+    PyInstaller also searches PATH when collecting DLLs. Unrelated tools can
+    ship DLL names such as icuuc.dll with an incompatible ABI, shadowing the
+    Windows library used successfully by Qt in an ordinary Python process.
+    Keep this restriction local to the build and restore the caller's PATH.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+    windows = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    directories = (
+        Path(sys.executable).resolve().parent,
+        Path(sys.base_prefix).resolve(),
+        Path(sys.base_prefix).resolve() / "DLLs",
+        _package_file("PyQt6", Path("Qt6") / "bin"),
+        windows / "System32",
+        windows,
+    )
+    original_path = os.environ.get("PATH")
+    os.environ["PATH"] = os.pathsep.join(dict.fromkeys(str(path) for path in directories))
+    try:
+        yield
+    finally:
+        if original_path is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = original_path
+
+
 def build(one_file: bool = False, clean: bool = False, target: BuildTarget = "minimal") -> int:
     project_root = Path(__file__).resolve().parent
     dist_dir = project_root / "dist"
@@ -337,9 +374,12 @@ def build(one_file: bool = False, clean: bool = False, target: BuildTarget = "mi
     print()
 
     try:
-        import PyInstaller.__main__
+        # Apply before importing PyInstaller; dependency discovery can capture
+        # search paths during import as well as while running Analysis.
+        with _isolated_windows_build_path():
+            import PyInstaller.__main__
 
-        PyInstaller.__main__.run(args)
+            PyInstaller.__main__.run(args)
     except Exception as exc:
         print()
         print("BUILD FAILED")

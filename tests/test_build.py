@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import builtins
+import os
+import sys
+import types
 from pathlib import Path
+
+import pytest
 
 
 def load_build_module():
@@ -93,3 +99,77 @@ def test_minimal_prune_removes_webengine_devtools_resources(tmp_path: Path) -> N
     assert not debug_pak.exists()
     assert not devtools_pak.exists()
     assert runtime_pak.exists()
+
+
+@pytest.mark.parametrize("existing_path", ["unrelated-poppler;unrelated-libheif", None])
+def test_windows_build_path_has_only_environment_and_system_directories_and_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, existing_path: str | None,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "venv" / "Scripts" / "python.exe"))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "python"))
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+    monkeypatch.setattr(build_module, "_package_file", lambda *_: tmp_path / "PyQt6" / "Qt6" / "bin")
+    if existing_path is None:
+        monkeypatch.delenv("PATH", raising=False)
+    else:
+        monkeypatch.setenv("PATH", existing_path)
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        with build_module._isolated_windows_build_path():
+            assert os.environ["PATH"].split(os.pathsep) == [
+                str(tmp_path / "venv" / "Scripts"),
+                str(tmp_path / "python"),
+                str(tmp_path / "python" / "DLLs"),
+                str(tmp_path / "PyQt6" / "Qt6" / "bin"),
+                str(tmp_path / "Windows" / "System32"),
+                str(tmp_path / "Windows"),
+            ]
+            raise RuntimeError("simulated failure")
+    assert os.environ.get("PATH") == existing_path
+
+
+def test_non_windows_build_path_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("PATH", "existing-path")
+    monkeypatch.setattr(build_module, "_package_file", lambda *_: pytest.fail("Qt directory discovery on non-Windows"))
+    with build_module._isolated_windows_build_path():
+        assert os.environ["PATH"] == "existing-path"
+    assert os.environ["PATH"] == "existing-path"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_build_isolates_path_before_pyinstaller_import_and_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("PATH", "unrelated-native-tool")
+    monkeypatch.setattr(build_module, "__file__", str(tmp_path / "build.py"))
+    monkeypatch.setattr(build_module, "_package_file", lambda *_: tmp_path / "Qt6" / "bin")
+    monkeypatch.setattr(build_module, "build_pyinstaller_args", lambda *_args, **_kwargs: ["test.spec"])
+    observed: list[str] = []
+
+    def run(args: list[str]) -> None:
+        observed.append("run")
+        assert args == ["test.spec"]
+        assert "unrelated-native-tool" not in os.environ["PATH"]
+        if fail:
+            raise OSError("simulated PyInstaller failure")
+
+    package = types.ModuleType("PyInstaller")
+    main = types.ModuleType("PyInstaller.__main__")
+    main.run = run  # type: ignore[attr-defined]
+    package.__main__ = main  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "PyInstaller", package)
+    monkeypatch.setitem(sys.modules, "PyInstaller.__main__", main)
+    original_import = builtins.__import__
+
+    def checked_import(name: str, *args, **kwargs):
+        if name == "PyInstaller.__main__":
+            observed.append("import")
+            assert "unrelated-native-tool" not in os.environ["PATH"]
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    assert build_module.build() == (1 if fail else 0)
+    assert observed == ["import", "run"]
+    assert os.environ["PATH"] == "unrelated-native-tool"

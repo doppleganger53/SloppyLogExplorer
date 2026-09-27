@@ -16,6 +16,7 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineS
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
+from . import __version__
 from .map_basemaps import (
     BASEMAP_OPENSTREETMAP,
     clamp_imagery_opacity,
@@ -101,7 +102,7 @@ def _persistent_web_profile() -> QWebEngineProfile:
         profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
         profile.setHttpUserAgent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) SloppyLogExplorer/0.1 QtWebEngine"
+            f"(KHTML, like Gecko) SloppyLogExplorer/{__version__} QtWebEngine"
         )
         _WEB_PROFILE = profile
     return _WEB_PROFILE

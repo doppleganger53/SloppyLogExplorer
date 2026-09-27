@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -64,12 +65,24 @@ def package_release(
     output_path: Path,
     documentation_root: Path | None = None,
 ) -> Path:
+    # Validate before touching an existing archive or creating output inside a
+    # directory that is about to be archived.
+    entries = _archive_entries(package_source, documentation_root)
+    resolved_output = output_path.resolve()
+    if package_source.is_dir() and resolved_output.is_relative_to(package_source.resolve()):
+        raise ValueError("Release archive must be outside the packaged app directory")
+    if any(path.resolve() == resolved_output for path, _ in entries):
+        raise ValueError("Release archive must not overwrite a packaged input file")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        output_path.unlink()
-    with zipfile.ZipFile(output_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path, archive_name in _archive_entries(package_source, documentation_root):
-            archive.write(path, archive_name)
+    with tempfile.NamedTemporaryFile(dir=output_path.parent, suffix=".tmp", delete=False) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        with zipfile.ZipFile(temporary_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path, archive_name in entries:
+                archive.write(path, archive_name)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return output_path
 
 
@@ -104,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or Path("dist") / default_archive_name(version)
         package_source = args.dist_dir or resolve_dist_source()
         archive = package_release(package_source, output, documentation_root=repo_root())
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
     print(f"Wrote release archive: {archive}")
     return 0

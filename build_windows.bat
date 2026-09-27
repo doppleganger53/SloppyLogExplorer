@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 
 echo.
 echo ======================================
@@ -22,16 +23,26 @@ if not exist .venv (
 call .venv\Scripts\activate.bat
 if errorlevel 1 exit /b 1
 
+python -m pip --version >nul 2>nul
+if errorlevel 1 (
+    python -m ensurepip --upgrade
+    if errorlevel 1 exit /b 1
+)
+
 python -m pip install --upgrade pip
 if errorlevel 1 exit /b 1
 
 python -m pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
-python build.py --clean --target minimal --onefile%*
-if errorlevel 1 exit /b 1
+python build.py --clean --target minimal --onefile %*
+if not "%errorlevel%"=="0" exit /b %errorlevel%
+if not exist dist\SloppyLogExplorer.exe (
+    echo Error: The build did not produce dist\SloppyLogExplorer.exe.
+    exit /b 1
+)
 
 echo.
 echo Build output:
-echo   dist\SloppyLogExplorer\SloppyLogExplorer.exe
+echo   dist\SloppyLogExplorer.exe
 echo.
