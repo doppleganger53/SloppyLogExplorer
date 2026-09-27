@@ -3370,12 +3370,12 @@ def test_telemetry_axis_layout_reserves_readable_right_gutter() -> None:
     assert _telemetry_right_margin(6) == 374
     assert _telemetry_right_margin(24) == 374
     assert _telemetry_right_axis_positions(1) == []
-    assert _telemetry_right_axis_positions(6) == [0.78, 0.835, 0.89, 0.945, 1.0]
-    assert _telemetry_right_axis_positions(24) == [0.78, 0.835, 0.89, 0.945, 1.0]
+    assert _telemetry_right_axis_positions(6) == [1.0] * 5
+    assert _telemetry_right_axis_positions(24) == [1.0] * 5
     assert _telemetry_x_axis_domain(1) == [0.0, 1.0]
     assert _telemetry_x_axis_domain(2) == [0.0, 1.0]
-    assert _telemetry_x_axis_domain(6) == [0.0, 0.745]
-    assert _telemetry_x_axis_domain(24) == [0.0, 0.745]
+    assert _telemetry_x_axis_domain(6) == [0.0, 1.0]
+    assert _telemetry_x_axis_domain(24) == [0.0, 1.0]
 
 
 def test_same_unit_similar_range_telemetry_columns_share_y_axis(tmp_path: Path) -> None:
@@ -3531,7 +3531,7 @@ def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> N
 
     assert len(fig.data) == 24
     assert fig.layout.margin.r == 374
-    assert list(fig.layout.xaxis.domain) == [0.0, 0.745]
+    assert list(fig.layout.xaxis.domain) == [0.0, 1.0]
     right_positions = [
         fig.layout.yaxis2.position,
         fig.layout.yaxis3.position,
@@ -3539,8 +3539,8 @@ def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> N
         fig.layout.yaxis5.position,
         fig.layout.yaxis6.position,
     ]
-    assert right_positions == [0.78, 0.835, 0.89, 0.945, 1.0]
-    assert len(set(right_positions)) == len(right_positions)
+    assert right_positions == [1.0] * 5
+    assert all(getattr(fig.layout, f"yaxis{index}").autoshift for index in range(2, 7))
     assert fig.layout.yaxis6.showticklabels is True
     assert fig.layout.yaxis6.title.text == "C5"
     assert fig.layout.yaxis7.showticklabels is False
@@ -3555,7 +3555,7 @@ def test_many_selected_telemetry_columns_keep_plot_readable(tmp_path: Path) -> N
 
     light_fig = build_telemetry_figure(log, columns, dark=False)
     assert light_fig.layout.paper_bgcolor == "#ffffff"
-    assert list(light_fig.layout.xaxis.domain) == [0.0, 0.745]
+    assert list(light_fig.layout.xaxis.domain) == [0.0, 1.0]
 
 
 def test_real_log_validator_accepts_current_3d_map_contract(tmp_path: Path) -> None:

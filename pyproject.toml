@@ -7,15 +7,17 @@ name = "sloppy-log-explorer"
 version = "0.2.0"
 description = "A polished desktop explorer for FrSky Ethos and OpenTX telemetry logs."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "doppleganger53" }]
 dependencies = [
   "pandas>=2.0.0",
   "numpy>=1.24.0",
-  "PyQt6>=6.6.0",
-  "PyQt6-WebEngine>=6.6.0",
-  "plotly>=5.0.0",
+  "PyQt6>=6.11.0",
+  "PyQt6-Qt6>=6.11.2",
+  "PyQt6-WebEngine>=6.11.0",
+  "PyQt6-WebEngine-Qt6>=6.11.2",
+  "plotly>=7.1.0",
   "pyttsx3>=2.90",
 ]
 

@@ -57,9 +57,6 @@ TELEMETRY_MARGIN_RIGHT_BASE = 64
 TELEMETRY_MARGIN_RIGHT_PER_AXIS = 62
 TELEMETRY_MARGIN_TOP = 30
 TELEMETRY_MARGIN_BOTTOM = 46
-TELEMETRY_RIGHT_AXIS_SPACING = 0.055
-TELEMETRY_RIGHT_AXIS_DOMAIN_GAP = 0.035
-TELEMETRY_RIGHT_AXIS_MIN_DOMAIN_END = 0.55
 MAX_GPS_JUMP_KM = 1000.0
 # A tiny origin tolerance catches placeholder zeros without rejecting genuine
 # coordinates that are only close to zero.
@@ -106,21 +103,15 @@ def _telemetry_visible_right_axis_count(plotted_column_count: int) -> int:
 
 def _telemetry_right_axis_positions(plotted_column_count: int) -> list[float]:
     right_axis_count = _telemetry_visible_right_axis_count(plotted_column_count)
-    if right_axis_count <= 0:
-        return []
-    start = 1.0 - (right_axis_count - 1) * TELEMETRY_RIGHT_AXIS_SPACING
-    return [round(start + offset * TELEMETRY_RIGHT_AXIS_SPACING, 6) for offset in range(right_axis_count)]
+    # Pixel-aware autoshift spaces the actual tick labels. Fractional offsets
+    # collapsed long decimal labels together when the window was narrow.
+    return [1.0] * right_axis_count
 
 
 def _telemetry_x_axis_domain(plotted_column_count: int) -> list[float]:
-    positions = _telemetry_right_axis_positions(plotted_column_count)
-    if len(positions) <= 1:
-        return [0.0, 1.0]
-    domain_end = max(
-        TELEMETRY_RIGHT_AXIS_MIN_DOMAIN_END,
-        positions[0] - TELEMETRY_RIGHT_AXIS_DOMAIN_GAP,
-    )
-    return [0.0, round(domain_end, 6)]
+    # Secondary axes occupy the right margin, without also narrowing the
+    # plotting domain and reserving the same space twice.
+    return [0.0, 1.0]
 
 
 def _telemetry_column_unit(column: str) -> str | None:
@@ -639,7 +630,7 @@ def build_telemetry_figure(
             "t": TELEMETRY_MARGIN_TOP,
             "b": TELEMETRY_MARGIN_BOTTOM,
         },
-        "legend": {"orientation": "h", "y": 1.08, "x": 0},
+        "legend": {"orientation": "h", "y": 1.02, "yanchor": "bottom", "x": 0},
         "xaxis": {
             "title": "Time" if time_mode == "absolute" and primary.time is not None else "Elapsed time",
             "domain": _telemetry_x_axis_domain(len(axis_groups)),
@@ -683,6 +674,7 @@ def build_telemetry_figure(
                     "overlaying": "y",
                     "side": "right",
                     "position": position,
+                    "autoshift": axis_is_visible,
                 }
             )
         if not axis_is_visible:
@@ -1095,7 +1087,14 @@ def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
     body = fig.to_html(
         include_plotlyjs=False,
         full_html=False,
-        config={"responsive": True, "scrollZoom": True, "displaylogo": False},
+        config={
+            "responsive": True,
+            "scrollZoom": True,
+            "displaylogo": False,
+            # Telemetry stays local; do not offer Plotly cloud chart upload.
+            "showSendToCloud": False,
+            "modeBarButtonsToRemove": ["sendChartToCloud"],
+        },
     )
     background = "#1f242b" if dark else "#ffffff"
     plotly_script = _plotly_script_tag()

@@ -671,7 +671,9 @@ class ReceptionMapWidget(QWidget):
         self._viewport_refresh_timer.setSingleShot(True)
         self._viewport_refresh_timer.timeout.connect(self._run_scheduled_viewport_refresh)
         self._auto_fitted_generation = -1
-        self.setMinimumHeight(420)
+        # The expanded normalization form must still fit on an 800px display.
+        # The layout gives the map all spare space on larger windows.
+        self.setMinimumHeight(240)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
