@@ -558,9 +558,9 @@ def test_gps_map_html_uses_maplibre_openstreetmap_without_api_keys(tmp_path: Pat
     html = build_gps_map_html(log, GpsGradientOptions(color_column="Current(A)"))
 
     assert "maplibregl.Map" in html
-    assert "maplibre-gl-csp.js" in html
-    assert "maplibre-gl-csp-worker.js" in html
-    assert "maplibregl.workerUrl" in html
+    assert "maplibre-gl.mjs" in html
+    assert 'script type="module"' in html
+    assert "import * as maplibregl" in html
     assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in html
     assert "imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery" in html
     assert "gibs.earthdata.nasa.gov/wmts/epsg3857" in html

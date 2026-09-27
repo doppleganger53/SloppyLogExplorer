@@ -93,8 +93,9 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     document = build_reception_map_html(sample_payload(), dark=True)
 
     assert "assets/maplibre/maplibre-gl.css" in document.replace("\\", "/")
-    assert "assets/maplibre/maplibre-gl-csp.js" in document.replace("\\", "/")
-    assert "assets/maplibre/maplibre-gl-csp-worker.js" in document.replace("\\", "/")
+    assert "assets/maplibre/maplibre-gl.mjs" in document.replace("\\", "/")
+    assert 'script type="module"' in document
+    assert "import * as maplibregl" in document
     assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in document
     assert "imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery" in document
     assert "gibs.earthdata.nasa.gov/wmts/epsg3857" in document
@@ -127,7 +128,7 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert "if (handleBasemapError(event)) return;" in document
     assert 'map.on("style.load", reapplyBasemapState)' in document
     assert 'map.setPaintProperty("reception-cells-fill", "fill-color", colorExpression(range))' in document
-    assert 'map.once("idle", () => refreshMapViewport({fit: true}))' in document
+    assert 'map.once("idle", () => refreshMapViewport({fit: false}))' in document
     assert "accessToken" not in document
 
 
@@ -238,7 +239,7 @@ def test_reception_renderer_uses_strict_script_safe_json() -> None:
     document = build_reception_map_html(payload)
 
     assert "RSSI </script><script>window.injected=true</script>" not in document
-    assert r"RSSI <\/script><script>window.injected=true<\/script>" in document
+    assert r"RSSI \u003c/script>\u003cscript>window.injected=true\u003c/script>" in document
 
     cells = cast(list[dict[str, object]], payload["cells"])
     cells[0]["value"] = float("nan")

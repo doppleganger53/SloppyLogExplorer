@@ -18,7 +18,7 @@ The feature target was the publicly documented behavior and screenshots for Phae
 
 ## MapLibre And Raster Basemaps
 
-The Flight Map and HeatMap use MapLibre GL JS 5.24.0, bundled in `sloppy_log_explorer/assets/maplibre/`, with selectable OpenStreetMap and public imagery raster layers.
+The Flight Map and HeatMap use MapLibre GL JS 6.4.1, bundled in `sloppy_log_explorer/assets/maplibre/`, with selectable OpenStreetMap and public imagery raster layers. The official release files and their license are included; `VERSION.txt` records the source archive and verified integrity hash.
 
 - MapLibre GL JS: https://maplibre.org/maplibre-gl-js/docs/
 - License: BSD 3-Clause License

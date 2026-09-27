@@ -31,6 +31,7 @@ from .parser import (
     _NON_POSITION_GPS_TOKENS,
     _clean_columns,
     _coerce_numeric_series,
+    _csv_delimiter,
     _deduplicate_columns,
     _detect_time,
     _has_coordinate_name_hint,
@@ -170,16 +171,11 @@ def _sampled_csv(
     """Read sparse data and GPS-event rows while retaining column evidence."""
     stride = max(1, int(sample_stride))
     requested_record_limit = max(1, int(max_records)) if max_records is not None else None
+    delimiter = _csv_delimiter(path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        sniff_sample = handle.read(4096)
-        handle.seek(0)
+        reader = csv.reader(handle, delimiter=delimiter)
         try:
-            dialect = csv.Sniffer().sniff(sniff_sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.reader(handle, dialect)
-        try:
-            header = next(reader)
+            header = next(row for row in reader if any(value.strip() for value in row))
         except StopIteration:
             return pd.DataFrame()
         columns = _deduplicate_columns(header)
@@ -399,19 +395,24 @@ def _valid_gps_candidates(
     if value_column is not None:
         values = _coerce_numeric_series(dataframe[value_column])
     elif value_values is not None:
-        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(value_values)
+        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(list(value_values))
         values = _coerce_numeric_series(raw_values).reset_index(drop=True)
     else:
         values = None
+    # Iterate positional arrays once instead of constructing several pandas
+    # scalar indexers for every GPS sample in full-length flight logs.
+    latitude_values = latitude.to_numpy()
+    longitude_values = longitude.to_numpy()
+    numeric_values = values.to_numpy() if values is not None else None
     candidates: list[GpsCandidate] = []
     for index in range(len(dataframe)):
-        lat = _coerce_float(latitude.iloc[index])
-        lon = _coerce_float(longitude.iloc[index])
+        lat = _coerce_float(latitude_values[index])
+        lon = _coerce_float(longitude_values[index])
         if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             continue
         if _is_origin_placeholder(lat, lon):
             continue
-        value = _coerce_float(values.iloc[index]) if values is not None else None
+        value = _coerce_float(numeric_values[index]) if numeric_values is not None else None
         point: GpsPoint = {
             "lat": lat,
             "lon": lon,

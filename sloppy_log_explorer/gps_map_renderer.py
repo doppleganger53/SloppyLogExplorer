@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from pathlib import Path
 
 from .map_basemaps import (
@@ -13,7 +14,7 @@ from .map_basemaps import (
     build_basemap_config,
 )
 
-MAPLIBRE_VERSION = "5.24.0"
+MAPLIBRE_VERSION = "6.4.1"
 MAP_MAX_ZOOM = 19
 MAP_FIT_MAX_ZOOM = 17
 MAP_MAX_PITCH = 85
@@ -61,9 +62,11 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     speed_focus = "#60a5fa" if dark else "#2563eb"
     speed_selected_bg = "#2563eb"
     css_uri = html.escape(_asset_uri("maplibre-gl.css"), quote=True)
-    js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
-    worker_uri_json = json.dumps(_asset_uri("maplibre-gl-csp-worker.js"))
-    data_json = json.dumps(payload, allow_nan=False)
+    js_uri = json.dumps(_asset_uri("maplibre-gl.mjs"))
+    worker_uri_json = json.dumps(_asset_uri("maplibre-gl-worker.mjs"))
+    # Escape HTML parser delimiters, including script end tags and comment
+    # openers, before embedding untrusted telemetry labels in inline script.
+    data_json = json.dumps(payload, allow_nan=False).replace("<", "\\u003c")
     basemap_config_json = json.dumps(
         build_basemap_config(payload),
         allow_nan=False,
@@ -79,7 +82,6 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="__MAPLIBRE_CSS_URI__">
-  <script src="__MAPLIBRE_JS_URI__"></script>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <style>
     html, body {
@@ -112,9 +114,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     #legend {
       position: absolute;
       left: 12px;
-      bottom: 30px;
-      min-width: 260px;
-      max-width: 380px;
+      bottom: 90px;
+      width: min(260px, calc(100% - 24px));
       color: __PANEL_FG__;
       background: __PANEL_BG__;
       border: 1px solid __BORDER__;
@@ -263,6 +264,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       background: rgba(255,255,255,0.84);
       padding: 2px 4px;
       border-radius: 3px;
+      max-width: calc(100% - 16px);
+      box-sizing: border-box;
     }
     #mapAttribution a {
       color: #0645ad;
@@ -343,6 +346,15 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       color: #ffffff;
       background-color: __SPEED_SELECTED_BG__;
     }
+    @media (max-width: 480px) {
+      #playbackOverlay {
+        grid-template-columns: auto 1fr 1fr auto;
+      }
+      #playbackSlider {
+        grid-column: 1 / -1;
+        grid-row: 2;
+      }
+    }
   </style>
 </head>
 <body>
@@ -379,8 +391,10 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     </select>
   </div>
   <div id="mapAttribution" aria-label="Active basemap attribution"></div>
-  <script>
-    maplibregl.workerUrl = __MAPLIBRE_WORKER_URI__;
+  <script type="module">
+    import * as maplibregl from __MAPLIBRE_JS_URI__;
+    window.maplibregl = maplibregl;
+    maplibregl.setWorkerUrl(__MAPLIBRE_WORKER_URI__);
     const flightData = __FLIGHT_DATA__;
     const basemapConfig = __BASEMAP_CONFIG__;
     const mapMaxZoom = Number(flightData.mapMaxZoom) || 19;
@@ -393,6 +407,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     const pathParts = Array.isArray(flightData.pathParts) && flightData.pathParts.length
       ? flightData.pathParts
       : [flightData.points];
+    const longitudeReference = Number(
+      flightData.points && flightData.points.length ? flightData.points[0].lon : 0
+    );
     const altitudeStats = flightData.altitudeStats || {};
     const altitudeBase = Number.isFinite(Number(altitudeStats.baseMeters))
       ? Number(altitudeStats.baseMeters)
@@ -437,6 +454,7 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     let statusHideTimer = null;
     let map = null;
 __BASEMAP_RUNTIME__
+    window.handleBasemapError = handleBasemapError;
     let flightBounds = null;
     let initialBearing = 0;
     let flightLayersAdded = false;
@@ -673,14 +691,21 @@ __BASEMAP_RUNTIME__
       }
       return part
         .filter((point) => point && finiteNumber(point.lon) && finiteNumber(point.lat))
-        .map((point) => [Number(point.lon), Number(point.lat)]);
+        .map(coordinateFromPoint);
+    }
+
+    function displayLongitude(longitude) {
+      // Keep every render path in the same nearby world copy. A flight across
+      // +180/-180 must not span the globe or send playback through Greenwich.
+      const delta = ((Number(longitude) - longitudeReference + 180) % 360 + 360) % 360 - 180;
+      return longitudeReference + delta;
     }
 
     function coordinateFromPoint(point) {
       if (!point || !finiteNumber(point.lon) || !finiteNumber(point.lat)) {
         return null;
       }
-      return [Number(point.lon), Number(point.lat)];
+      return [displayLongitude(point.lon), Number(point.lat)];
     }
 
     function allPathPoints() {
@@ -733,7 +758,7 @@ __BASEMAP_RUNTIME__
           const nearest = amount <= 0.5 ? left : right;
           return {
             lat: Number(left.lat) + (Number(right.lat) - Number(left.lat)) * amount,
-            lon: Number(left.lon) + (Number(right.lon) - Number(left.lon)) * amount,
+            lon: displayLongitude(left.lon) + (displayLongitude(right.lon) - displayLongitude(left.lon)) * amount,
             alt: Number(left.alt || 0) + (Number(right.alt || 0) - Number(left.alt || 0)) * amount,
             elapsedSeconds: target,
             row: nearest.row
@@ -765,6 +790,17 @@ __BASEMAP_RUNTIME__
       if (playbackSpeed) {
         playbackSpeed.value = String(currentCursor.speed || 1);
       }
+      layoutMapOverlays();
+    }
+
+    function layoutMapOverlays() {
+      // Stack the legend, playback, and wrapping provider credits vertically,
+      // including in a narrow split-pane or a small application window.
+      const attributionHeight = basemapAttributionElement ? basemapAttributionElement.offsetHeight : 0;
+      const playbackBottom = attributionHeight + 10;
+      playbackOverlay.style.bottom = `${playbackBottom}px`;
+      const playbackHeight = playbackOverlay.hidden ? 0 : playbackOverlay.offsetHeight + 8;
+      legendContainer.style.bottom = `${playbackBottom + playbackHeight}px`;
     }
 
     function renderCurrentReadout(projected) {
@@ -904,7 +940,7 @@ __BASEMAP_RUNTIME__
 
     function mercatorCoordinate(point, altitudeMeters) {
       return maplibregl.MercatorCoordinate.fromLngLat(
-        { lng: Number(point.lon), lat: Number(point.lat) },
+        { lng: displayLongitude(point.lon), lat: Number(point.lat) },
         altitudeMeters
       );
     }
@@ -1802,8 +1838,10 @@ __BASEMAP_RUNTIME__
       });
 
       const revealFlightPath = () => {
+        if (flightLayersAdded) return;
         try {
           addFlightLayers();
+          if (!flightLayersAdded) return;
           renderLegend();
           setCursor(currentCursor);
           fitFlightBounds();
@@ -1818,8 +1856,8 @@ __BASEMAP_RUNTIME__
       map.once("style.load", revealFlightPath);
       map.once("load", revealFlightPath);
       refreshMapViewport({ fit: true });
-      window.setTimeout(() => refreshMapViewport({ fit: true }), 250);
-      window.setTimeout(() => refreshMapViewport({ fit: true }), 1000);
+      window.setTimeout(() => refreshMapViewport({ fit: false }), 250);
+      window.setTimeout(() => refreshMapViewport({ fit: false }), 1000);
     }
 
     window.sloppyGpsMap = {
@@ -1834,6 +1872,10 @@ __BASEMAP_RUNTIME__
     };
 
     try {
+      const footerObserver = new ResizeObserver(layoutMapOverlays);
+      [playbackOverlay, basemapAttributionElement, legendContainer].forEach(
+        (element) => footerObserver.observe(element)
+      );
       transientStatus("Preparing map...", "info", 900);
       initMapLibreFlightMap();
     } catch (error) {
@@ -1862,8 +1904,6 @@ __BASEMAP_RUNTIME__
         "__SPEED_FOCUS__": speed_focus,
         "__SPEED_SELECTED_BG__": speed_selected_bg,
     }
-    # Replace placeholder tokens last so the template stays readable above and
-    # the payload can be serialized with strict JSON escaping.
-    for token, value in replacements.items():
-        document = document.replace(token, value)
-    return document
+    # Substitute only tokens from the original template. Telemetry labels may
+    # legitimately contain token-like text and must never be expanded as code.
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements.get(match[0], match[0]), document)

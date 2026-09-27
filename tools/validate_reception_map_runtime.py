@@ -16,6 +16,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sloppy_log_explorer.reception_map_renderer import build_reception_map_html
+from tools.validate_gps_map_runtime import (
+    _validate_outside_naip_fallback,
+    _validate_vendor_attribution_security,
+    _wait_for_basemap_tiles,
+)
 
 
 FOCUS_LATITUDE = 39.774389
@@ -486,7 +491,7 @@ def validate_reception_map_runtime(
         "{autoRange:false, minimum:2, maximum:85, reverse:false});",
     )
 
-    _run_event_loop(750)
+    _wait_for_basemap_tiles(page, "__sloppyReceptionDebugMap")
     osm_image = view.grab().toImage().copy()
 
     _run_js(
@@ -494,7 +499,7 @@ def validate_reception_map_runtime(
         "window.sloppyReceptionMap.setBasemap('imagery');"
         "window.sloppyReceptionMap.setImageryOpacity(0.8); true;",
     )
-    _run_event_loop(2000)
+    _wait_for_basemap_tiles(page, "__sloppyReceptionDebugMap")
     imagery_state = _run_js(page, "window.sloppyReceptionMap.getState();")
     _assert_ready_state(imagery_state, expected_cells)
     imagery_basemap = imagery_state.get("basemap") if isinstance(imagery_state, dict) else None
@@ -539,7 +544,7 @@ def validate_reception_map_runtime(
         raise AssertionError(
             f"Reception map did not fall back from NAIP to GIBS: {naip_fallback_state}"
         )
-    _run_event_loop(750)
+    _wait_for_basemap_tiles(page, "__sloppyReceptionDebugMap")
     gibs_image = view.grab().toImage().copy()
     try:
         gibs_difference = _assert_imagery_pixels(
@@ -571,7 +576,7 @@ def validate_reception_map_runtime(
         )
 
     _run_js(page, "window.sloppyReceptionMap.setBasemap('imagery'); true;")
-    _run_event_loop(2000)
+    _wait_for_basemap_tiles(page, "__sloppyReceptionDebugMap")
     imagery_retry_state = _run_js(page, "window.sloppyReceptionMap.getState();")
     retry_basemap = (
         imagery_retry_state.get("basemap") if isinstance(imagery_retry_state, dict) else None
@@ -581,6 +586,12 @@ def validate_reception_map_runtime(
         raise AssertionError(
             f"Reception imagery providers did not recover on retry: {imagery_retry_state}"
         )
+
+    outside_naip = _validate_outside_naip_fallback(
+        page, view, "sloppyReceptionMap", "__sloppyReceptionDebugMap",
+        output.with_stem(output.stem + "-global-gibs"),
+    )
+    vendor_security = _validate_vendor_attribution_security(page, "__sloppyReceptionDebugMap")
 
     view.resize(max(width + 600, int(width * 1.5)), max(320, height // 2))
     _run_event_loop(250)
@@ -660,6 +671,8 @@ def validate_reception_map_runtime(
     if existing_app is None:
         app.quit()
     return {
+        "vendorSecurity": vendor_security,
+        "outsideNaip": outside_naip,
         "html": str(html_path),
         "screenshot": str(output),
         "loaded": True,

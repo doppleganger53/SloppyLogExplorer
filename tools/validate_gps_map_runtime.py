@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,73 @@ def _wait_for_ready_state(page: Any, attempts: int = 60) -> dict[str, Any] | Non
             return state
         _run_event_loop(250)
     return state
+
+
+def _wait_for_basemap_tiles(page: Any, map_name: str, timeout_seconds: float = 60.0) -> None:
+    """Wait for actual source completion before comparing provider pixels."""
+    deadline = time.monotonic() + timeout_seconds
+    settled_polls = 0
+    while time.monotonic() < deadline:
+        # Allow visibility changes to schedule their tile requests before
+        # accepting loaded state. Cold WMS requests can exceed two seconds.
+        _run_event_loop(200)
+        loaded = _run_js(
+            page,
+            f"Boolean(window.{map_name} && !window.{map_name}.isMoving() "
+            f"&& window.{map_name}.areTilesLoaded());",
+        )
+        settled_polls = settled_polls + 1 if loaded is True else 0
+        if settled_polls >= 2:
+            return
+    raise AssertionError(f"Map tile loading did not settle within {timeout_seconds:g} seconds")
+
+
+def _camera_matches(before: Any, after: Any) -> bool:
+    """Ignore projection roundoff while checking complete camera preservation."""
+    if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+        return math.isclose(before, after, rel_tol=0.0, abs_tol=1e-7)
+    if isinstance(before, dict) and isinstance(after, dict):
+        return before.keys() == after.keys() and all(_camera_matches(before[key], after[key]) for key in before)
+    if isinstance(before, list) and isinstance(after, list):
+        return len(before) == len(after) and all(_camera_matches(left, right) for left, right in zip(before, after))
+    return before == after
+
+
+def _validate_vendor_attribution_security(page: Any, map_name: str) -> dict[str, Any]:
+    result = _run_js(page, """(() => {
+      const control = new maplibregl.AttributionControl({customAttribution:
+        '<a href="#test" onclick="window.injected=true" onmouseover="window.injected=true">Test</a>'});
+      const container = control.onAdd(window.""" + map_name + """);
+      const unsafeAttributes = container.querySelectorAll('[onclick], [onmouseover]').length;
+      const version = maplibregl.getVersion();
+      control.onRemove();
+      return {version, unsafeAttributes};
+    })();""")
+    if not isinstance(result, dict) or result.get("version") != "6.4.1" or result.get("unsafeAttributes") != 0:
+        raise AssertionError(f"Bundled MapLibre attribution sanitization failed: {result}")
+    return result
+
+
+def _assert_gps_overlay_layout(page: Any) -> dict[str, Any]:
+    result = _run_js(page, """(() => {
+      const boxes = ['legend','playbackOverlay','mapAttribution'].map(id => {
+        const element = document.getElementById(id);
+        if (!element || element.hidden) return null;
+        const r = element.getBoundingClientRect();
+        return {id,left:r.left,right:r.right,top:r.top,bottom:r.bottom};
+      }).filter(Boolean);
+      return {width:innerWidth,height:innerHeight,boxes};
+    })();""")
+    if not isinstance(result, dict):
+        raise AssertionError("GPS map overlay geometry was not available")
+    boxes = result["boxes"]
+    for index, box in enumerate(boxes):
+        if box["left"] < 0 or box["right"] > result["width"] or box["top"] < 0 or box["bottom"] > result["height"]:
+            raise AssertionError(f"GPS overlay extends outside the viewport: {result}")
+        for other in boxes[index + 1:]:
+            if box["left"] < other["right"] and box["right"] > other["left"] and box["top"] < other["bottom"] and box["bottom"] > other["top"]:
+                raise AssertionError(f"GPS overlays overlap: {result}")
+    return result
 
 
 def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float | None = None) -> None:
@@ -157,6 +225,43 @@ def _assert_imagery_pixels(
             f"{label} did not visibly replace the OpenStreetMap pixels: {metrics}"
         )
     return metrics
+
+
+def _validate_outside_naip_fallback(
+    page: Any,
+    view: Any,
+    api_name: str,
+    map_name: str,
+    output: Path,
+) -> dict[str, Any]:
+    """Exercise GIBS outside NAIP coverage without simulating provider errors."""
+    original_camera = _run_js(
+        page,
+        f"({{center:window.{map_name}.getCenter().toArray(),"
+        f"zoom:window.{map_name}.getZoom(),pitch:window.{map_name}.getPitch(),"
+        f"bearing:window.{map_name}.getBearing()}});",
+    )
+    _run_js(
+        page,
+        f"window.{api_name}.setBasemap('osm');"
+        f"window.{map_name}.jumpTo({{center:[10,51],zoom:6,pitch:0,bearing:0}}); true;",
+    )
+    _wait_for_basemap_tiles(page, map_name)
+    osm_image = view.grab().toImage().copy()
+    _run_js(page, f"window.{api_name}.setBasemap('imagery'); true;")
+    _wait_for_basemap_tiles(page, map_name)
+    state = _run_js(page, f"window.{api_name}.getState();")
+    if not isinstance(state, dict) or state.get("basemap", {}).get("provider") != "gibs":
+        raise AssertionError(f"Non-NAIP viewport did not use NASA GIBS: {state}")
+    gibs_image = view.grab().toImage().copy()
+    difference = _assert_imagery_pixels(osm_image, gibs_image, "NASA GIBS outside NAIP coverage")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if not gibs_image.save(str(output)):
+        raise AssertionError(f"Failed to save non-NAIP screenshot: {output}")
+    _run_js(page, f"window.{map_name}.jumpTo({json.dumps(original_camera)}); true;")
+    _wait_for_basemap_tiles(page, map_name)
+    return {"basemap": state["basemap"], "camera": state["camera"], "difference": difference,
+            "screenshot": str(output)}
 
 
 def _gps_runtime_options(
@@ -307,6 +412,8 @@ def validate_gps_map_runtime(
         view.close()
         raise
 
+    vendor_security = _validate_vendor_attribution_security(page, "__sloppyDebugMap")
+
     cursor_payload = {
         "index": 3,
         "row": 4,
@@ -369,7 +476,7 @@ def validate_gps_map_runtime(
         view.close()
         raise AssertionError(f"GPS map returned no stable fit state: {after_fit_state}")
 
-    _run_event_loop(750)
+    _wait_for_basemap_tiles(page, "__sloppyDebugMap")
     before_imagery_state = _run_js(page, "window.sloppyGpsMap.getState();")
     if not isinstance(before_imagery_state, dict):
         view.close()
@@ -383,7 +490,7 @@ def validate_gps_map_runtime(
         "window.sloppyGpsMap.setBasemap('imagery');"
         "window.sloppyGpsMap.setImageryOpacity(0.8); true;",
     )
-    _run_event_loop(2000)
+    _wait_for_basemap_tiles(page, "__sloppyDebugMap")
     imagery_state = _run_js(page, "window.sloppyGpsMap.getState();")
     imagery_basemap = imagery_state.get("basemap") if isinstance(imagery_state, dict) else None
     if not isinstance(imagery_basemap, dict):
@@ -397,9 +504,12 @@ def validate_gps_map_runtime(
     if imagery_basemap.get("provider") not in {"naip", "gibs"}:
         view.close()
         raise AssertionError(f"GPS imagery did not retain a usable provider: {imagery_state}")
-    if imagery_state.get("camera") != before_imagery_state.get("camera"):
+    if not _camera_matches(imagery_state.get("camera"), before_imagery_state.get("camera")):
         view.close()
-        raise AssertionError(f"GPS imagery switch moved the camera: {imagery_state}")
+        raise AssertionError(
+            f"GPS imagery switch moved the camera: before={before_imagery_state.get('camera')}; "
+            f"after={imagery_state.get('camera')}"
+        )
     if imagery_state.get("cursor") != before_imagery_state.get("cursor"):
         view.close()
         raise AssertionError(f"GPS imagery switch changed the cursor: {imagery_state}")
@@ -428,7 +538,7 @@ def validate_gps_map_runtime(
     if not isinstance(naip_fallback_basemap, dict) or naip_fallback_basemap.get("provider") != "gibs":
         view.close()
         raise AssertionError(f"GPS map did not fall back from NAIP to GIBS: {naip_fallback_state}")
-    _run_event_loop(750)
+    _wait_for_basemap_tiles(page, "__sloppyDebugMap")
     gibs_image = view.grab().toImage().copy()
     try:
         gibs_difference = _assert_imagery_pixels(
@@ -458,7 +568,7 @@ def validate_gps_map_runtime(
         raise AssertionError(f"GPS map did not fall back from GIBS to OSM: {osm_fallback_state}")
 
     _run_js(page, "window.sloppyGpsMap.setBasemap('imagery'); true;")
-    _run_event_loop(2000)
+    _wait_for_basemap_tiles(page, "__sloppyDebugMap")
     imagery_retry_state = _run_js(page, "window.sloppyGpsMap.getState();")
     retry_basemap = (
         imagery_retry_state.get("basemap") if isinstance(imagery_retry_state, dict) else None
@@ -466,6 +576,21 @@ def validate_gps_map_runtime(
     if not isinstance(retry_basemap, dict) or retry_basemap.get("provider") not in {"naip", "gibs"}:
         view.close()
         raise AssertionError(f"GPS imagery providers did not recover on retry: {imagery_retry_state}")
+
+    outside_naip = _validate_outside_naip_fallback(
+        page, view, "sloppyGpsMap", "__sloppyDebugMap",
+        output.with_stem(output.stem + "-global-gibs"),
+    )
+
+    overlay_layout = _assert_gps_overlay_layout(page)
+    view.resize(480, 360)
+    _run_event_loop(250)
+    narrow_overlay_layout = _assert_gps_overlay_layout(page)
+    view.grab().save(str(output.with_stem(output.stem + "-narrow")))
+    view.resize(width, height)
+    _run_event_loop(250)
+    _run_js(page, "window.sloppyGpsMap.refresh({fit:true}); true;")
+    _wait_for_basemap_tiles(page, "__sloppyDebugMap")
 
     _run_event_loop(1200)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +608,10 @@ def validate_gps_map_runtime(
     view.close()
     app.quit()
     return {
+        "vendorSecurity": vendor_security,
+        "overlayLayout": overlay_layout,
+        "narrowOverlayLayout": narrow_overlay_layout,
+        "outsideNaip": outside_naip,
         "log": str(log_path),
         "html": str(html_path),
         "screenshot": str(output),

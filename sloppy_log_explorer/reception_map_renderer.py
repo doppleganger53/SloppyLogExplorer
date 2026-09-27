@@ -5,6 +5,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,7 @@ def _message_html(message: str, dark: bool, state: str) -> str:
 
 def _json_for_script(value: Any) -> str:
     """Serialize strict JSON without allowing a payload to end the script tag."""
-    return json.dumps(value, allow_nan=False, separators=(",", ":")).replace("</", "<\\/")
+    return json.dumps(value, allow_nan=False, separators=(",", ":")).replace("<", "\\u003c")
 
 
 def build_reception_map_html(payload: dict[str, object] | None, dark: bool = True) -> str:
@@ -130,8 +131,8 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     border = "rgba(255,255,255,0.22)" if dark else "rgba(0,0,0,0.20)"
     outline = "rgba(255,255,255,0.36)" if dark else "rgba(17,24,39,0.42)"
     css_uri = html.escape(_asset_uri("maplibre-gl.css"), quote=True)
-    js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
-    worker_uri_json = _json_for_script(_asset_uri("maplibre-gl-csp-worker.js"))
+    js_uri = json.dumps(_asset_uri("maplibre-gl.mjs"))
+    worker_uri_json = _json_for_script(_asset_uri("maplibre-gl-worker.mjs"))
     data_json = _json_for_script(payload)
     basemap_config_json = _json_for_script(build_basemap_config(payload))
 
@@ -142,7 +143,6 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="__MAPLIBRE_CSS_URI__">
-  <script src="__MAPLIBRE_JS_URI__"></script>
   <style>
     html, body {
       width: 100%;
@@ -239,13 +239,10 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     <div id="legend-detail" class="legend-detail"></div>
   </section>
   <div id="basemap-attribution" aria-label="Active basemap attribution"></div>
-  <script>
-    const maplibreWorkerUrl = __MAPLIBRE_WORKER_URI__;
-    if (typeof maplibregl.setWorkerUrl === "function") {
-      maplibregl.setWorkerUrl(maplibreWorkerUrl);
-    } else {
-      maplibregl.workerUrl = maplibreWorkerUrl;
-    }
+  <script type="module">
+    import * as maplibregl from __MAPLIBRE_JS_URI__;
+    window.maplibregl = maplibregl;
+    maplibregl.setWorkerUrl(__MAPLIBRE_WORKER_URI__);
     const receptionData = __RECEPTION_DATA__;
     const basemapConfig = __BASEMAP_CONFIG__;
     const mapMaxZoom = 22;
@@ -264,6 +261,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     const basemapAttributionElement = document.getElementById("basemap-attribution");
     let map = null;
 __BASEMAP_RUNTIME__
+    window.handleBasemapError = handleBasemapError;
     let mapState = "loading";
     let mapError = null;
     let layersAdded = false;
@@ -939,9 +937,9 @@ __BASEMAP_RUNTIME__
       };
       map.once("style.load", revealCells);
       map.once("load", revealCells);
-      map.once("idle", () => refreshMapViewport({fit: true}));
-      window.setTimeout(() => refreshMapViewport({fit: true}), 250);
-      window.setTimeout(() => refreshMapViewport({fit: true}), 900);
+      map.once("idle", () => refreshMapViewport({fit: false}));
+      window.setTimeout(() => refreshMapViewport({fit: false}), 250);
+      window.setTimeout(() => refreshMapViewport({fit: false}), 900);
     }
 
     window.sloppyReceptionMap = {
@@ -979,6 +977,5 @@ __BASEMAP_RUNTIME__
         "__BORDER__": border,
         "__OUTLINE__": outline,
     }
-    for token, value in replacements.items():
-        document = document.replace(token, value)
-    return document
+    # Never substitute token-like telemetry labels after inserting their JSON.
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements.get(match[0], match[0]), document)

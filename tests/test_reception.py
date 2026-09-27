@@ -82,6 +82,29 @@ def test_index_log_samples_every_twentieth_row_and_uses_recorded_date(tmp_path: 
     assert record.channels == ("VFR 2.4G(%)",)
 
 
+@pytest.mark.parametrize("delimiter", [";", "\t"])
+def test_index_ragged_delimited_log_matches_full_log_parser(tmp_path: Path, delimiter: str) -> None:
+    path = tmp_path / "delimited.csv"
+    path.write_text(
+        "\n" + "\n".join(
+            delimiter.join(row) for row in [
+                ["Date", "Time", "GPS Lat", "GPS Lon", "VFR 2.4G(%)"],
+                ["2026-04-01", "12:00:00", "39.75", "-75.25", "90", "extra"],
+                ["2026-04-01", "12:00:01", "39.75001", "-75.25", "80"],
+                ["2026-04-01", "12:00:02", "39.75002", "-75.25"],
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path)
+    assert record.status == "ok"
+    assert record.channels == ("VFR 2.4G(%)",)
+    assert record.center_latitude == pytest.approx(39.75001)
+    payload = build_reception_heatmap([record], "VFR 2.4G(%)", (39.75, -75.25))
+    assert payload["status"] == "ok"
+    assert payload["error_count"] == 0
+
+
 def test_index_log_discovers_channels_between_stride_aligned_rows(tmp_path: Path) -> None:
     path = tmp_path / "between-samples.csv"
     rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]

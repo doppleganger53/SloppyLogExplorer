@@ -631,7 +631,7 @@ class GpsPathWidget(QWidget):
 
     def showEvent(self, a0) -> None:
         super().showEvent(a0)
-        self._schedule_viewport_refresh(fit=True)
+        self._schedule_viewport_refresh(fit=False)
 
     def resizeEvent(self, a0) -> None:
         super().resizeEvent(a0)

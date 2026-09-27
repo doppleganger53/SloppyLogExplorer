@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -80,9 +81,9 @@ def validate_core(log_path: Path, compare_path: Path | None, library_root: Path)
         # These tokens pin the generated HTML/JS contract that the live map
         # validator depends on, so a renderer regression shows up immediately.
         required_map_tokens = [
-            "maplibre-gl-csp.js",
-            "maplibre-gl-csp-worker.js",
-            "maplibregl.workerUrl",
+            "maplibre-gl.mjs",
+            '<script type="module">',
+            "import * as maplibregl",
             "new maplibregl.Map",
             "OpenStreetMap contributors",
             "function buildRasterBaseStyle()",
@@ -196,7 +197,7 @@ def validate_ui(
 ) -> dict[str, Any]:
     if state_root is None:
         state_root = Path(tempfile.mkdtemp(prefix="sloppy-log-explorer-"))
-    os.environ["APPDATA"] = str(state_root)
+    os.environ["APPDATA"] = str(state_root.resolve())
     if platform == "offscreen":
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
     else:
@@ -206,7 +207,7 @@ def validate_ui(
 
     from sloppy_log_explorer.main_window import MainWindow
 
-    app = QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication(["sloppy-log-explorer-validation"])
     window = MainWindow()
     window.library_root = library_root
     window.load_log(log_path)
@@ -229,10 +230,23 @@ def validate_ui(
         "gps_view_type": type(window.gps_view).__name__,
     }
     if render_graph is not None:
+        if platform != "native":
+            raise ValueError("Graph screenshots require --ui-platform native to render Qt WebEngine")
+        from tools.validate_gps_map_runtime import _run_event_loop, _run_js
+
         render_graph.parent.mkdir(parents=True, exist_ok=True)
-        window.graph_view.resize(1200, 650)
-        # Grab a screenshot after the widget is sized so the output reflects a
-        # realistic rendered graph rather than an initial placeholder layout.
+        window.show()
+        page = window.graph_view._page
+        if page is None:
+            raise AssertionError("Telemetry WebEngine page is unavailable")
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if _run_js(page, "Boolean(document.querySelector('.js-plotly-plot')?._fullLayout)"):
+                break
+            _run_event_loop(100)
+        else:
+            raise AssertionError("Telemetry plot did not finish rendering within 30 seconds")
+        _run_event_loop(200)
         image = window.graph_view.grab()
         if not image.save(str(render_graph)):
             raise AssertionError(f"failed to save graph render to {render_graph}")
