@@ -106,8 +106,8 @@ The Windows symlink-escape regression is skipped when the host lacks symlink
 creation privileges; ordinary path containment, overlapping directories,
 stale candidates, and interrupted-copy preservation are tested. Cross-platform
 desktop behavior and every display scaling/GPU combination were not tested.
-The local build is a release candidate; publication, signing, and release tags
-are separate actions.
+These checks cover the unsigned Windows build. Publication and release tags
+are recorded separately on the repository's GitHub Releases page.
 
 The onefile executable must unpack its runtime at startup. Packaged validation
 startup varied from about 9 to 37 seconds in this run; the first check ran
@@ -120,6 +120,12 @@ portability for faster startup. No universal startup-time claim is made.
 - Archive SHA-256: `cc83abac66456c330e84d23a6bab572fd36a1cd2d2840fc79a5b3241b18cb46d`.
 - Executable SHA-256: `ef1ce74da527cf0830d9055f3ae8a3c6dcfe0fd56009bb3e0aca3182e8b1a30f`.
 - Prepared release notes: `validation_artifacts/release-notes-0.2.0.md`.
-- Changes are organized into focused commits on `release/v0.2.0`; no push,
-  tag, issue closure, or GitHub release was performed. The parent workspace
-  and unrelated review worktree were preserved.
+- Release changes were organized into focused commits on `release/v0.2.0`.
+  Final integration also preserves the local checkout-routing and release
+  template guidance. The combined tree passed a fresh full regression run
+  (314 passed, 1 skipped) and Pyright (zero errors or warnings).
+- The retired Spark branch was reviewed against the current implementation:
+  elapsed-range bridging, GPS scope filtering, cursor clamping, scoped playback,
+  and validation coverage are already implemented by newer changes. The current
+  code additionally handles non-monotonic timelines and stale WebChannel
+  documents, so the older implementation was not imported.
