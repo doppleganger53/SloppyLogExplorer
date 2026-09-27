@@ -8,7 +8,7 @@ from typing import Iterable, cast
 import numpy as np
 import pandas as pd
 
-from .models import CursorValue, InternalResistanceResult, LoadedLog
+from .models import CursorTimeline, CursorValue, InternalResistanceResult, LoadedLog
 
 
 def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
@@ -16,7 +16,7 @@ def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
     if isinstance(series, pd.DataFrame):
         series = pd.Series(series.to_numpy()[:, 0], index=series.index)
     numeric = pd.to_numeric(series, errors="coerce")
-    return pd.Series(numeric, index=series.index)
+    return pd.Series(numeric, index=series.index).where(np.isfinite(numeric))
 
 
 # Keep the most useful telemetry channels near the top of the UI so the first
@@ -116,6 +116,7 @@ def find_current_columns(columns: Iterable[str]) -> list[str]:
 
 
 def guess_cell_count(voltage: pd.Series) -> int:
+    voltage = voltage.where(np.isfinite(voltage))
     median = float(voltage.dropna().median()) if voltage.notna().any() else 0.0
     if median <= 0:
         return 1
@@ -174,30 +175,76 @@ def calculate_internal_resistance(
     )
 
 
+def _cursor_timeline(log: LoadedLog) -> CursorTimeline | None:
+    if log.cursor_timeline is not None and log.cursor_timeline.source is log.time:
+        return log.cursor_timeline
+    if log.time is None or not log.time.notna().any():
+        return None
+    clean = log.time.ffill().bfill()
+    absolute = (clean - pd.Timestamp("1970-01-01")).dt.total_seconds().to_numpy(dtype=float)
+    elapsed = (clean - clean.iloc[0]).dt.total_seconds().clip(lower=0).to_numpy(dtype=float)
+    log.cursor_timeline = CursorTimeline(
+        source=log.time,
+        absolute_seconds=absolute,
+        elapsed_seconds=elapsed,
+        monotonic=bool(np.all(absolute[1:] >= absolute[:-1])),
+        absolute_bounds=(float(absolute.min()), float(absolute.max())),
+        elapsed_bounds=(float(elapsed.min()), float(elapsed.max())),
+    )
+    return log.cursor_timeline
+
+
+def _nearest_compare_index(timeline: CursorTimeline, target: float, absolute: bool) -> int | None:
+    values = timeline.absolute_seconds if absolute else timeline.elapsed_seconds
+    lower, upper = timeline.absolute_bounds if absolute else timeline.elapsed_bounds
+    if not lower <= target <= upper:
+        return None
+    if not timeline.monotonic:
+        return int(np.abs(values - target).argmin())
+    insertion = int(np.searchsorted(values, target, side="left"))
+    if insertion == 0:
+        return 0
+    if insertion == len(values):
+        return len(values) - 1
+    if values[insertion] - target < target - values[insertion - 1]:
+        return insertion
+    return insertion - 1
+
+
 def cursor_values(
     primary: LoadedLog,
     index: int,
     columns: list[str],
     compare: LoadedLog | None = None,
+    *,
+    time_mode: str = "absolute",
 ) -> list[CursorValue]:
     if primary.dataframe.empty:
         return []
     index = max(0, min(index, len(primary.dataframe) - 1))
-    # Compare logs can be shorter than the primary log, so clamp the cursor to
-    # the last available compare row instead of indexing past the end.
     compare_index = min(index, len(compare.dataframe) - 1) if compare is not None and not compare.dataframe.empty else None
+    if compare is not None and compare_index is not None:
+        primary_timeline, compare_timeline = _cursor_timeline(primary), _cursor_timeline(compare)
+        if primary_timeline is not None and compare_timeline is not None:
+            absolute = time_mode == "absolute"
+            target = primary_timeline.absolute_seconds[index] if absolute else primary_timeline.elapsed_seconds[index]
+            compare_index = _nearest_compare_index(compare_timeline, float(target), absolute)
     values: list[CursorValue] = []
+    primary_row = primary.dataframe.iloc[index]
+    compare_row = compare.dataframe.iloc[compare_index] if compare is not None and compare_index is not None else None
     for col in columns:
         if col not in primary.dataframe.columns:
             continue
-        value = primary.dataframe.iloc[index][col]
+        value = primary_row[col]
         compare_value = None
         delta = None
-        if compare is not None and compare_index is not None and col in compare.dataframe.columns:
-            compare_value = compare.dataframe.iloc[compare_index][col]
+        if compare_row is not None and col in compare_row.index:
+            compare_value = compare_row[col]
             try:
                 delta = float(value) - float(compare_value)
-            except Exception:
+                if not math.isfinite(delta):
+                    delta = None
+            except (TypeError, ValueError, OverflowError):
                 delta = None
         values.append(CursorValue(column=col, value=value, compare_value=compare_value, delta=delta))
     return values
