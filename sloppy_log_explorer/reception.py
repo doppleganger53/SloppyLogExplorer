@@ -31,6 +31,7 @@ from .parser import (
     _NON_POSITION_GPS_TOKENS,
     _clean_columns,
     _coerce_numeric_series,
+    _csv_delimiter,
     _deduplicate_columns,
     _detect_time,
     _has_coordinate_name_hint,
@@ -170,16 +171,11 @@ def _sampled_csv(
     """Read sparse data and GPS-event rows while retaining column evidence."""
     stride = max(1, int(sample_stride))
     requested_record_limit = max(1, int(max_records)) if max_records is not None else None
+    delimiter = _csv_delimiter(path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        sniff_sample = handle.read(4096)
-        handle.seek(0)
+        reader = csv.reader(handle, delimiter=delimiter)
         try:
-            dialect = csv.Sniffer().sniff(sniff_sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.reader(handle, dialect)
-        try:
-            header = next(reader)
+            header = next(row for row in reader if any(value.strip() for value in row))
         except StopIteration:
             return pd.DataFrame()
         columns = _deduplicate_columns(header)
@@ -399,19 +395,24 @@ def _valid_gps_candidates(
     if value_column is not None:
         values = _coerce_numeric_series(dataframe[value_column])
     elif value_values is not None:
-        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(value_values)
+        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(list(value_values))
         values = _coerce_numeric_series(raw_values).reset_index(drop=True)
     else:
         values = None
+    # Iterate positional arrays once instead of constructing several pandas
+    # scalar indexers for every GPS sample in full-length flight logs.
+    latitude_values = latitude.to_numpy()
+    longitude_values = longitude.to_numpy()
+    numeric_values = values.to_numpy() if values is not None else None
     candidates: list[GpsCandidate] = []
     for index in range(len(dataframe)):
-        lat = _coerce_float(latitude.iloc[index])
-        lon = _coerce_float(longitude.iloc[index])
+        lat = _coerce_float(latitude_values[index])
+        lon = _coerce_float(longitude_values[index])
         if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
             continue
         if _is_origin_placeholder(lat, lon):
             continue
-        value = _coerce_float(values.iloc[index]) if values is not None else None
+        value = _coerce_float(numeric_values[index]) if numeric_values is not None else None
         point: GpsPoint = {
             "lat": lat,
             "lon": lon,
@@ -971,6 +972,17 @@ def _row_median(dataframe: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
     return pd.concat(numeric_columns, axis=1).median(axis=1, skipna=True)
 
 
+def _replace_zero_references_with_lowest_positive(reference_values: pd.Series) -> pd.Series:
+    """Treat zero power samples as the lowest positive power in this log."""
+    positive_values = reference_values[reference_values.notna() & reference_values.gt(0.0)]
+    if positive_values.empty:
+        return reference_values
+    replacement = positive_values.min()
+    if pd.isna(replacement):
+        return reference_values
+    return reference_values.mask(reference_values.eq(0.0), float(replacement))
+
+
 def _normalization_label(
     source: str,
     reference: str | None,
@@ -1259,9 +1271,16 @@ def build_reception_heatmap(
                     valid = source_values.notna() & reference_values.notna()
                     transformed_values = (source_values - reference_values).where(valid)
                 else:
-                    valid = source_values.notna() & reference_values.notna() & reference_values.gt(0.0)
+                    normalization_reference_values = _replace_zero_references_with_lowest_positive(
+                        reference_values
+                    )
+                    valid = (
+                        source_values.notna()
+                        & normalization_reference_values.notna()
+                        & normalization_reference_values.gt(0.0)
+                    )
                     transformed_values = (
-                        source_values - 10.0 * reference_values.map(
+                        source_values - 10.0 * normalization_reference_values.map(
                             lambda value: math.log10(float(value)) if pd.notna(value) and float(value) > 0.0 else math.nan
                         )
                     ).where(valid)

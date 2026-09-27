@@ -9,7 +9,8 @@ helpers if needed.
 from __future__ import annotations
 
 import csv
-import math
+import re
+import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,11 +37,11 @@ def load_voice_csv(path: str | Path) -> list[VoiceItem]:
     to be fixed.
     """
 
-    with Path(path).open(newline="", encoding="utf-8") as handle:
+    with Path(path).open(newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         # Keep the header names aligned with the visible table labels and
         # `save_voice_csv()` so files can round-trip without schema mapping.
-        return [VoiceItem(row.get("Text to be Spoken", ""), row.get("Target WAV Filename", "")) for row in reader]
+        return [VoiceItem(row.get("Text to be Spoken") or "", row.get("Target WAV Filename") or "") for row in reader]
 
 
 def save_voice_csv(path: str | Path, items: list[VoiceItem]) -> None:
@@ -55,43 +56,18 @@ def save_voice_csv(path: str | Path, items: list[VoiceItem]) -> None:
             writer.writerow({"Text to be Spoken": item.text, "Target WAV Filename": item.filename})
 
 
-def _placeholder_wav(path: Path, text: str) -> None:
-    """Create a short audible WAV when the local TTS engine is unavailable.
-
-    The placeholder is intentionally a simple sine wave rather than spoken
-    speech. It proves the export path, filename normalization, and WAV container
-    writing all worked without pretending to be a real voice-pack output.
-    """
-
-    # 22.05 kHz mono PCM keeps the file small while still being broadly playable
-    # by desktop audio tools and radio voice-pack workflows.
-    sample_rate = 22050
-
-    # Tie the placeholder length loosely to the text length so blank/short rows
-    # still produce an audible file and very long labels do not create large
-    # fallback assets.
-    duration = max(0.25, min(1.5, len(text) / 20.0))
-    frames = int(sample_rate * duration)
-    with wave.open(str(path), "w") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(sample_rate)
-        data = bytearray()
-        for i in range(frames):
-            # Generate signed 16-bit little-endian PCM samples for a steady
-            # 660 Hz tone. The amplitude stays below the int16 maximum to avoid
-            # clipping in players that apply gain.
-            sample = int(16000 * math.sin(2 * math.pi * 660 * (i / sample_rate)))
-            data.extend(sample.to_bytes(2, "little", signed=True))
-        wav.writeframes(bytes(data))
-
-
 def _voice_target_path(output_path: Path, filename: str) -> Path | None:
     clean = filename.strip()
     if not clean:
         return None
     if "/" in clean or "\\" in clean:
         raise ValueError("Voice-pack filenames must be simple file names, not paths.")
+    if (
+        re.search(r'[<>:"|?*\x00-\x1f]', clean)
+        or clean.endswith(".")
+        or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", clean.split(".", 1)[0].rstrip(), re.IGNORECASE)
+    ):
+        raise ValueError("Voice-pack filenames must be valid Windows file names, without device names or special characters.")
     requested = Path(clean)
     if requested.is_absolute() or len(requested.parts) != 1:
         raise ValueError("Voice-pack filenames must be simple file names, not paths.")
@@ -108,43 +84,54 @@ def _voice_target_path(output_path: Path, filename: str) -> Path | None:
 def generate_voice_pack(items: list[VoiceItem], output_dir: str | Path) -> list[Path]:
     """Generate WAV files for the supplied voice items.
 
-    The function prefers `pyttsx3` because it uses local operating-system speech
-    engines and does not require a web service. If import or engine startup
-    fails, it falls back to `_placeholder_wav()` so the export operation remains
-    deterministic and the caller still receives concrete output paths.
+    Speech is rendered to temporary files and verified before replacing any
+    existing pack entries. An unavailable or failed speech engine is reported;
+    an alarm tone must never silently replace a spoken radio announcement.
     """
 
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
     jobs: list[tuple[VoiceItem, Path]] = []
+    names: set[str] = set()
     for item in items:
         target = _voice_target_path(output_path, item.filename)
         if target is not None:
+            if not item.text.strip():
+                raise ValueError(f"Enter text to speak for {target.name}.")
+            name = target.name.casefold()
+            if name in names:
+                raise ValueError(f"Duplicate voice-pack filename: {target.name}")
+            names.add(name)
             jobs.append((item, target))
     if not jobs:
         return []
 
-    created: list[Path] = []
-    engine = None
     try:
         import pyttsx3
 
         # Initialize lazily inside this function so importing the application
         # does not trigger speech-engine discovery or platform-specific errors.
         engine = pyttsx3.init()
-    except Exception:
-        # pyttsx3 can fail for missing OS voices, broken drivers, or unavailable
-        # COM/audio backends. The placeholder path preserves a useful export
-        # result instead of surfacing those local environment problems here.
-        engine = None
+    except Exception as exc:
+        raise RuntimeError("The local speech engine could not start. Install or enable a system voice and try again.") from exc
 
-    for item, target in jobs:
-        if engine is not None:
-            engine.save_to_file(item.text, str(target))
-            # pyttsx3 queues speech requests; `runAndWait()` flushes each file so
-            # the returned path list only includes files that have been rendered.
-            engine.runAndWait()
-        else:
-            _placeholder_wav(target, item.text)
-        created.append(target)
-    return created
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".sloppy-voice-", dir=output_path) as temporary:
+            staged: list[tuple[Path, Path]] = []
+            for item, target in jobs:
+                temporary_path = Path(temporary) / target.name
+                try:
+                    engine.save_to_file(item.text, str(temporary_path))
+                    engine.runAndWait()
+                    with wave.open(str(temporary_path), "rb") as rendered:
+                        if rendered.getnframes() == 0 or not rendered.readframes(1):
+                            raise ValueError("The speech engine produced an empty WAV.")
+                except Exception as exc:
+                    raise RuntimeError(f"The speech engine could not create {target.name}. Existing voice files were preserved.") from exc
+                staged.append((temporary_path, target))
+            for temporary_path, target in staged:
+                _voice_target_path(output_path, target.name)
+                temporary_path.replace(target)
+    finally:
+        engine.stop()
+    return [target for _, target in jobs]

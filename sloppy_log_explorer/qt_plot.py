@@ -16,6 +16,12 @@ from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineS
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 
+from . import __version__
+from .map_basemaps import (
+    BASEMAP_OPENSTREETMAP,
+    clamp_imagery_opacity,
+    normalize_basemap,
+)
 from .models import GpsGradientOptions, LoadedLog
 from .reception_map_renderer import build_reception_map_html
 from .plotting import (
@@ -96,7 +102,7 @@ def _persistent_web_profile() -> QWebEngineProfile:
         profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
         profile.setHttpUserAgent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) SloppyLogExplorer/0.1 QtWebEngine"
+            f"(KHTML, like Gecko) SloppyLogExplorer/{__version__} QtWebEngine"
         )
         _WEB_PROFILE = profile
     return _WEB_PROFILE
@@ -438,10 +444,14 @@ class GpsPathWidget(QWidget):
         self.log: LoadedLog | None = None
         self.options = GpsGradientOptions()
         self.dark = True
+        self.basemap = BASEMAP_OPENSTREETMAP
+        self.imagery_opacity = 1.0
         self._last_cursor: dict[str, Any] | None = None
         self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
         self._page: QWebEnginePage | None = None
+        self._render_generation = 0
+        self._loaded_render_generation = -1
         self._pending_viewport_fit = False
         self._viewport_refresh_timer = QTimer(self)
         self._viewport_refresh_timer.setSingleShot(True)
@@ -475,8 +485,33 @@ class GpsPathWidget(QWidget):
         self.log = log
         self.options = options or GpsGradientOptions()
         self.dark = dark
-        html = build_gps_map_html(log, options=self.options, dark=dark)
+        try:
+            previous_generation = self._render_generation
+        except (AttributeError, RuntimeError):
+            previous_generation = 0
+        try:
+            basemap = self.basemap
+        except (AttributeError, RuntimeError):
+            basemap = BASEMAP_OPENSTREETMAP
+        try:
+            imagery_opacity = self.imagery_opacity
+        except (AttributeError, RuntimeError):
+            imagery_opacity = 1.0
+        self._render_generation = previous_generation + 1
+        self._loaded_render_generation = -1
+        html = build_gps_map_html(
+            log,
+            options=self.options,
+            dark=dark,
+            basemap=normalize_basemap(basemap),
+            imagery_opacity=clamp_imagery_opacity(imagery_opacity),
+        )
         if self._web_engine:
+            marker = (
+                "<script>window.sloppyGpsRenderGeneration = "
+                f"{self._render_generation};</script>"
+            )
+            html = html.replace("<head>", f"<head>{marker}", 1)
             # Regenerate the HTML file on each refresh so the embedded browser
             # always reads the latest payload and can access local assets.
             previous_path = self._html_path
@@ -486,6 +521,56 @@ class GpsPathWidget(QWidget):
             self._schedule_viewport_refresh(fit=True)
         else:
             self._view.setHtml(html)
+
+    def set_basemap(self, basemap: str) -> None:
+        """Switch the live GPS basemap without replacing the map document."""
+        self.basemap = normalize_basemap(basemap)
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
+            return
+        generation = self._render_generation
+        value = json.dumps(self.basemap)
+        self._page.runJavaScript(
+            "(() => {"
+            f"if (window.sloppyGpsRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyGpsMap;"
+            "return api && typeof api.setBasemap === 'function' "
+            f"? api.setBasemap({value}) : false;"
+            "})();"
+        )
+
+    def set_imagery_opacity(self, opacity: float) -> None:
+        """Update GPS imagery opacity without disturbing camera or playback."""
+        self.imagery_opacity = clamp_imagery_opacity(opacity)
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
+            return
+        generation = self._render_generation
+        value = json.dumps(self.imagery_opacity)
+        self._page.runJavaScript(
+            "(() => {"
+            f"if (window.sloppyGpsRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyGpsMap;"
+            "return api && typeof api.setImageryOpacity === 'function' "
+            f"? api.setImageryOpacity({value}) : false;"
+            "})();"
+        )
+
+    def _reapply_basemap_controls(self) -> None:
+        GpsPathWidget.set_basemap(
+            self,
+            getattr(self, "basemap", BASEMAP_OPENSTREETMAP),
+        )
+        GpsPathWidget.set_imagery_opacity(
+            self,
+            getattr(self, "imagery_opacity", 1.0),
+        )
 
     def set_cursor(self, cursor: dict[str, Any]) -> None:
         self._last_cursor = dict(cursor)
@@ -524,14 +609,30 @@ class GpsPathWidget(QWidget):
         self.refresh_viewport(fit=fit)
 
     def _map_page_loaded(self, ok: bool) -> None:
-        if ok:
-            self._schedule_viewport_refresh(fit=True)
-            if self._last_cursor is not None:
-                self.set_cursor(self._last_cursor)
+        page = self._page
+        if not ok or page is None:
+            return
+        page.runJavaScript(
+            "String(window.sloppyGpsRenderGeneration || '');",
+            self._map_page_generation_loaded,
+        )
+
+    def _map_page_generation_loaded(self, result: object) -> None:
+        try:
+            generation = int(result) if isinstance(result, str) else -1
+        except ValueError:
+            return
+        if generation != self._render_generation:
+            return
+        self._loaded_render_generation = generation
+        GpsPathWidget._reapply_basemap_controls(self)
+        self._schedule_viewport_refresh(fit=True)
+        if self._last_cursor is not None:
+            self.set_cursor(self._last_cursor)
 
     def showEvent(self, a0) -> None:
         super().showEvent(a0)
-        self._schedule_viewport_refresh(fit=True)
+        self._schedule_viewport_refresh(fit=False)
 
     def resizeEvent(self, a0) -> None:
         super().resizeEvent(a0)
@@ -553,12 +654,15 @@ class ReceptionMapWidget(QWidget):
         self.payload: dict[str, object] | None = None
         self.dark = True
         self.opacity = 0.72
+        self.basemap = BASEMAP_OPENSTREETMAP
+        self.imagery_opacity = 1.0
         self._view: QWebEngineView | QTextEdit
         self._html_path: Path | None = None
         self._page: QWebEnginePage | None = None
         self._ready = False
         self._ready_state: dict[str, object] | None = None
         self._render_generation = 0
+        self._loaded_render_generation = -1
         self._ready_poll_attempts = 0
         self._ready_poll_timer = QTimer(self)
         self._ready_poll_timer.setSingleShot(True)
@@ -568,7 +672,9 @@ class ReceptionMapWidget(QWidget):
         self._viewport_refresh_timer.setSingleShot(True)
         self._viewport_refresh_timer.timeout.connect(self._run_scheduled_viewport_refresh)
         self._auto_fitted_generation = -1
-        self.setMinimumHeight(420)
+        # The expanded normalization form must still fit on an 800px display.
+        # The layout gives the map all spare space on larger windows.
+        self.setMinimumHeight(240)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -610,15 +716,34 @@ class ReceptionMapWidget(QWidget):
             except (TypeError, ValueError):
                 opacity = fallback_opacity
             self.opacity = max(0.0, min(1.0, opacity))
+            self.basemap = normalize_basemap(
+                self.payload.get("basemap", getattr(self, "basemap", BASEMAP_OPENSTREETMAP))
+            )
+            self.imagery_opacity = clamp_imagery_opacity(
+                self.payload.get(
+                    "imagery_opacity",
+                    self.payload.get("imageryOpacity", getattr(self, "imagery_opacity", 1.0)),
+                )
+            )
         self.dark = dark
         self._render_generation += 1
+        self._loaded_render_generation = -1
         self._ready_poll_timer.stop()
         self._ready_poll_attempts = 0
         self._ready_state = None
         self._auto_fitted_generation = -1
         self._set_ready(False)
-        html_document = build_reception_map_html(self.payload, dark=dark)
+        render_payload = dict(self.payload) if self.payload is not None else None
+        if render_payload is not None:
+            render_payload["basemap"] = self.basemap
+            render_payload["imagery_opacity"] = self.imagery_opacity
+        html_document = build_reception_map_html(render_payload, dark=dark)
         if self._web_engine:
+            marker = (
+                "<script>window.sloppyReceptionRenderGeneration = "
+                f"{self._render_generation};</script>"
+            )
+            html_document = html_document.replace("<head>", f"<head>{marker}", 1)
             previous_path = self._html_path
             self._html_path = _write_temp_html(html_document, "reception-map-")
             cast(QWebEngineView, self._view).setUrl(QUrl.fromLocalFile(str(self._html_path)))
@@ -636,11 +761,21 @@ class ReceptionMapWidget(QWidget):
         self.opacity = max(0.0, min(1.0, numeric))
         if self.payload is not None:
             self.payload["opacity"] = self.opacity
-        if not self._web_engine or self._page is None:
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
             return
+        generation = self._render_generation
         value = json.dumps(self.opacity)
         self._page.runJavaScript(
-            f"window.sloppyReceptionMap ? window.sloppyReceptionMap.setOpacity({value}) : false;"
+            "(() => {"
+            f"if (window.sloppyReceptionRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyReceptionMap;"
+            "return api && typeof api.setOpacity === 'function' "
+            f"? api.setOpacity({value}) : false;"
+            "})();"
         )
 
     def set_color_scale(
@@ -670,11 +805,99 @@ class ReceptionMapWidget(QWidget):
             else:
                 self.payload["range_min"] = minimum_value
                 self.payload["range_max"] = maximum_value
-        if not self._web_engine or self._page is None:
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
             return
+        generation = self._render_generation
         data = json.dumps(options, allow_nan=False, separators=(",", ":"))
         self._page.runJavaScript(
-            f"window.sloppyReceptionMap ? window.sloppyReceptionMap.setColorScale({data}) : false;"
+            "(() => {"
+            f"if (window.sloppyReceptionRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyReceptionMap;"
+            "return api && typeof api.setColorScale === 'function' "
+            f"? api.setColorScale({data}) : false;"
+            "})();"
+        )
+
+    def _reapply_live_controls(self) -> None:
+        """Apply the latest controls after the current map document loads."""
+        ReceptionMapWidget.set_basemap(
+            self,
+            getattr(self, "basemap", BASEMAP_OPENSTREETMAP),
+        )
+        ReceptionMapWidget.set_imagery_opacity(
+            self,
+            getattr(self, "imagery_opacity", 1.0),
+        )
+        ReceptionMapWidget.set_opacity(self, self.opacity)
+        payload = self.payload
+        if payload is None:
+            return
+        auto_range = payload.get("auto_range", True) is not False
+        minimum_key = "value_min" if auto_range else "range_min"
+        maximum_key = "value_max" if auto_range else "range_max"
+        raw_minimum = payload.get(minimum_key, 0.0)
+        raw_maximum = payload.get(maximum_key, 1.0)
+        try:
+            minimum = float(raw_minimum) if isinstance(raw_minimum, (int, float, str)) else 0.0
+            maximum = float(raw_maximum) if isinstance(raw_maximum, (int, float, str)) else 1.0
+        except (TypeError, ValueError):
+            minimum, maximum = 0.0, 1.0
+        if not math.isfinite(minimum) or not math.isfinite(maximum):
+            minimum, maximum = 0.0, 1.0
+        ReceptionMapWidget.set_color_scale(
+            self,
+            auto_range,
+            minimum,
+            maximum,
+            bool(payload.get("reverse", False)),
+        )
+
+    def set_basemap(self, basemap: str) -> None:
+        """Switch the live reception basemap without rebuilding the heatmap."""
+        self.basemap = normalize_basemap(basemap)
+        if self.payload is not None:
+            self.payload["basemap"] = self.basemap
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
+            return
+        generation = self._render_generation
+        value = json.dumps(self.basemap)
+        self._page.runJavaScript(
+            "(() => {"
+            f"if (window.sloppyReceptionRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyReceptionMap;"
+            "return api && typeof api.setBasemap === 'function' "
+            f"? api.setBasemap({value}) : false;"
+            "})();"
+        )
+
+    def set_imagery_opacity(self, opacity: float) -> None:
+        """Update imagery opacity without changing reception cell opacity."""
+        self.imagery_opacity = clamp_imagery_opacity(opacity)
+        if self.payload is not None:
+            self.payload["imagery_opacity"] = self.imagery_opacity
+        if (
+            not self._web_engine
+            or self._page is None
+            or self._loaded_render_generation != self._render_generation
+        ):
+            return
+        generation = self._render_generation
+        value = json.dumps(self.imagery_opacity)
+        self._page.runJavaScript(
+            "(() => {"
+            f"if (window.sloppyReceptionRenderGeneration !== {generation}) return false;"
+            "const api = window.sloppyReceptionMap;"
+            "return api && typeof api.setImageryOpacity === 'function' "
+            f"? api.setImageryOpacity({value}) : false;"
+            "})();"
         )
 
     def refresh_viewport(self, fit: bool = False) -> None:
@@ -704,9 +927,24 @@ class ReceptionMapWidget(QWidget):
         self.refresh_viewport(fit=fit)
 
     def _map_page_loaded(self, ok: bool) -> None:
-        if not ok:
-            self._set_ready(False)
+        page = self._page
+        if not ok or page is None:
             return
+        page.runJavaScript(
+            "window.sloppyReceptionMap "
+            "? String(window.sloppyReceptionRenderGeneration || '') : '';",
+            self._map_page_generation_loaded,
+        )
+
+    def _map_page_generation_loaded(self, result: object) -> None:
+        try:
+            generation = int(result) if isinstance(result, str) else -1
+        except ValueError:
+            return
+        if generation != self._render_generation:
+            return
+        self._loaded_render_generation = generation
+        ReceptionMapWidget._reapply_live_controls(self)
         self._schedule_viewport_refresh(fit=True)
         self._ready_poll_attempts = 0
         self._poll_ready_state()

@@ -5,12 +5,12 @@ from __future__ import annotations
 import html
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
+from .map_basemaps import BASEMAP_RUNTIME_JAVASCRIPT, build_basemap_config
 
-OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
 MAP_MAX_ZOOM = 22
 MAP_FIT_MAX_ZOOM = 17
 DEFAULT_CELL_SIZE_METERS = 5.0
@@ -42,7 +42,10 @@ def _message_html(message: str, dark: bool, state: str) -> str:
     window.sloppyReceptionMap = {{
       fit: function() {{ return false; }},
       refresh: function() {{ return false; }},
+      setOpacity: function() {{ return false; }},
       setColorScale: function() {{ return false; }},
+      setBasemap: function() {{ return false; }},
+      setImageryOpacity: function() {{ return false; }},
       getState: function() {{
         return {{state: {state_json}, ready: false, cellCount: 0, layers: {{fill: false, outline: false}}}};
       }}
@@ -55,7 +58,7 @@ def _message_html(message: str, dark: bool, state: str) -> str:
 
 def _json_for_script(value: Any) -> str:
     """Serialize strict JSON without allowing a payload to end the script tag."""
-    return json.dumps(value, allow_nan=False, separators=(",", ":")).replace("</", "<\\/")
+    return json.dumps(value, allow_nan=False, separators=(",", ":")).replace("<", "\\u003c")
 
 
 def build_reception_map_html(payload: dict[str, object] | None, dark: bool = True) -> str:
@@ -128,9 +131,10 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     border = "rgba(255,255,255,0.22)" if dark else "rgba(0,0,0,0.20)"
     outline = "rgba(255,255,255,0.36)" if dark else "rgba(17,24,39,0.42)"
     css_uri = html.escape(_asset_uri("maplibre-gl.css"), quote=True)
-    js_uri = html.escape(_asset_uri("maplibre-gl-csp.js"), quote=True)
-    worker_uri_json = _json_for_script(_asset_uri("maplibre-gl-csp-worker.js"))
+    js_uri = json.dumps(_asset_uri("maplibre-gl.mjs"))
+    worker_uri_json = _json_for_script(_asset_uri("maplibre-gl-worker.mjs"))
     data_json = _json_for_script(payload)
+    basemap_config_json = _json_for_script(build_basemap_config(payload))
 
     document = r"""
 <!doctype html>
@@ -139,7 +143,6 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="__MAPLIBRE_CSS_URI__">
-  <script src="__MAPLIBRE_JS_URI__"></script>
   <style>
     html, body {
       width: 100%;
@@ -212,6 +215,18 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     .maplibregl-popup-tip { display: none; }
     .hover-title { margin-bottom: 3px; font-weight: 600; }
     .hover-row { white-space: nowrap; }
+    #basemap-attribution {
+      position: absolute;
+      right: 8px;
+      bottom: 2px;
+      z-index: 10;
+      border-radius: 3px;
+      padding: 2px 4px;
+      background: rgba(255,255,255,0.84);
+      color: #111827;
+      font-size: 11px;
+    }
+    #basemap-attribution a { color: #0645ad; }
   </style>
 </head>
 <body>
@@ -223,14 +238,13 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     <div class="legend-range"><span id="legend-min"></span><span id="legend-max"></span></div>
     <div id="legend-detail" class="legend-detail"></div>
   </section>
-  <script>
-    const maplibreWorkerUrl = __MAPLIBRE_WORKER_URI__;
-    if (typeof maplibregl.setWorkerUrl === "function") {
-      maplibregl.setWorkerUrl(maplibreWorkerUrl);
-    } else {
-      maplibregl.workerUrl = maplibreWorkerUrl;
-    }
+  <div id="basemap-attribution" aria-label="Active basemap attribution"></div>
+  <script type="module">
+    import * as maplibregl from __MAPLIBRE_JS_URI__;
+    window.maplibregl = maplibregl;
+    maplibregl.setWorkerUrl(__MAPLIBRE_WORKER_URI__);
     const receptionData = __RECEPTION_DATA__;
+    const basemapConfig = __BASEMAP_CONFIG__;
     const mapMaxZoom = 22;
     const fitMaxZoom = 17;
     const defaultCellSizeMeters = 5;
@@ -244,7 +258,10 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     const legendMin = document.getElementById("legend-min");
     const legendMax = document.getElementById("legend-max");
     const legendDetail = document.getElementById("legend-detail");
+    const basemapAttributionElement = document.getElementById("basemap-attribution");
     let map = null;
+__BASEMAP_RUNTIME__
+    window.handleBasemapError = handleBasemapError;
     let mapState = "loading";
     let mapError = null;
     let layersAdded = false;
@@ -529,17 +546,15 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     function buildRasterBaseStyle() {
       return {
         version: 8,
-        sources: {
-          "osm-raster": {
-            type: "raster",
-            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
-            tileSize: 256,
-            minzoom: 0,
-            maxzoom: 19,
-            attribution: "&copy; OpenStreetMap contributors"
-          }
-        },
-        layers: [{id: "osm-raster", type: "raster", source: "osm-raster", minzoom: 0}]
+        sources: basemapConfig.sources,
+        layers: [
+          {
+            id: "background",
+            type: "background",
+            paint: {"background-color": "__BACKGROUND__"}
+          },
+          ...basemapRasterLayers()
+        ]
       };
     }
 
@@ -856,6 +871,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         } : null,
         viewportRadiusMeters: visibleViewportRadiusMeters(viewportFocus),
         opacity: heatmapOpacity,
+        basemap: basemapDebugState(),
         error: mapError
       };
     }
@@ -897,11 +913,11 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       });
       window.__sloppyReceptionDebugMap = map;
       map.addControl(new maplibregl.NavigationControl({showCompass: false}), "top-right");
-      map.addControl(new maplibregl.AttributionControl({
-        compact: true,
-        customAttribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
-      }), "bottom-right");
+      updateBasemapAttribution();
+      map.on("moveend", updateBasemapAttribution);
+      map.on("style.load", reapplyBasemapState);
       map.on("error", (event) => {
+        if (handleBasemapError(event)) return;
         const details = event && event.error && (event.error.message || String(event.error));
         if (details) mapError = details;
       });
@@ -921,9 +937,9 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       };
       map.once("style.load", revealCells);
       map.once("load", revealCells);
-      map.once("idle", () => refreshMapViewport({fit: true}));
-      window.setTimeout(() => refreshMapViewport({fit: true}), 250);
-      window.setTimeout(() => refreshMapViewport({fit: true}), 900);
+      map.once("idle", () => refreshMapViewport({fit: false}));
+      window.setTimeout(() => refreshMapViewport({fit: false}), 250);
+      window.setTimeout(() => refreshMapViewport({fit: false}), 900);
     }
 
     window.sloppyReceptionMap = {
@@ -931,6 +947,8 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
       refresh: refreshMapViewport,
       setOpacity,
       setColorScale,
+      setBasemap,
+      setImageryOpacity,
       getState: debugState
     };
 
@@ -950,6 +968,8 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         "__MAPLIBRE_JS_URI__": js_uri,
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__RECEPTION_DATA__": data_json,
+        "__BASEMAP_CONFIG__": basemap_config_json,
+        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,
@@ -957,6 +977,5 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
         "__BORDER__": border,
         "__OUTLINE__": outline,
     }
-    for token, value in replacements.items():
-        document = document.replace(token, value)
-    return document
+    # Never substitute token-like telemetry labels after inserting their JSON.
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements.get(match[0], match[0]), document)

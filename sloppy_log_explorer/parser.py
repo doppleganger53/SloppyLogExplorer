@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import csv
-import math
 import re
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .models import GpsColumns, LoadedLog, LogFileInfo
@@ -50,7 +51,7 @@ def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     normalized = [str(column).strip() for column in df.columns]
     keep = [bool(column) and re.match(r"^Unnamed", column) is None for column in normalized]
     df = df.loc[:, keep].copy()
-    df.columns = [column for column, should_keep in zip(normalized, keep) if should_keep]
+    df.columns = _deduplicate_columns([column for column, should_keep in zip(normalized, keep) if should_keep])
     return df
 
 
@@ -64,39 +65,49 @@ def _coerce_numeric_series(series: pd.Series | pd.DataFrame) -> pd.Series:
 def _coerce_datetime_series(series: pd.Series | pd.DataFrame) -> pd.Series:
     if isinstance(series, pd.DataFrame):
         series = series.iloc[:, 0]
-    parsed = pd.to_datetime(series, errors="coerce")
+    # Normalize explicit timezone offsets to UTC while retaining naive clock
+    # values; mixed fractional-second formats occur in real transmitter logs.
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed", utc=True).dt.tz_localize(None)
     return pd.Series(parsed, index=series.index)
 
 
 def _deduplicate_columns(columns: list[str]) -> list[str]:
+    names = [str(column).strip() or f"Unnamed: {index}" for index, column in enumerate(columns)]
+    reserved = set(names)
+    used: set[str] = set()
     counts: dict[str, int] = {}
     result: list[str] = []
-    for index, column in enumerate(columns):
-        name = str(column).strip()
-        if not name:
-            name = f"Unnamed: {index}"
-        if name in counts:
-            counts[name] += 1
-            result.append(f"{name}.{counts[name]}")
-        else:
-            counts[name] = 0
-            result.append(name)
+    for name in names:
+        candidate = name
+        if candidate in used:
+            suffix = counts.get(name, 0) + 1
+            while f"{name}.{suffix}" in reserved or f"{name}.{suffix}" in used:
+                suffix += 1
+            counts[name] = suffix
+            candidate = f"{name}.{suffix}"
+        used.add(candidate)
+        result.append(candidate)
     return result
+
+
+def _csv_delimiter(path: Path) -> str:
+    # Inspect the header so uneven data rows cannot defeat delimiter detection.
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        header = next((line for line in handle if line.strip()), "")
+    try:
+        return csv.Sniffer().sniff(header, delimiters=",;\t").delimiter
+    except csv.Error:
+        return ","
 
 
 def _read_ragged_csv(path: Path) -> pd.DataFrame:
     # FrSky-style exports sometimes have uneven rows or delimiter drift, so we
     # fall back to the stdlib csv reader when pandas cannot infer the layout.
+    delimiter = _csv_delimiter(path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        sample = handle.read(4096)
-        handle.seek(0)
+        reader = csv.reader(handle, delimiter=delimiter)
         try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-        except csv.Error:
-            dialect = csv.excel
-        reader = csv.reader(handle, dialect)
-        try:
-            header = next(reader)
+            header = next(row for row in reader if any(value.strip() for value in row))
         except StopIteration:
             return pd.DataFrame()
 
@@ -115,8 +126,13 @@ def _read_ragged_csv(path: Path) -> pd.DataFrame:
 
 def _read_csv(path: Path) -> pd.DataFrame:
     try:
-        return pd.read_csv(path, low_memory=False)
-    except Exception:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", pd.errors.ParserWarning)
+            return pd.read_csv(
+                path, sep=_csv_delimiter(path), encoding="utf-8-sig",
+                low_memory=False, index_col=False,
+            )
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, pd.errors.ParserWarning):
         return _read_ragged_csv(path)
 
 
@@ -190,22 +206,33 @@ def _detect_time(df: pd.DataFrame) -> tuple[pd.Series | None, frozenset[str]]:
         raw = df[col]
         numeric = _coerce_numeric_series(raw)
         numeric_value_count = numeric.notna().sum()
-        finite_mask = numeric.map(
-            lambda value: bool(pd.notna(value) and math.isfinite(float(value)))
-        )
-        numeric = numeric.where(finite_mask)
+        # Pandas' float conversion can overflow even with errors='coerce'.
+        # A nanosecond timedelta cannot represent more than ~292 years.
+        numeric = numeric.where(np.isfinite(numeric) & numeric.between(-9_223_372_036, 9_223_372_036))
         if numeric.notna().sum() >= max(1, len(df) // 3):
             # Some exports store elapsed seconds as a bare number; convert them
             # to timestamps anchored at the Unix epoch so Plotly can format them.
             base = pd.Timestamp("1970-01-01")
             return (
-                pd.Series(base + pd.to_timedelta(numeric.fillna(0), unit="s"), index=numeric.index),
+                pd.Series(base + pd.to_timedelta(numeric, unit="s", errors="coerce"), index=numeric.index),
                 frozenset((col,)),
             )
         if numeric_value_count == raw.notna().sum() and raw.notna().any():
             # A wholly numeric-looking column containing only non-finite or too
             # sparse values cannot become a valid datetime by reparsing it.
             continue
+        text = raw.astype("string").str.strip()
+        clock_values = text.str.fullmatch(r"\d{1,2}:\d{2}:\d{2}(?:\.\d+)?").fillna(False)
+        if clock_values.sum() >= max(1, len(df) // 3):
+            elapsed = pd.to_timedelta(text.where(clock_values), errors="coerce")
+            # A time-only export has no date to carry midnight rollover. A
+            # backwards jump of over 12 hours identifies a new day without
+            # hiding ordinary out-of-order samples.
+            rollovers = elapsed.ffill().diff().lt(-pd.Timedelta(hours=12)).cumsum()
+            return (
+                pd.Series(pd.Timestamp("1970-01-01") + elapsed + pd.to_timedelta(rollovers, unit="D")),
+                frozenset((col,)),
+            )
         parsed = _coerce_datetime_series(raw)
         if parsed.notna().sum() >= max(1, len(df) // 3):
             return parsed, frozenset((col,))
@@ -242,13 +269,13 @@ def _numeric_columns(df: pd.DataFrame, timeline_columns: frozenset[str]) -> list
         if col in timeline_columns:
             continue
         converted = _coerce_numeric_series(df[col])
-        finite_values = converted.dropna().map(math.isfinite)
+        finite_values = np.isfinite(converted)
         if finite_values.any():
             if _should_preserve_coordinate_text_column(col, df[col], converted):
                 continue
             # Coerce in place so downstream plotting and GPS heuristics can use
             # a stable numeric dtype instead of re-parsing each column later.
-            df[col] = converted
+            df[col] = converted.where(finite_values)
             numeric.append(col)
     return numeric
 
@@ -701,7 +728,7 @@ def relative_seconds(log: LoadedLog) -> list[float]:
         # even when the source log has sparse timestamp holes.
         clean = log.time.ffill().bfill()
         start = clean.iloc[0]
-        return [max(0.0, float((value - start).total_seconds())) for value in clean]
+        return (clean - start).dt.total_seconds().clip(lower=0).to_list()
     return [float(i) for i in range(len(log.dataframe))]
 
 

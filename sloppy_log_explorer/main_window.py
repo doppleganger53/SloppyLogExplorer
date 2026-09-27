@@ -4,6 +4,7 @@ import html
 import json
 import math
 import re
+import sqlite3
 import time
 import traceback
 from bisect import bisect_left, bisect_right
@@ -58,6 +59,7 @@ from .analysis import (
     suggest_display_columns,
 )
 from .library import group_by_model, scan_library
+from .map_basemaps import BASEMAP_CHOICES, BASEMAP_IMAGERY, BASEMAP_OPENSTREETMAP
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
 from .qt_plot import GpsPathWidget, ReceptionMapWidget, TelemetryPlotWidget
@@ -175,6 +177,8 @@ class MainWindow(QMainWindow):
         self.telemetry_axis_ungrouped_columns: set[str] = set()
         self.statistics_excluded_columns: set[str] = set()
         self._deferred_views_dirty: set[str] = set()
+        self._flight_notes_path: str | None = None
+        self._flight_notes_saved = ("", "")
         self._gps_view_loaded = False
         self.gps_start_color = GpsGradientOptions.start_color
         self.gps_end_color = GpsGradientOptions.end_color
@@ -518,15 +522,39 @@ class MainWindow(QMainWindow):
         marker_row.addStretch()
         layout.addLayout(marker_row)
 
+        basemap_row = QHBoxLayout()
+        basemap_row.addWidget(QLabel("Basemap"))
+        self.gps_basemap_combo = QComboBox()
+        for label, value in BASEMAP_CHOICES:
+            self.gps_basemap_combo.addItem(label, value)
+        basemap_row.addWidget(self.gps_basemap_combo)
+        basemap_row.addWidget(QLabel("Imagery opacity"))
+        self.gps_imagery_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.gps_imagery_opacity_slider.setRange(0, 100)
+        self.gps_imagery_opacity_slider.setValue(100)
+        self.gps_imagery_opacity_slider.setSingleStep(1)
+        self.gps_imagery_opacity_slider.setPageStep(10)
+        basemap_row.addWidget(self.gps_imagery_opacity_slider, 1)
+        self.gps_imagery_opacity_label = QLabel("100%")
+        self.gps_imagery_opacity_label.setMinimumWidth(42)
+        basemap_row.addWidget(self.gps_imagery_opacity_label)
+        basemap_row.addStretch()
+        layout.addLayout(basemap_row)
+
         self.gps_view = GpsPathWidget()
         self.gps_view.elapsed_seeked.connect(self.seek_gps_elapsed)
         self.gps_view.playing_changed.connect(self.set_gps_playback_playing)
         self.gps_view.speed_changed.connect(self.set_gps_playback_speed)
         layout.addWidget(self.gps_view, 1)
+        self.gps_basemap_combo.currentIndexChanged.connect(self.gps_basemap_changed)
+        self.gps_imagery_opacity_slider.valueChanged.connect(
+            self.gps_imagery_opacity_changed
+        )
         self.gps_tab = tab
         self.tabs.addTab(tab, "Flight Map")
         self._update_gps_color_buttons()
         self._update_gps_range_enabled()
+        self._update_gps_basemap_controls()
         self.populate_gps_value_combos()
 
     def _build_reception_tab(self) -> None:
@@ -555,6 +583,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(scan_row)
 
         selection = QFormLayout()
+        self.reception_selection_layout = selection
         self.reception_site_combo = QComboBox()
         self.reception_site_combo.currentIndexChanged.connect(self.reception_site_changed)
         selection.addRow("Flying site", self.reception_site_combo)
@@ -579,13 +608,15 @@ class MainWindow(QMainWindow):
         self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
         selection.addRow("Telemetry item", self.reception_channel_combo)
 
-        normalize_row = QHBoxLayout()
         self.reception_normalize_check = QCheckBox("Normalize")
         self.reception_normalize_check.toggled.connect(self.reception_normalization_changed)
-        normalize_row.addWidget(self.reception_normalize_check)
+        selection.addRow("", self.reception_normalize_check)
+
+        reference_row = QHBoxLayout()
+        self.reception_reference_row = reference_row
         self.reception_reference_combo = QComboBox()
         self.reception_reference_combo.currentIndexChanged.connect(self.reception_normalization_changed)
-        normalize_row.addWidget(self.reception_reference_combo, 1)
+        reference_row.addWidget(self.reception_reference_combo, 1)
         self.reception_normalization_mode_combo = QComboBox()
         self.reception_normalization_mode_combo.addItem("Ratio", "ratio")
         self.reception_normalization_mode_combo.addItem("Difference", "difference")
@@ -593,10 +624,12 @@ class MainWindow(QMainWindow):
         self.reception_normalization_mode_combo.currentIndexChanged.connect(
             self.reception_normalization_changed
         )
-        normalize_row.addWidget(self.reception_normalization_mode_combo)
-        selection.addRow("Reference", normalize_row)
+        reference_row.addWidget(self.reception_normalization_mode_combo)
+        self.reception_reference_label = QLabel("Reference")
+        selection.addRow(self.reception_reference_label, reference_row)
 
         reference_range_row = QHBoxLayout()
+        self.reception_reference_range_row = reference_range_row
         self.reception_reference_auto_range_check = QCheckBox("Auto reference range")
         self.reception_reference_auto_range_check.setChecked(True)
         self.reception_reference_auto_range_check.toggled.connect(
@@ -653,6 +686,25 @@ class MainWindow(QMainWindow):
         range_row.addStretch()
         layout.addLayout(range_row)
 
+        basemap_row = QHBoxLayout()
+        basemap_row.addWidget(QLabel("Basemap"))
+        self.reception_basemap_combo = QComboBox()
+        for label, value in BASEMAP_CHOICES:
+            self.reception_basemap_combo.addItem(label, value)
+        basemap_row.addWidget(self.reception_basemap_combo)
+        basemap_row.addWidget(QLabel("Imagery opacity"))
+        self.reception_imagery_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.reception_imagery_opacity_slider.setRange(0, 100)
+        self.reception_imagery_opacity_slider.setValue(100)
+        self.reception_imagery_opacity_slider.setSingleStep(1)
+        self.reception_imagery_opacity_slider.setPageStep(10)
+        basemap_row.addWidget(self.reception_imagery_opacity_slider, 1)
+        self.reception_imagery_opacity_label = QLabel("100%")
+        self.reception_imagery_opacity_label.setMinimumWidth(42)
+        basemap_row.addWidget(self.reception_imagery_opacity_label)
+        basemap_row.addStretch()
+        layout.addLayout(basemap_row)
+
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Heatmap opacity"))
         self.reception_opacity_slider = QSlider(Qt.Orientation.Horizontal)
@@ -674,10 +726,17 @@ class MainWindow(QMainWindow):
 
         self.reception_view = ReceptionMapWidget()
         layout.addWidget(self.reception_view, 1)
+        self.reception_basemap_combo.currentIndexChanged.connect(
+            self.reception_basemap_changed
+        )
+        self.reception_imagery_opacity_slider.valueChanged.connect(
+            self.reception_imagery_opacity_changed
+        )
         self.reception_tab = tab
-        self.tabs.addTab(tab, "Reception Map")
+        self.tabs.addTab(tab, "HeatMap")
         self._update_reception_range_enabled()
         self._update_reception_normalization_enabled()
+        self._update_reception_basemap_controls()
         self._update_reception_generate_enabled()
 
     @staticmethod
@@ -729,6 +788,12 @@ class MainWindow(QMainWindow):
         self._reception_map_payload = dict(payload) if payload is not None else None
         if self._reception_map_payload is not None:
             self._reception_map_payload["opacity"] = self.reception_opacity_slider.value() / 100.0
+            self._reception_map_payload["basemap"] = str(
+                self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
+            )
+            self._reception_map_payload["imagery_opacity"] = (
+                self.reception_imagery_opacity_slider.value() / 100.0
+            )
         if not force and not self._tab_is_active("reception_tab"):
             self._reception_view_loaded = False
             return
@@ -845,6 +910,27 @@ class MainWindow(QMainWindow):
         if self._reception_map_payload is not None:
             self._reception_map_payload["opacity"] = opacity
         self.reception_view.set_opacity(opacity)
+
+    def reception_basemap_changed(self, *_args) -> None:
+        basemap = str(
+            self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
+        )
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["basemap"] = basemap
+        self.reception_view.set_basemap(basemap)
+        self._update_reception_basemap_controls()
+
+    def reception_imagery_opacity_changed(self, value: int) -> None:
+        opacity = max(0.0, min(1.0, int(value) / 100.0))
+        self.reception_imagery_opacity_label.setText(f"{int(value)}%")
+        if self._reception_map_payload is not None:
+            self._reception_map_payload["imagery_opacity"] = opacity
+        self.reception_view.set_imagery_opacity(opacity)
+
+    def _update_reception_basemap_controls(self) -> None:
+        self.reception_imagery_opacity_slider.setEnabled(
+            self.reception_basemap_combo.currentData() == BASEMAP_IMAGERY
+        )
 
     def reception_color_scale_changed(self, *_args) -> None:
         self._update_reception_range_enabled()
@@ -992,6 +1078,14 @@ class MainWindow(QMainWindow):
     def _update_reception_normalization_enabled(self, *_args) -> None:
         normalize = self.reception_normalize_check.isChecked()
         has_references = self.reception_reference_combo.count() > 0
+        self.reception_selection_layout.setRowVisible(
+            self.reception_reference_row,
+            normalize,
+        )
+        self.reception_selection_layout.setRowVisible(
+            self.reception_reference_range_row,
+            normalize,
+        )
         self.reception_reference_combo.setEnabled(normalize and has_references)
         self.reception_normalization_mode_combo.setEnabled(normalize and has_references)
         ratio = normalize and self.reception_normalization_mode_combo.currentData() == "ratio"
@@ -1379,12 +1473,14 @@ class MainWindow(QMainWindow):
         self.battery_table.setHorizontalHeaderLabels(["ID", "Name", "Cells", "Active"])
         self._horizontal_header(self.battery_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.battery_table)
+        self.battery_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.battery_table, 1)
 
         self.history_table = QTableWidget(0, 6)
         self.history_table.setHorizontalHeaderLabels(["Battery", "Date", "Pack mOhm", "Cell mOhm", "Health", "Log"])
         self._horizontal_header(self.history_table).setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self._configure_sortable_table(self.history_table)
+        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(self.history_table, 2)
         self.tabs.addTab(tab, "Batteries")
         self.refresh_batteries()
@@ -1412,7 +1508,10 @@ class MainWindow(QMainWindow):
         self._horizontal_header(self.sync_table).setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.sync_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.sync_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.sync_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._configure_sortable_table(self.sync_table)
+        self.sync_source.textChanged.connect(self._clear_sync_candidates)
+        self.sync_target.textChanged.connect(self._clear_sync_candidates)
         layout.addWidget(self.sync_table)
         self.tabs.addTab(tab, "SD Sync")
 
@@ -1422,7 +1521,9 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         self.alias_profile = QComboBox()
         self.alias_profile.setEditable(True)
-        self.alias_profile.currentTextChanged.connect(self.load_alias_profile)
+        # Typing a new name is Save As: keep the current draft until the user
+        # explicitly selects an existing profile from the dropdown.
+        self.alias_profile.textActivated.connect(self.load_alias_profile)
         save = QPushButton("Save Profile")
         save.clicked.connect(self.save_alias_profile)
         row.addWidget(QLabel("Alias profile"))
@@ -1510,6 +1611,21 @@ class MainWindow(QMainWindow):
     def gps_marker_values_changed(self, *_args) -> None:
         self.sync_gps_cursor()
 
+    def gps_basemap_changed(self, *_args) -> None:
+        basemap = str(self.gps_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP)
+        self.gps_view.set_basemap(basemap)
+        self._update_gps_basemap_controls()
+
+    def gps_imagery_opacity_changed(self, value: int) -> None:
+        opacity = max(0.0, min(1.0, int(value) / 100.0))
+        self.gps_imagery_opacity_label.setText(f"{int(value)}%")
+        self.gps_view.set_imagery_opacity(opacity)
+
+    def _update_gps_basemap_controls(self) -> None:
+        self.gps_imagery_opacity_slider.setEnabled(
+            self.gps_basemap_combo.currentData() == BASEMAP_IMAGERY
+        )
+
     def populate_gps_value_combos(self) -> None:
         current_values = [combo.currentText() for combo in self.gps_marker_value_combos]
         for index, combo in enumerate(self.gps_marker_value_combos):
@@ -1532,7 +1648,6 @@ class MainWindow(QMainWindow):
         self.refresh_gps()
 
     def gps_midpoint_changed(self, *_args) -> None:
-        self._populate_gps_range_defaults()
         self._update_gps_range_enabled()
         self.refresh_gps()
 
@@ -1556,6 +1671,7 @@ class MainWindow(QMainWindow):
             return
         series = self.current_log.dataframe[color_column]
         values = series.dropna()
+        values = values[(values > -math.inf) & (values < math.inf)]
         if values.empty:
             return
         # Seed the manual range controls from the current data so the user can
@@ -1611,7 +1727,11 @@ class MainWindow(QMainWindow):
         return float(self.gps_timeline_seconds[safe_index])
 
     def _gps_duration_seconds(self) -> float:
-        return max(self.gps_timeline_seconds) if self.gps_timeline_seconds else 0.0
+        if not self.gps_timeline_seconds:
+            return 0.0
+        if self.gps_timeline_is_monotonic:
+            return self.gps_timeline_seconds[-1]
+        return max(self.gps_timeline_seconds)
 
     def _gps_playback_scope_bounds(self) -> tuple[float, float]:
         duration = self._gps_duration_seconds()
@@ -1675,6 +1795,8 @@ class MainWindow(QMainWindow):
                 clean_value = value.item()
             else:
                 clean_value = value
+            if isinstance(clean_value, float) and not math.isfinite(clean_value):
+                clean_value = None
             values.append({"label": column, "value": clean_value})
         return values
 
@@ -1795,6 +1917,9 @@ class MainWindow(QMainWindow):
             QMenuBar, QMenu, QStatusBar { background: #181b20; color: #e5e7eb; }
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
             QPushButton:hover { background: #3f8df2; }
+            QPushButton:disabled { background: #303640; color: #838b98; }
+            QProgressBar { background: #15181d; color: #e5e7eb; border: 1px solid #3a414d; border-radius: 3px; text-align: center; }
+            QProgressBar::chunk { background: #185fc7; }
             QPushButton:checked { background: #185fc7; border: 1px solid #87b7ff; padding: 6px 9px; }
             QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget, QTableView {
                 background: #15181d; color: #e5e7eb; border: 1px solid #3a414d; border-radius: 4px;
@@ -1813,6 +1938,9 @@ class MainWindow(QMainWindow):
             QMenuBar, QMenu, QStatusBar { background: #ffffff; color: #1f2937; border-bottom: 1px solid #d7dde7; }
             QPushButton { background: #2f80ed; color: white; border: 0; border-radius: 4px; padding: 7px 10px; }
             QPushButton:hover { background: #1f6fd4; }
+            QPushButton:disabled { background: #d9dfe8; color: #737d8c; }
+            QProgressBar { background: #e8edf4; color: #1f2937; border: 1px solid #c9d2df; border-radius: 3px; text-align: center; }
+            QProgressBar::chunk { background: #97c1fb; }
             QPushButton:checked { background: #185fc7; border: 1px solid #0f4fb0; padding: 6px 9px; }
             QLineEdit, QTextEdit, QComboBox, QTreeWidget, QTableWidget, QTableView {
                 background: #ffffff; color: #1f2937; border: 1px solid #c9d2df; border-radius: 4px;
@@ -1866,7 +1994,9 @@ class MainWindow(QMainWindow):
             return
         try:
             self.compare_log = load_log(Path(path), self.library_root)
+            self.compare_toggle.blockSignals(True)
             self.compare_toggle.setChecked(True)
+            self.compare_toggle.blockSignals(False)
             self.compare_label.setText(Path(path).name)
             self.refresh_plots()
         except Exception as exc:
@@ -1879,11 +2009,18 @@ class MainWindow(QMainWindow):
             self.load_library(Path(path))
 
     def load_library(self, path: Path) -> None:
+        try:
+            if not path.is_dir():
+                raise ValueError("Select an existing log-library directory.")
+            logs = scan_library(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Library load failed", str(exc))
+            return
         self.cancel_reception_scan()
         self.cancel_reception_heatmap()
         self.library_root = path
         self.store.set_setting("library_root", str(path))
-        self.library_logs = scan_library(path)
+        self.library_logs = logs
         self.populate_library_tree()
         self.reception_scan_refresh_button.setEnabled(True)
         self._load_cached_reception_sites(preserve_selection=False)
@@ -1972,13 +2109,17 @@ class MainWindow(QMainWindow):
 
     def load_log(self, path: Path) -> None:
         try:
-            self.current_log = load_log(path, self.library_root)
+            next_log = load_log(path, self.library_root)
+            if not self._confirm_flight_notes_saved():
+                return
+            self.current_log = next_log
             # Discard range callbacks already queued by the outgoing WebEngine
             # document before the replacement log rebuilds the plot.
             self._telemetry_x_range_generation += 1
             self.selected_index = 0
             self.telemetry_visible_elapsed_range = None
-            self.reset_telemetry_axis_grouping(refresh=False)
+            # Axis overrides belong to this session. The renderer filters out
+            # unavailable columns, retaining the full groups for later logs.
             self._reset_gps_playback()
             self.store.set_setting("last_log", str(path))
             # Every dependent widget needs a refresh because a new log changes
@@ -2493,7 +2634,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "gps_tab") and self.tabs.widget(index) is self.gps_tab:
             if not self._gps_view_loaded or "gps" in self._deferred_views_dirty:
                 self.refresh_gps(force=True)
-            self.gps_view.refresh_viewport(fit=True)
+            self.gps_view.refresh_viewport(fit=False)
         if hasattr(self, "reception_tab") and self.tabs.widget(index) is self.reception_tab:
             if not self._reception_view_loaded:
                 self._set_reception_map_payload(self._reception_map_payload, force=True)
@@ -2537,7 +2678,10 @@ class MainWindow(QMainWindow):
             return
         cols = self.selected_columns()
         compare = self.compare_log if self.compare_toggle.isChecked() else None
-        values = cursor_values(self.current_log, self.selected_index, cols, compare)
+        values = cursor_values(
+            self.current_log, self.selected_index, cols, compare,
+            time_mode=self.telemetry_time_mode,
+        )
         rows = []
         for value in values:
             delta = "" if value.delta is None else f"{value.delta:+.3f}"
@@ -2575,6 +2719,7 @@ class MainWindow(QMainWindow):
     def telemetry_time_changed(self, text: str) -> None:
         self.telemetry_time_mode = "relative" if text == "Relative" else "absolute"
         self.refresh_graph()
+        self.update_info_panel()
 
     def reset_telemetry_view(self) -> None:
         self._telemetry_x_range_generation += 1
@@ -2589,21 +2734,48 @@ class MainWindow(QMainWindow):
     def load_flight_notes(self) -> None:
         if self.current_log is None:
             return
-        flight = self.store.get_flight(str(self.current_log.info.path))
+        self._flight_notes_path = str(self.current_log.info.path)
+        flight = self.store.get_flight(self._flight_notes_path)
         self.flight_notes.setPlainText(flight.get("notes", ""))
         self.flight_video.setText(flight.get("video_path", ""))
+        self._flight_notes_saved = (self.flight_notes.toPlainText(), self.flight_video.text())
 
-    def save_flight_notes(self) -> None:
+    def _confirm_flight_notes_saved(self) -> bool:
+        if self._flight_notes_path is None or self._flight_notes_saved == (
+            self.flight_notes.toPlainText(), self.flight_video.text()
+        ):
+            return True
+        choice = QMessageBox.question(
+            self, "Unsaved flight notes", "Save changes to the current flight's notes and video link?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            return self.save_flight_notes()
+        if choice == QMessageBox.StandardButton.Discard:
+            self._flight_notes_saved = (self.flight_notes.toPlainText(), self.flight_video.text())
+            return True
+        return False
+
+    def save_flight_notes(self) -> bool:
         if self.current_log is None:
             QMessageBox.information(self, "No log", "Open a log before saving flight notes.")
-            return
-        self.store.save_flight(
-            str(self.current_log.info.path),
-            self.current_log.info.model,
-            self.flight_notes.toPlainText(),
-            self.flight_video.text().strip(),
-        )
+            return False
+        if self._flight_notes_path != str(self.current_log.info.path):
+            self.load_flight_notes()
+        try:
+            self.store.save_flight(
+                str(self.current_log.info.path),
+                self.current_log.info.model,
+                self.flight_notes.toPlainText(),
+                self.flight_video.text().strip(),
+            )
+        except (OSError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, "Flight notes could not be saved", str(exc))
+            return False
+        self._flight_notes_saved = (self.flight_notes.toPlainText(), self.flight_video.text())
         self.status.showMessage("Flight notes saved")
+        return True
 
     def select_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select linked video", "", "Video files (*.mp4 *.mov *.mkv *.avi);;All files (*.*)")
@@ -2612,8 +2784,11 @@ class MainWindow(QMainWindow):
 
     def open_linked_video(self) -> None:
         path = self.flight_video.text().strip()
-        if path and Path(path).exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        if not path or not Path(path).is_file():
+            QMessageBox.information(self, "Linked video", "Choose an existing video file first.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve()))):
+            QMessageBox.warning(self, "Linked video", "No application could open the selected video.")
 
     def add_battery(self) -> None:
         name = self.battery_name.text().strip()
@@ -2723,7 +2898,13 @@ class MainWindow(QMainWindow):
         if not source or not target:
             QMessageBox.information(self, "Sync paths", "Select both source and target directories.")
             return
-        self.sync_candidates = discover_sync_candidates(source, target)
+        try:
+            candidates = discover_sync_candidates(source, target)
+        except (OSError, ValueError) as exc:
+            self._clear_sync_candidates()
+            QMessageBox.warning(self, "Sync scan failed", str(exc))
+            return
+        self.sync_candidates = candidates
         self.sync_table.setSortingEnabled(False)
         self.sync_table.setRowCount(0)
         for candidate_index, candidate in enumerate(self.sync_candidates):
@@ -2737,15 +2918,25 @@ class MainWindow(QMainWindow):
         self.sync_table.setSortingEnabled(True)
         self.status.showMessage(f"Found {len(self.sync_candidates)} sync candidates")
 
+    def _clear_sync_candidates(self, *_args) -> None:
+        self.sync_candidates = []
+        self.sync_table.setRowCount(0)
+
     def copy_sync_candidates(self) -> None:
         selected_candidates = self._selected_sync_candidates()
         if not selected_candidates:
             QMessageBox.information(self, "No sync candidates selected", "Select one or more candidate rows before copying.")
             return
-        copied = copy_candidates(selected_candidates)
-        self.status.showMessage(f"Copied {copied} log files")
+        try:
+            copied = copy_candidates(selected_candidates)
+        except (OSError, ValueError) as exc:
+            self._clear_sync_candidates()
+            QMessageBox.warning(self, "Sync copy failed", f"{exc}\n\nScan again to see the remaining files.")
+            return
+        self._clear_sync_candidates()
         if self.sync_target.text().strip():
             self.load_library(Path(self.sync_target.text().strip()))
+        self.status.showMessage(f"Copied {copied} log files; scan again to refresh candidates.")
 
     def _selected_sync_candidates(self) -> list[SyncCandidate]:
         selection_model = self.sync_table.selectionModel()
@@ -2830,7 +3021,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Open voice CSV", "", "CSV files (*.csv);;All files (*.*)")
         if not path:
             return
-        self.voice_items = load_voice_csv(path)
+        try:
+            items = load_voice_csv(path)
+        except (OSError, UnicodeError, ValueError) as exc:
+            QMessageBox.warning(self, "Voice CSV could not be opened", str(exc))
+            return
+        self.voice_items = items
         self.voice_table.setSortingEnabled(False)
         self.voice_table.setRowCount(0)
         for item in self.voice_items:
@@ -2843,7 +3039,12 @@ class MainWindow(QMainWindow):
     def save_voice_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save voice CSV", "audio_list.csv", "CSV files (*.csv)")
         if path:
-            save_voice_csv(path, self.voice_items_from_table())
+            try:
+                save_voice_csv(path, self.voice_items_from_table())
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(self, "Voice CSV could not be saved", str(exc))
+                return
+            self.status.showMessage("Voice CSV saved")
 
     def generate_voice_pack(self, *_args) -> None:
         items = self.voice_items_from_table()
@@ -2855,7 +3056,7 @@ class MainWindow(QMainWindow):
             return
         try:
             created = generate_voice_pack(items, path)
-        except ValueError as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             QMessageBox.warning(self, "Voice pack", str(exc))
             return
         self.status.showMessage(f"Generated {len(created)} WAV files")
@@ -2967,6 +3168,11 @@ class MainWindow(QMainWindow):
         return f"{size / (1024 * 1024):.1f} MB"
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        if not self._confirm_flight_notes_saved():
+            if a0 is not None:
+                a0.ignore()
+            return
+        self.gps_playback_timer.stop()
         self.cancel_reception_scan()
         self.cancel_reception_heatmap()
         self._reception_pool.clear()

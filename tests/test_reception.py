@@ -82,6 +82,29 @@ def test_index_log_samples_every_twentieth_row_and_uses_recorded_date(tmp_path: 
     assert record.channels == ("VFR 2.4G(%)",)
 
 
+@pytest.mark.parametrize("delimiter", [";", "\t"])
+def test_index_ragged_delimited_log_matches_full_log_parser(tmp_path: Path, delimiter: str) -> None:
+    path = tmp_path / "delimited.csv"
+    path.write_text(
+        "\n" + "\n".join(
+            delimiter.join(row) for row in [
+                ["Date", "Time", "GPS Lat", "GPS Lon", "VFR 2.4G(%)"],
+                ["2026-04-01", "12:00:00", "39.75", "-75.25", "90", "extra"],
+                ["2026-04-01", "12:00:01", "39.75001", "-75.25", "80"],
+                ["2026-04-01", "12:00:02", "39.75002", "-75.25"],
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path)
+    assert record.status == "ok"
+    assert record.channels == ("VFR 2.4G(%)",)
+    assert record.center_latitude == pytest.approx(39.75001)
+    payload = build_reception_heatmap([record], "VFR 2.4G(%)", (39.75, -75.25))
+    assert payload["status"] == "ok"
+    assert payload["error_count"] == 0
+
+
 def test_index_log_discovers_channels_between_stride_aligned_rows(tmp_path: Path) -> None:
     path = tmp_path / "between-samples.csv"
     rows = ["Date,Time,GPS Lat,GPS Lon,VFR 2.4G(%)"]
@@ -706,6 +729,40 @@ def test_heatmap_normalizes_paired_row_values(
     assert cells[0]["sample_count"] == 3
     assert payload["reference_observed_min"] == 5.0
     assert payload["reference_observed_max"] == 200.0
+
+
+def test_db_power_normalization_replaces_zero_with_lowest_positive_reference(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "zero-power.csv"
+    path.write_text(
+        "\n".join(
+            [
+                "Date,Time,GPS Lat,GPS Lon,VFR(%),Power 900M(mW)",
+                "2026-04-01,12:00:00,39.75,-75.25,80,0",
+                "2026-04-01,12:00:01,39.75,-75.25,60,5",
+                "2026-04-01,12:00:02,39.75,-75.25,40,20",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    record = index_log(path, tmp_path, sample_stride=1)
+
+    payload = build_reception_heatmap(
+        [record],
+        "VFR(%)",
+        (39.75, -75.25),
+        reference_column="Power 900M(mW)",
+        normalization_mode="db_power",
+    )
+
+    cells = payload["cells"]
+    assert isinstance(cells, list) and len(cells) == 1
+    assert cells[0]["value"] == pytest.approx(60.0 - 10.0 * math.log10(5.0))
+    assert cells[0]["sample_count"] == 3
+    assert payload["reference_observed_min"] == 0.0
+    assert payload["reference_observed_max"] == 20.0
+    assert payload["invalid_reference_sample_count"] == 0
 
 
 @pytest.mark.parametrize("bounds", [(10.0, 100.0), (100.0, 10.0)])

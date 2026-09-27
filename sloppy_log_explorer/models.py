@@ -7,6 +7,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 RECEPTION_INDEX_VERSION = 3
@@ -156,6 +157,16 @@ class LogFileInfo:
 
 
 @dataclass
+class CursorTimeline:
+    source: pd.Series
+    absolute_seconds: np.ndarray
+    elapsed_seconds: np.ndarray
+    monotonic: bool
+    absolute_bounds: tuple[float, float]
+    elapsed_bounds: tuple[float, float]
+
+
+@dataclass
 class LoadedLog:
     info: LogFileInfo
     dataframe: pd.DataFrame
@@ -163,6 +174,9 @@ class LoadedLog:
     numeric_columns: list[str]
     gps_columns: GpsColumns | None
     timeline_columns: frozenset[str] = field(default_factory=frozenset)
+    # Loaded timestamp series are immutable during inspection. A replacement
+    # series invalidates the cursor cache in analysis._cursor_timeline.
+    cursor_timeline: CursorTimeline | None = field(default=None, init=False, repr=False)
 
     @property
     def parameter_columns(self) -> list[str]:
@@ -185,6 +199,8 @@ class SyncCandidate:
     reason: str
     source_mtime: float
     target_mtime: float | None
+    source_root: Path | None = None
+    target_root: Path | None = None
 
 
 @dataclass(frozen=True)

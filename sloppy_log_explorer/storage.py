@@ -90,6 +90,7 @@ def app_data_dir() -> Path:
         root = Path(base) / "SloppyLogExplorer"
     else:
         root = Path.home() / ".sloppy_log_explorer"
+    root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
