@@ -165,6 +165,7 @@ def _validate_ground_measurement(page: Any) -> dict[str, Any]:
 
 
 def _validate_imagery_zoom(page: Any, view: Any, output: Path) -> list[dict[str, Any]]:
+    output.parent.mkdir(parents=True, exist_ok=True)
     original = _run_js(page, "window.sloppyGpsMap.getState();")
     results = []
     _run_js(page, "window.sloppyGpsMap.setBasemap('imagery');"
