@@ -4,6 +4,12 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-06
+
+### Fixed
+
+- Remove solid ground-to-altitude walls from the Flight Map, preserving the elevated, telemetry-colored flight path. Validate the ribbon geometry and allow live map checks over a complete flight.
+
 ## [0.2.0] - 2026-09-27
 
 ### Added

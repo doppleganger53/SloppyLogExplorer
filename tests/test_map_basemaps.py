@@ -159,7 +159,7 @@ def test_flight_map_keeps_antimeridian_bounds_playback_and_3d_segments_local(
     names = [
         "finiteNumber", "displayLongitude", "coordinateFromPoint", "allPathPoints",
         "nearestPointForElapsed", "interpolatedPointForElapsed", "calculateBounds",
-        "extrusionCoordinatesForSegment", "mercatorCoordinate",
+        "mercatorCoordinate",
     ]
     definitions = []
     for name in names:
@@ -171,7 +171,6 @@ def test_flight_map_keeps_antimeridian_bounds_playback_and_3d_segments_local(
         + "\n".join(definitions)
         + "\nJSON.stringify({midpoint:interpolatedPointForElapsed(1),"
         "bounds:calculateBounds(pathParts[0]),"
-        "polygon:extrusionCoordinatesForSegment(pathParts[0][0],pathParts[0][1],24),"
         "mercator:mercatorCoordinate(pathParts[0][1],40)});"
     )
     evaluated = engine.evaluate(script)
@@ -180,9 +179,49 @@ def test_flight_map_keeps_antimeridian_bounds_playback_and_3d_segments_local(
     assert abs(result["midpoint"]["lon"]) == pytest.approx(180)
     assert result["midpoint"]["alt"] == 30
     assert result["bounds"][1][0] - result["bounds"][0][0] == pytest.approx(0.002)
-    longitudes = [point[0] for point in result["polygon"][0]]
-    assert max(longitudes) - min(longitudes) < 0.003
     assert abs(result["mercator"]["lng"] - start_longitude) == pytest.approx(0.002)
+    assert app is not None
+
+
+def test_flight_ribbon_joins_endpoint_altitudes_without_ground_walls() -> None:
+    from PyQt6.QtQml import QJSEngine
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    engine = QJSEngine()
+    document = build_gps_map_html({"status": "ok", "points": []})
+    names = ["finiteNumber", "displayLongitude", "coordinateFromPoint",
+             "altitudeRenderMeters", "colorToRgba", "mercatorCoordinate",
+             "mercatorPoint", "buildElevationRenderData"]
+    definitions = []
+    for name in names:
+        function = document.split(f"    function {name}(", 1)[1].split("\n    function ", 1)[0]
+        definitions.append(f"function {name}(" + function)
+    script = """
+        const longitudeReference = 0;
+        const altitudeBase = 0, altitudeScale = 1, altitudeFloorMeters = 0;
+        const pathRibbonWidthMeters = 24;
+        const flightData = {points: [], segments: [{
+            left: {lon: 0, lat: 0, alt: 100},
+            right: {lon: 1, lat: 0, alt: 200}, color: '#ff0000'
+        }]};
+        const maplibregl = {MercatorCoordinate: {fromLngLat: (point, altitude) => ({
+            x: point.lng, y: point.lat, z: altitude,
+            meterInMercatorCoordinateUnits: () => 0.00001
+        })}};
+    """ + "\n".join(definitions) + """
+        const data = buildElevationRenderData();
+        JSON.stringify({positions: Array.from(data.ribbonPositions),
+                        shadows: Array.from(data.shadowPositions),
+                        vertices: data.ribbonVertexCount});
+    """
+    evaluated = engine.evaluate(script)
+    assert not evaluated.isError(), evaluated.toString()
+    result = json.loads(evaluated.toString())
+    # Exactly two triangles follow the endpoints, with no faces down to zero.
+    assert result["vertices"] == 6
+    assert result["positions"][2::3] == [100, 100, 200, 100, 200, 200]
+    assert result["shadows"][2::3] == [0] * 6
     assert app is not None
 
 

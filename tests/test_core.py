@@ -743,12 +743,9 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert "gl.drawArrays(gl.TRIANGLES, 0, vertexCount)" in html
     assert "gl.disable(gl.DEPTH_TEST)" in html
     assert 'id: "flight-elevation-layer"' in html
-    assert 'id: "flight-extrusions"' in html
-    assert 'type: "fill-extrusion"' in html
-    assert '"fill-extrusion-height": ["get", "height"]' in html
+    assert "fill-extrusion" not in html
+    assert "flight-extrusions" not in html
     assert 'renderingMode: "3d"' in html
-    assert "extrusionLayerReady" in html
-    assert "native3dPathReady: extrusionLayerReady" in html
     assert "elevationLayerReady" in html
     assert "webglPathReady: elevationLayerReady" in html
     assert "ribbonVertexCount" in html
@@ -760,7 +757,6 @@ def test_gps_map_html_renders_path_underlay_and_segment_overlays(tmp_path: Path)
     assert 'id: "osm-raster-base"' in html
     assert '"https://tile.openstreetmap.org/{z}/{x}/{y}.png"' in html
     assert 'id: "flight-segments"' in html
-    assert 'map.addSource("flight-extrusions-source"' in html
     assert '"line-color": ["get", "color"]' in html
     assert '"line-opacity": 0.22' in html
     assert 'map.addSource("flight-markers"' in html

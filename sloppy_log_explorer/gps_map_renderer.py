@@ -461,7 +461,6 @@ __BASEMAP_RUNTIME__
     let elevationLayerReady = false;
     let elevationLayerError = "";
     let canvasPathReady = false;
-    let extrusionLayerReady = false;
     let ribbonVertexCount = 0;
     let guideVertexCount = 0;
     let activeCameraMode = "orbit";
@@ -551,7 +550,6 @@ __BASEMAP_RUNTIME__
         "usgs-naip-raster-base",
         "flight-underlay",
         "flight-segments",
-        "flight-extrusions",
         "flight-marker-circles",
         "flight-marker-labels",
         "flight-elevation-layer"
@@ -562,10 +560,9 @@ __BASEMAP_RUNTIME__
         "usgs-naip-raster-source",
         "flight-underlay-source",
         "flight-segments-source",
-        "flight-extrusions-source",
         "flight-markers"
       ];
-      const pathReady = extrusionLayerReady || elevationLayerReady || canvasPathReady;
+      const pathReady = elevationLayerReady || canvasPathReady;
       const state = {
         ready: flightLayersAdded && pathReady,
         state: flightLayersAdded && pathReady ? "ready" : (elevationLayerError ? "degraded" : "loading"),
@@ -575,13 +572,11 @@ __BASEMAP_RUNTIME__
         segments: Array.isArray(flightData.segments) ? flightData.segments.length : 0,
         pathParts: pathParts.length,
         canvasPathReady,
-        extrusionLayerReady,
         elevationLayerReady,
         elevationLayerError,
         elevationMatrixSource,
         elevationRenderArgKeys,
         webglPathReady: elevationLayerReady,
-        native3dPathReady: extrusionLayerReady,
         ribbonVertexCount,
         guideVertexCount,
         cameraMode: activeCameraMode,
@@ -888,34 +883,6 @@ __BASEMAP_RUNTIME__
 
     function setPlayback(playback) {
       return setCursor(Object.assign({}, playback || {}, { values: currentCursor.values }));
-    }
-
-    function extrusionCoordinatesForSegment(leftPoint, rightPoint, widthMeters) {
-      const left = coordinateFromPoint(leftPoint);
-      const right = coordinateFromPoint(rightPoint);
-      if (!left || !right) {
-        return null;
-      }
-      const midLatRadians = ((left[1] + right[1]) / 2) * Math.PI / 180;
-      const metersPerDegreeLat = 110540;
-      const metersPerDegreeLon = Math.max(1, 111320 * Math.cos(midLatRadians));
-      const dx = (right[0] - left[0]) * metersPerDegreeLon;
-      const dy = (right[1] - left[1]) * metersPerDegreeLat;
-      const length = Math.hypot(dx, dy);
-      if (!Number.isFinite(length) || length <= 0) {
-        return null;
-      }
-      const nx = -dy / length * widthMeters / 2;
-      const ny = dx / length * widthMeters / 2;
-      const offset = (coordinate, sign) => [
-        coordinate[0] + (nx * sign) / metersPerDegreeLon,
-        coordinate[1] + (ny * sign) / metersPerDegreeLat
-      ];
-      const leftA = offset(left, 1);
-      const rightA = offset(right, 1);
-      const rightB = offset(right, -1);
-      const leftB = offset(left, -1);
-      return [[leftA, rightA, rightB, leftB, leftA]];
     }
 
     function altitudeRenderMeters(point) {
@@ -1233,7 +1200,6 @@ __BASEMAP_RUNTIME__
     function buildFlightGeoJson() {
       const underlayFeatures = [];
       const segmentFeatures = [];
-      const extrusionFeatures = [];
       const markerFeatures = [];
 
       pathParts.forEach((part, index) => {
@@ -1265,21 +1231,6 @@ __BASEMAP_RUNTIME__
           },
           geometry: { type: "LineString", coordinates: [left, right] }
         });
-        const extrusionCoordinates = extrusionCoordinatesForSegment(segment.left, segment.right, pathRibbonWidthMeters);
-        if (extrusionCoordinates) {
-          extrusionFeatures.push({
-            type: "Feature",
-            properties: {
-              color: segment.color,
-              index: index + 1,
-              height: Math.max(
-                altitudeFloorMeters,
-                (altitudeRenderMeters(segment.left) + altitudeRenderMeters(segment.right)) / 2
-              )
-            },
-            geometry: { type: "Polygon", coordinates: extrusionCoordinates }
-          });
-        }
       });
 
       const startPoint = flightData.points[0];
@@ -1307,7 +1258,6 @@ __BASEMAP_RUNTIME__
       return {
         underlay: { type: "FeatureCollection", features: underlayFeatures },
         segments: { type: "FeatureCollection", features: segmentFeatures },
-        extrusions: { type: "FeatureCollection", features: extrusionFeatures },
         markers: { type: "FeatureCollection", features: markerFeatures }
       };
     }
@@ -1396,8 +1346,8 @@ __BASEMAP_RUNTIME__
       flightCanvasContext.clearRect(0, 0, width, height);
 
       let drawn = false;
-      const drawFallbackPath = !extrusionLayerReady && !elevationLayerReady;
-      const drawAccentPath = extrusionLayerReady || elevationLayerReady;
+      const drawFallbackPath = !elevationLayerReady;
+      const drawAccentPath = elevationLayerReady;
       const guideStride = Math.max(1, Math.floor(flightData.points.length / 24));
       flightData.points.forEach((point, index) => {
         if (index !== 0 && index !== flightData.points.length - 1 && index % guideStride !== 0) {
@@ -1564,24 +1514,6 @@ __BASEMAP_RUNTIME__
           "line-opacity": 0.22
         }
       });
-      map.addSource("flight-extrusions-source", {
-        type: "geojson",
-        data: geoJson.extrusions
-      });
-      extrusionLayerReady = geoJson.extrusions.features.length > 0;
-      map.addLayer({
-        id: "flight-extrusions",
-        type: "fill-extrusion",
-        source: "flight-extrusions-source",
-        paint: {
-          "fill-extrusion-color": ["get", "color"],
-          "fill-extrusion-height": ["get", "height"],
-          "fill-extrusion-base": 0,
-          "fill-extrusion-opacity": 0.9,
-          "fill-extrusion-vertical-gradient": true
-        }
-      });
-
       map.addSource("flight-markers", {
         type: "geojson",
         data: geoJson.markers
@@ -1614,6 +1546,7 @@ __BASEMAP_RUNTIME__
           "text-halo-width": 2
         }
       });
+      // The flight is an elevated ribbon, not a solid extrusion down to ground.
       addElevationLayer();
       flightLayersAdded = true;
       drawFlightCanvas();
