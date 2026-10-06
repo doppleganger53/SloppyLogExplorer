@@ -6,9 +6,14 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ## [0.2.1] - 2026-10-06
 
+### Added
+
+- Add a Flight Map ground-distance tool with multiple points, draggable endpoints, click-to-remove, undo, clear, and metric/imperial totals (#39).
+
 ### Fixed
 
 - Remove solid ground-to-altitude walls from the Flight Map, preserving the elevated, telemetry-colored flight path. Validate the ribbon geometry and allow live map checks over a complete flight.
+- Refresh NAIP imagery as the map zooms, retain available parent tiles after individual tile errors, and reuse the finest native detail above the imagery source's maximum zoom (#40).
 
 ## [0.2.0] - 2026-09-27
 

@@ -29,4 +29,4 @@ The Flight Map and HeatMap use MapLibre GL JS 6.4.1, bundled in `sloppy_log_expl
 - NASA Global Imagery Browse Services (GIBS): https://nasa-gibs.github.io/gibs-api-docs/
 - NASA acknowledgment: Imagery is provided by NASA GIBS, part of NASA's Earth Science Data and Information System (ESDIS)
 
-The application does not use Google Maps, Mapbox, paid subscriptions, account signups, or API keys for map visualization. OpenStreetMap is the default and final fallback. Imagery mode places NASA GIBS beneath transparent NAIP WMS tiles, so the active view may request tiles from all three providers.
+The application does not use Google Maps, Mapbox, paid subscriptions, account signups, or API keys for map visualization. OpenStreetMap is the default and final fallback. Imagery mode places NASA GIBS beneath transparent NAIP ArcGIS image-export tiles, so the active view may request tiles from all three providers.

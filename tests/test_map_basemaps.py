@@ -18,7 +18,7 @@ from sloppy_log_explorer.map_basemaps import (
     NASA_GIBS_RASTER_TILE_URL,
     OPENSTREETMAP_RASTER_TILE_URL,
     USGS_NAIP_BOUNDS,
-    USGS_NAIP_WMS_TILE_URL,
+    USGS_NAIP_TILE_URL,
     build_basemap_config,
     clamp_imagery_opacity,
     normalize_basemap,
@@ -38,7 +38,7 @@ def test_shared_basemap_config_defaults_to_openstreetmap_with_ordered_fallbacks(
     ]
     assert sources["osm-raster-source"]["tiles"] == [OPENSTREETMAP_RASTER_TILE_URL]
     assert sources["nasa-gibs-raster-source"]["tiles"] == [NASA_GIBS_RASTER_TILE_URL]
-    assert sources["usgs-naip-raster-source"]["tiles"] == [USGS_NAIP_WMS_TILE_URL]
+    assert sources["usgs-naip-raster-source"]["tiles"] == [USGS_NAIP_TILE_URL]
     assert sources["usgs-naip-raster-source"]["bounds"] == list(USGS_NAIP_BOUNDS)
 
     osm_layer = BASEMAP_RUNTIME_JAVASCRIPT.index('id: "osm-raster-base"')
@@ -47,15 +47,16 @@ def test_shared_basemap_config_defaults_to_openstreetmap_with_ordered_fallbacks(
     assert osm_layer < gibs_layer < naip_layer
 
 
-def test_imagery_config_uses_transparent_naip_wms_and_global_gibs() -> None:
+def test_imagery_config_uses_transparent_naip_images_and_global_gibs() -> None:
     config = build_basemap_config({"basemap": "imagery", "imagery_opacity": 0.45})
 
     assert config["selected"] == BASEMAP_IMAGERY
     assert config["imageryOpacity"] == 0.45
-    assert "bbox={bbox-epsg-3857}" in USGS_NAIP_WMS_TILE_URL
-    assert "transparent=true" in USGS_NAIP_WMS_TILE_URL
-    assert "format=image%2Fpng" in USGS_NAIP_WMS_TILE_URL
-    assert "USGSNAIPImagery%3ANaturalColor" in USGS_NAIP_WMS_TILE_URL
+    assert "bbox={bbox-epsg-3857}" in USGS_NAIP_TILE_URL
+    assert "ImageServer/exportImage" in USGS_NAIP_TILE_URL
+    assert "format=png32" in USGS_NAIP_TILE_URL
+    assert "%22NaturalColor%22" in USGS_NAIP_TILE_URL
+    assert cast(dict[str, Any], config["sources"])["usgs-naip-raster-source"]["maxzoom"] == 19
     assert "gibs.earthdata.nasa.gov/wmts/epsg3857" in NASA_GIBS_RASTER_TILE_URL
     assert "BlueMarble_ShadedRelief_Bathymetry" in NASA_GIBS_RASTER_TILE_URL
 
@@ -95,6 +96,44 @@ def test_enabled_naip_layer_is_always_included_in_imagery_attribution() -> None:
         'const attributionProvider = naipAttributionRequired() ? "naip" : provider;'
         in BASEMAP_RUNTIME_JAVASCRIPT
     )
+
+
+def test_individual_imagery_tile_errors_keep_provider_enabled_for_next_zoom() -> None:
+    from PyQt6.QtQml import QJSEngine
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    engine = QJSEngine()
+    script = """
+      const basemapConfig = {selected:'imagery',imageryOpacity:1,
+        naipBounds:[-125,24,-66,50],attribution:{naip:'NAIP',gibs:'GIBS',osm:'OSM'}};
+      const basemapAttributionElement = {innerHTML:'',textContent:''};
+      const visibility = {};
+      const map = {
+        getCenter: () => ({lng:-75,lat:40}), getLayer: () => true,
+        setLayoutProperty(id,key,value) {visibility[id]=value;},
+        setPaintProperty() {},triggerRepaint() {}
+      };
+    """ + BASEMAP_RUNTIME_JAVASCRIPT + """
+      reapplyBasemapState();
+      handleBasemapError({sourceId:'usgs-naip-raster-source',tile:{},error:{status:404}});
+      const afterMissingTile = activeImageryProvider();
+      reapplyBasemapState();
+      const naipVisibility = visibility['usgs-naip-raster-base'];
+      handleBasemapError({sourceId:'usgs-naip-raster-source'});
+      const outage = activeImageryProvider();
+      setBasemap('imagery');
+      const retried = activeImageryProvider();
+      handleBasemapError({sourceId:'nasa-gibs-raster-source',tile:{},error:{status:404}});
+      JSON.stringify({afterMissingTile,naipVisibility,outage,retried,gibsFailed});
+    """
+    evaluated = engine.evaluate(script)
+    assert not evaluated.isError(), evaluated.toString()
+    assert json.loads(evaluated.toString()) == {
+        "afterMissingTile": "naip", "naipVisibility": "visible", "outage": "gibs",
+        "retried": "naip", "gibsFailed": False,
+    }
+    assert app is not None
 
 
 @pytest.mark.parametrize("renderer", [build_gps_map_html, build_reception_map_html])
@@ -239,6 +278,7 @@ def test_late_flight_map_load_does_not_repeat_initial_camera_fit() -> None:
       let fits = 0;
       let currentCursor = {};
       function addFlightLayers() {flightLayersAdded = true;}
+      function initializeMeasurement() {}
       function fitFlightBounds() {fits += 1; camera = 'fitted';}
       function renderLegend() {}
       function setCursor() {}

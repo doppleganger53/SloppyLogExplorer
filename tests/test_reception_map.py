@@ -97,7 +97,7 @@ def test_reception_renderer_uses_vendored_maplibre_and_osm_raster_cells() -> Non
     assert 'script type="module"' in document
     assert "import * as maplibregl" in document
     assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in document
-    assert "imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery" in document
+    assert "imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery" in document
     assert "gibs.earthdata.nasa.gov/wmts/epsg3857" in document
     assert 'id: "osm-raster-base"' in document
     assert 'id: "nasa-gibs-raster-base"' in document
