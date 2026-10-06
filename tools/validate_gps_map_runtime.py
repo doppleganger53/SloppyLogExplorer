@@ -51,7 +51,7 @@ def _wait_for_ready_state(page: Any, attempts: int = 60) -> dict[str, Any] | Non
             "window.sloppyGpsMap && window.sloppyGpsMap.getState ? window.sloppyGpsMap.getState() : null;",
             timeout_ms=500,
         )
-        if state and state.get("state") == "ready" and (state.get("native3dPathReady") or state.get("webglPathReady")):
+        if state and state.get("state") == "ready" and state.get("webglPathReady"):
             return state
         _run_event_loop(250)
     return state
@@ -131,14 +131,12 @@ def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float 
     raw_camera = state.get("camera")
     layers: dict[str, Any] = raw_layers if isinstance(raw_layers, dict) else {}
     camera: dict[str, Any] = raw_camera if isinstance(raw_camera, dict) else {}
-    if not layers.get("flight-extrusions"):
-        raise AssertionError(f"GPS map is missing the native 3D extrusion path layer at {label}: {state}")
-    if not state.get("native3dPathReady"):
-        raise AssertionError(f"GPS map native 3D extrusion path is not ready at {label}: {state}")
-    # The WebGL diagnostic layer is optional, but if it exists it should carry
-    # real vertices so it can prove the renderer path is working.
-    if layers.get("flight-elevation-layer") and int(state.get("ribbonVertexCount") or 0) <= 0:
-        raise AssertionError(f"GPS map WebGL diagnostic ribbon has no vertices at {label}: {state}")
+    if layers.get("flight-extrusions"):
+        raise AssertionError(f"GPS map must not extrude walls beneath the flight path at {label}: {state}")
+    if not layers.get("flight-elevation-layer") or not state.get("webglPathReady"):
+        raise AssertionError(f"GPS map elevated ribbon is not ready at {label}: {state}")
+    if int(state.get("ribbonVertexCount") or 0) <= 0 or state.get("elevationLayerError"):
+        raise AssertionError(f"GPS map elevated ribbon failed at {label}: {state}")
     if float(camera.get("maxPitch") or 0) < 85:
         raise AssertionError(f"GPS map camera cannot pitch to ground level at {label}: {state}")
     if float(camera.get("maxZoom") or 0) < 19:
@@ -342,6 +340,7 @@ def validate_gps_map_runtime(
     state_root: Path | None,
     width: int,
     height: int,
+    full_flight: bool = False,
 ) -> dict[str, Any]:
     log_path = log_path.resolve()
     output = output.resolve()
@@ -361,7 +360,7 @@ def validate_gps_map_runtime(
         raise AssertionError(f"{log_path} does not contain detected GPS coordinates")
 
     elapsed_values = relative_seconds(log)
-    scope_start, scope_end = _gps_validation_scope(log, elapsed_values)
+    scope_start, scope_end = (0.0, max(elapsed_values)) if full_flight else _gps_validation_scope(log, elapsed_values)
     cursor_elapsed = scope_start + max(0.0, min(1.0, scope_end - scope_start))
 
     options = _gps_runtime_options(
@@ -408,6 +407,9 @@ def validate_gps_map_runtime(
     initial_state = _wait_for_ready_state(page)
     try:
         _assert_3d_state(initial_state, "initial")
+        wall_layers = _run_js(page, "window.__sloppyDebugMap.getStyle().layers.filter(layer => layer.type === 'fill-extrusion').map(layer => layer.id);")
+        if wall_layers != []:
+            raise AssertionError(f"Flight path contains unintended solid wall layers: {wall_layers}")
     except AssertionError:
         view.close()
         raise
@@ -636,6 +638,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate the MapLibre 3D GPS map in a live Qt WebEngine view.")
     parser.add_argument("log", type=Path)
     parser.add_argument("--color-column")
+    parser.add_argument("--full-flight", action="store_true", help="Render the entire flight instead of a short scope.")
     parser.add_argument("--output", type=Path, default=Path("validation_artifacts/flight-map-3d-webengine.png"))
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--width", type=int, default=1280)
@@ -649,6 +652,7 @@ def main() -> None:
         state_root=args.state_root,
         width=args.width,
         height=args.height,
+        full_flight=args.full_flight,
     )
     print(json.dumps(result, indent=2))
 
