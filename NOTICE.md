@@ -1,5 +1,9 @@
 # Attribution Notice
 
+## Application Icon
+
+The aircraft-and-telemetry icon was created for Sloppy Log Explorer using OpenAI image generation. No third-party logo assets were reused. The PNG artwork and multi-resolution Windows ICO are included under `sloppy_log_explorer/assets/`.
+
 ## Ethos_LogView
 
 Sloppy Log Explorer uses `Ethos_LogView` as its starting point for a Python/PyQt telemetry log viewer architecture, including the general approach of parsing Ethos CSV data with pandas and rendering interactive Plotly graphs in a Qt desktop application.

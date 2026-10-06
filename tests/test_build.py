@@ -54,6 +54,21 @@ def test_debug_target_keeps_broad_plotly_collection(tmp_path: Path) -> None:
     assert "PyQt6.QtWebChannel" in option_values(args, "--hidden-import")
 
 
+@pytest.mark.parametrize("target", ["minimal", "debug"])
+@pytest.mark.parametrize("one_file", [False, True])
+def test_all_windows_targets_embed_the_packaged_app_icon(tmp_path: Path, target: str, one_file: bool) -> None:
+    args = build_module.build_pyinstaller_args(tmp_path, one_file=one_file, target=target)
+    assets = tmp_path / "sloppy_log_explorer" / "assets"
+    icon = assets / "app-icon.ico"
+    if target == "minimal":
+        spec = build_module._minimal_spec_path(tmp_path, one_file).read_text(encoding="utf-8")
+        assert f"icon={[str(icon)]!r}," in spec
+        assert repr((str(assets), "sloppy_log_explorer/assets")) in spec
+    else:
+        assert option_values(args, "--icon") == [str(icon)]
+        assert build_module._add_data_arg(assets, "sloppy_log_explorer/assets") in option_values(args, "--add-data")
+
+
 def test_onefile_mode_keeps_target_specific_args(tmp_path: Path) -> None:
     args = build_module.build_pyinstaller_args(tmp_path, one_file=True, target="minimal")
     spec_path = tmp_path / "SloppyLogExplorer-minimal-onefile.spec"

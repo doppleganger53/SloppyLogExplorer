@@ -58,6 +58,8 @@ dist\SloppyLogExplorer.exe
 The release archive also includes `README.md`, `NOTICE.md`, `LICENSE`, and
 `CHANGELOG.md`.
 
+The application icon is embedded in every Windows build and bundled for the app's windows and taskbar. Source installations include the same icon. Artwork lives in `sloppy_log_explorer/assets/app-icon.png`; regenerate its 16–256 px Windows ICO after artwork changes with `python tools/make_app_icon.py`. No extra imaging dependency is required.
+
 To build the same target directly:
 
 ```powershell

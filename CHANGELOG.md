@@ -8,6 +8,7 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ### Added
 
+- Add an aircraft-and-telemetry app icon for Windows Explorer, app windows, and the taskbar, embedded in the portable executable and included in source packages.
 - Add a Flight Map ground-distance tool with multiple points, draggable endpoints, click-to-remove, undo, clear, and metric/imperial totals (#39).
 
 ### Fixed

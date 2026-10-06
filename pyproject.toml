@@ -32,7 +32,7 @@ sloppy-log-explorer = "sloppy_log_explorer.__main__:main"
 include = ["sloppy_log_explorer*"]
 
 [tool.setuptools.package-data]
-sloppy_log_explorer = ["assets/maplibre/*"]
+sloppy_log_explorer = ["assets/*.ico", "assets/*.png", "assets/maplibre/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

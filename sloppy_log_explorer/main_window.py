@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 )
 
 from . import __version__
+from .app_icon import application_icon
 from .analysis import (
     basic_stats,
     calculate_internal_resistance,
@@ -160,6 +161,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Sloppy Log Explorer")
+        self.setWindowIcon(application_icon())
         self.resize(1500, 940)
         self.store = AppStore()
         self.library_root: Path | None = None

@@ -106,9 +106,8 @@ def _base_pyinstaller_args(project_root: Path, one_file: bool) -> list[str]:
         _add_data_arg(project_root / "pyproject.toml", "."),
     ]
 
-    icon = project_root / "icon.ico"
-    if icon.exists():
-        args.extend(["--icon", str(icon)])
+    icon = assets_dir / "app-icon.ico"
+    args.extend(["--icon", str(icon)])
     return args
 
 
@@ -167,8 +166,8 @@ def _minimal_spec_text(project_root: Path, one_file: bool) -> str:
         *PYTTSX3_HIDDEN_IMPORTS,
         *QT_WEBENGINE_HIDDEN_IMPORTS,
     ]
-    icon = project_root / "icon.ico"
-    icon_arg = f"icon={[str(icon)]!r}," if icon.exists() else ""
+    icon = assets_dir / "app-icon.ico"
+    icon_arg = f"icon={[str(icon)]!r},"
 
     exe_inputs = "a.binaries,\n    a.datas,\n    []," if one_file else "[],\n    exclude_binaries=True,"
     collect = ""
