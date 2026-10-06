@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import Path
 
+from .gps_measurement import MEASUREMENT_RUNTIME_JAVASCRIPT
 from .map_basemaps import (
     BASEMAP_RUNTIME_JAVASCRIPT,
     OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
@@ -254,6 +255,39 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
       background: #2f80ed;
       border-color: #2f80ed;
     }
+    #map .maplibregl-ctrl-top-left { z-index: 12; }
+    #measurementControls {
+      max-width: min(300px, calc(100vw - 115px));
+      padding: 8px;
+      background: __PANEL_BG__;
+      color: __PANEL_FG__;
+      border: 1px solid __BORDER__;
+      border-radius: 6px;
+    }
+    #measurementControls button {
+      border: 1px solid __BORDER__;
+      border-radius: 4px;
+      padding: 5px 8px;
+      margin-right: 4px;
+      color: __PANEL_FG__;
+      background: __BACKGROUND__;
+      cursor: pointer;
+    }
+    #measurementControls button[aria-pressed="true"] { background: #2f80ed; color: white; }
+    #measurementControls button:disabled { opacity: 0.5; cursor: default; }
+    #measurementControls output { display: block; margin-top: 6px; font-variant-numeric: tabular-nums; }
+    #measurementControls [data-measure-hint] { font-size: 11px; max-width: 240px; margin-top: 4px; }
+    .measurement-point {
+      z-index: 11;
+      width: 24px;
+      height: 24px;
+      border: 2px solid #111827;
+      border-radius: 50%;
+      background: #fbbf24;
+      color: #111827;
+      font: bold 12px Arial, sans-serif;
+      cursor: pointer;
+    }
     #mapAttribution {
       position: absolute;
       right: 8px;
@@ -355,6 +389,9 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
         grid-row: 2;
       }
     }
+    @media (max-width: 700px) {
+      #map .maplibregl-ctrl-top-left { top: 54px; }
+    }
   </style>
 </head>
 <body>
@@ -454,6 +491,8 @@ def build_gps_map_html(payload: dict[str, object], dark: bool = True) -> str:
     let statusHideTimer = null;
     let map = null;
 __BASEMAP_RUNTIME__
+
+__MEASUREMENT_RUNTIME__
     window.handleBasemapError = handleBasemapError;
     let flightBounds = null;
     let initialBearing = 0;
@@ -580,6 +619,7 @@ __BASEMAP_RUNTIME__
         ribbonVertexCount,
         guideVertexCount,
         cameraMode: activeCameraMode,
+        measurement: measurementState(),
         cursor: {
           index: currentCursor.index,
           row: currentCursor.row,
@@ -1775,6 +1815,7 @@ __BASEMAP_RUNTIME__
         try {
           addFlightLayers();
           if (!flightLayersAdded) return;
+          initializeMeasurement();
           renderLegend();
           setCursor(currentCursor);
           fitFlightBounds();
@@ -1801,6 +1842,11 @@ __BASEMAP_RUNTIME__
       setPlayback,
       setBasemap,
       setImageryOpacity,
+      setMeasurementActive,
+      addMeasurementPoint,
+      moveMeasurementPoint,
+      removeMeasurementPoint,
+      clearMeasurement,
       getState: debugMapState
     };
 
@@ -1826,6 +1872,7 @@ __BASEMAP_RUNTIME__
         "__FLIGHT_DATA__": data_json,
         "__BASEMAP_CONFIG__": basemap_config_json,
         "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT,
+        "__MEASUREMENT_RUNTIME__": MEASUREMENT_RUNTIME_JAVASCRIPT,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,

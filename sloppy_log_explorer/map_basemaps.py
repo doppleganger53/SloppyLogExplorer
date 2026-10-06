@@ -18,16 +18,16 @@ DEFAULT_IMAGERY_OPACITY = 1.0
 OPENSTREETMAP_RASTER_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 OPENSTREETMAP_RASTER_TILE_MAX_ZOOM = 19
 
-# MapLibre expands ``{bbox-epsg-3857}`` for WMS raster sources. Transparent
-# pixels outside NAIP coverage reveal the NASA GIBS layer below it.
-USGS_NAIP_WMS_TILE_URL = (
-    "https://imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery/"
-    "ImageServer/WMSServer?service=WMS&request=GetMap&version=1.1.1"
-    "&layers=USGSNAIPImagery%3ANaturalColor&styles=&format=image%2Fpng"
-    "&transparent=true&srs=EPSG%3A3857&bbox={bbox-epsg-3857}"
-    "&width=256&height=256"
+# Use the cacheable ArcGIS image endpoint rather than the WMS endpoint whose
+# error responses can omit CORS headers. PNG32 retains transparency outside
+# coverage. The source's maxzoom retains the finest native imagery on overzoom.
+USGS_NAIP_TILE_URL = (
+    "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/"
+    "ImageServer/exportImage?f=image&bbox={bbox-epsg-3857}"
+    "&bboxSR=3857&imageSR=3857&size=256,256&format=png32"
+    "&renderingRule=%7B%22rasterFunction%22%3A%22NaturalColor%22%7D"
 )
-USGS_NAIP_RASTER_TILE_MAX_ZOOM = 22
+USGS_NAIP_RASTER_TILE_MAX_ZOOM = 19
 # Current Web Mercator extent published by the USGS NAIP ImageServer.
 USGS_NAIP_BOUNDS = (-124.831355, 24.485906, -66.851641, 49.571293)
 
@@ -168,6 +168,12 @@ BASEMAP_RUNTIME_JAVASCRIPT = r"""
 
     function handleBasemapError(event) {
       const sourceId = basemapSourceId(event);
+      // A missing/cancelled tile during zoom is not a provider-wide outage.
+      // Keep the raster layer enabled so MapLibre retains loaded parent tiles
+      // and fetches the next viewport; the stacked layers fill uncovered areas.
+      if (event && event.tile && ["usgs-naip-raster-source", "nasa-gibs-raster-source"].includes(sourceId)) {
+        return true;
+      }
       if (sourceId === "usgs-naip-raster-source") {
         naipFailed = true;
         reapplyBasemapState();
@@ -267,7 +273,7 @@ def build_basemap_config(payload: Mapping[str, object] | None = None) -> dict[st
             },
             "usgs-naip-raster-source": {
                 "type": "raster",
-                "tiles": [USGS_NAIP_WMS_TILE_URL],
+                "tiles": [USGS_NAIP_TILE_URL],
                 "tileSize": 256,
                 "minzoom": 0,
                 "maxzoom": USGS_NAIP_RASTER_TILE_MAX_ZOOM,

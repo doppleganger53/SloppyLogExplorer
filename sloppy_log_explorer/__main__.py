@@ -11,6 +11,7 @@ from typing import cast
 from PyQt6.QtWidgets import QApplication
 
 from . import __version__
+from .app_icon import application_icon
 from .main_window import MainWindow
 from .models import GpsGradientOptions
 from .parser import load_log
@@ -122,6 +123,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Sloppy Log Explorer")
     app.setOrganizationName("SloppyLogExplorer")
+    app.setWindowIcon(application_icon())
     if validate_ui_path:
         try:
             _validate_ui_log(app, validate_ui_path)
@@ -131,6 +133,8 @@ def main() -> None:
         return
     window = MainWindow()
     if smoke_test:
+        if window.windowIcon().isNull():
+            raise RuntimeError("Bundled application icon failed to load")
         print(window.windowTitle())
         window.close()
         return

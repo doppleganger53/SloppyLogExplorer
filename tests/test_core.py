@@ -562,7 +562,7 @@ def test_gps_map_html_uses_maplibre_openstreetmap_without_api_keys(tmp_path: Pat
     assert 'script type="module"' in html
     assert "import * as maplibregl" in html
     assert "https://tile.openstreetmap.org/{z}/{x}/{y}.png" in html
-    assert "imagery.nationalmap.gov/arcgis/services/USGSNAIPImagery" in html
+    assert "imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery" in html
     assert "gibs.earthdata.nasa.gov/wmts/epsg3857" in html
     assert "OpenStreetMap contributors" in html
     assert "USGS/USDA NAIP" in html

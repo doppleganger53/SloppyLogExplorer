@@ -104,7 +104,7 @@ def _validate_vendor_attribution_security(page: Any, map_name: str) -> dict[str,
 
 def _assert_gps_overlay_layout(page: Any) -> dict[str, Any]:
     result = _run_js(page, """(() => {
-      const boxes = ['legend','playbackOverlay','mapAttribution'].map(id => {
+      const boxes = ['legend','playbackOverlay','mapAttribution','cameraControls','measurementControls'].map(id => {
         const element = document.getElementById(id);
         if (!element || element.hidden) return null;
         const r = element.getBoundingClientRect();
@@ -122,6 +122,92 @@ def _assert_gps_overlay_layout(page: Any) -> dict[str, Any]:
             if box["left"] < other["right"] and box["right"] > other["left"] and box["top"] < other["bottom"] and box["bottom"] > other["top"]:
                 raise AssertionError(f"GPS overlays overlap: {result}")
     return result
+
+
+def _validate_ground_measurement(page: Any) -> dict[str, Any]:
+    result = _run_js(page, """(() => {
+      const api = window.sloppyGpsMap, map = window.__sloppyDebugMap;
+      const before = api.getState(), zoomEnabled = map.doubleClickZoom.isEnabled();
+      const center = map.getCenter();
+      api.setMeasurementActive(true);
+      [[center.lng,center.lat],[center.lng+0.001,center.lat],
+       [center.lng+0.001,center.lat+0.001]].forEach(point => {
+        map.fire('click',{lngLat:new maplibregl.LngLat(...point),originalEvent:{detail:1}});
+      });
+      const added = api.getState().measurement;
+      api.moveMeasurementPoint(1,[center.lng+0.0005,center.lat]);
+      const moved = api.getState().measurement;
+      api.removeMeasurementPoint(2);
+      const removed = api.getState().measurement;
+      api.setMeasurementActive(false);
+      const finished = api.getState().measurement;
+      api.clearMeasurement();
+      const after = api.getState();
+      return {before,added,moved,removed,finished,after,
+        zoomRestored:zoomEnabled === map.doubleClickZoom.isEnabled()};
+    })();""")
+    if not isinstance(result, dict):
+        raise AssertionError("Ground measurement did not report state")
+    if len(result["added"]["points"]) != 3 or result["added"]["meters"] <= 0:
+        raise AssertionError(f"Measurement map clicks failed: {result}")
+    if result["moved"]["points"][1] == result["added"]["points"][1]:
+        raise AssertionError(f"Measurement point did not move: {result}")
+    if len(result["removed"]["points"]) != 2 or result["removed"]["meters"] >= result["added"]["meters"]:
+        raise AssertionError(f"Measurement removal did not update the total: {result}")
+    if result["finished"]["active"] or not result["zoomRestored"]:
+        raise AssertionError(f"Measurement did not restore normal map interaction: {result}")
+    if result["after"]["measurement"] != {"active": False, "points": [], "meters": 0}:
+        raise AssertionError(f"Measurement did not clear: {result}")
+    for key in ("camera", "cursor", "playback"):
+        if not _camera_matches(result["before"][key], result["after"][key]):
+            raise AssertionError(f"Measurement changed flight {key}: {result}")
+    return {key: result[key] for key in ("added", "moved", "removed", "finished", "zoomRestored")}
+
+
+def _validate_imagery_zoom(page: Any, view: Any, output: Path) -> list[dict[str, Any]]:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    original = _run_js(page, "window.sloppyGpsMap.getState();")
+    results = []
+    _run_js(page, "window.sloppyGpsMap.setBasemap('imagery');"
+            "window.sloppyGpsMap.setImageryOpacity(1); window.__sloppyDebugMap.setMaxZoom(22); true;")
+    try:
+        for zoom in (16, 17, 18, 19, 21):
+            _run_js(page, "performance.clearResourceTimings();"
+                    f"window.__sloppyDebugMap.jumpTo({{zoom:{zoom},pitch:0,bearing:0}}); true;")
+            _wait_for_basemap_tiles(page, "__sloppyDebugMap")
+            state = _run_js(page, "window.sloppyGpsMap.getState();")
+            if not isinstance(state, dict) or state["basemap"]["provider"] != "naip":
+                raise AssertionError(f"Imagery provider disappeared at zoom {zoom}: {state}")
+            urls = _run_js(page, "performance.getEntriesByType('resource')"
+                           ".filter(e=>e.name.includes('ImageServer/exportImage')).map(e=>e.name);")
+            from urllib.parse import parse_qs, urlsplit
+            tile_zooms = []
+            for url in urls or []:
+                bbox = [float(value) for value in parse_qs(urlsplit(url).query)["bbox"][0].split(",")]
+                tile_zooms.append(round(math.log2(40075016.68557849 / (bbox[2] - bbox[0]))))
+            if any(level > 19 for level in tile_zooms):
+                raise AssertionError(f"Imagery requested unavailable detail above zoom 19: {tile_zooms}")
+            # MapLibre's 512-pixel camera world requests 256-pixel raster tiles
+            # one canonical level above camera zoom, capped at source maxzoom.
+            expected_level = min(zoom + 1, 19)
+            if tile_zooms and max(tile_zooms) != expected_level:
+                raise AssertionError(f"Imagery did not request the expected detail at zoom {zoom}: {tile_zooms}")
+            if expected_level not in tile_zooms:
+                # Already cached tiles need no network request; the source must
+                # still be complete at the new viewport.
+                loaded = _run_js(page, "window.__sloppyDebugMap.isSourceLoaded('usgs-naip-raster-source');")
+                if loaded is not True:
+                    raise AssertionError(f"Imagery did not complete the new zoom {zoom}")
+            screenshot = output.with_stem(output.stem + f"-zoom-{zoom}")
+            if not view.grab().save(str(screenshot)):
+                raise AssertionError(f"Could not save imagery zoom screenshot: {screenshot}")
+            results.append({"zoom": zoom, "tileZooms": sorted(set(tile_zooms)), "basemap": state["basemap"],
+                            "screenshot": str(screenshot)})
+    finally:
+        _run_js(page, f"window.__sloppyDebugMap.setMaxZoom({original['camera']['maxZoom']});"
+                f"window.__sloppyDebugMap.jumpTo({json.dumps(original['camera'])});"
+                f"window.sloppyGpsMap.setImageryOpacity({original['basemap']['imageryOpacity']}); true;")
+    return results
 
 
 def _assert_3d_state(state: dict[str, Any] | None, label: str, min_pitch: float | None = None) -> None:
@@ -415,6 +501,7 @@ def validate_gps_map_runtime(
         raise
 
     vendor_security = _validate_vendor_attribution_security(page, "__sloppyDebugMap")
+    ground_measurement = _validate_ground_measurement(page)
 
     cursor_payload = {
         "index": 3,
@@ -579,6 +666,8 @@ def validate_gps_map_runtime(
         view.close()
         raise AssertionError(f"GPS imagery providers did not recover on retry: {imagery_retry_state}")
 
+    imagery_zoom = _validate_imagery_zoom(page, view, output)
+
     outside_naip = _validate_outside_naip_fallback(
         page, view, "sloppyGpsMap", "__sloppyDebugMap",
         output.with_stem(output.stem + "-global-gibs"),
@@ -588,6 +677,10 @@ def validate_gps_map_runtime(
     view.resize(480, 360)
     _run_event_loop(250)
     narrow_overlay_layout = _assert_gps_overlay_layout(page)
+    _run_js(page, "window.sloppyGpsMap.setMeasurementActive(true); true;")
+    _run_event_loop(100)
+    narrow_measurement_layout = _assert_gps_overlay_layout(page)
+    _run_js(page, "window.sloppyGpsMap.setMeasurementActive(false); true;")
     view.grab().save(str(output.with_stem(output.stem + "-narrow")))
     view.resize(width, height)
     _run_event_loop(250)
@@ -611,8 +704,11 @@ def validate_gps_map_runtime(
     app.quit()
     return {
         "vendorSecurity": vendor_security,
+        "groundMeasurement": ground_measurement,
+        "imageryZoom": imagery_zoom,
         "overlayLayout": overlay_layout,
         "narrowOverlayLayout": narrow_overlay_layout,
+        "narrowMeasurementLayout": narrow_measurement_layout,
         "outsideNaip": outside_naip,
         "log": str(log_path),
         "html": str(html_path),
