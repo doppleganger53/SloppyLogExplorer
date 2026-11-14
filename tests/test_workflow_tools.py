@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import shutil
+import subprocess
 import zipfile
 from argparse import Namespace
 from pathlib import Path
 
 import pytest
+from tools import render_issue_prompt, session_preflight as preflight
 
 
 def load_tool(name: str):
@@ -18,8 +22,6 @@ def load_tool(name: str):
     return module
 
 
-preflight = load_tool("session_preflight")
-render_issue_prompt = load_tool("render_issue_prompt")
 release_notes = load_tool("write_release_notes")
 package_release = load_tool("package_release")
 
@@ -42,7 +44,7 @@ def test_issue_mode_blocks_on_main(monkeypatch: pytest.MonkeyPatch, capsys: pyte
     assert result == 2
     assert "Result: BLOCKED" in output
     assert "Issue-linked work cannot mutate on 'main'." in output
-    assert "git checkout -b feature/12-map-playback" in output
+    assert f'git -C "{preflight.repo_root()}" checkout -b feature/12-map-playback' in output
 
 
 def test_issue_mode_reports_dirty_worktree(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -151,7 +153,73 @@ def test_render_issue_prompt_fetches_with_gh(monkeypatch: pytest.MonkeyPatch) ->
     issue = render_issue_prompt.fetch_issue("7")
 
     assert issue["number"] == 7
-    assert calls == [["issue", "view", "7", "--json", "number,title,url,state,labels,body"]]
+    assert calls == [[
+        "issue", "view", "7", "--repo", "github.com/doppleganger53/SloppyLogExplorer",
+        "--json", "number,title,url,state,labels,body",
+    ]]
+
+
+def test_workflow_tools_use_selected_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    root = Path(preflight.__file__).resolve().parents[1]
+    checkout = tmp_path / "implementation"
+    sibling = tmp_path / "sibling"
+    linked = tmp_path / "linked worktree"
+    git = shutil.which("git")
+    assert git
+    for path in (checkout, sibling):
+        subprocess.run([git, "init", "-q", "-b", "main", str(path)], check=True)
+    for name in ("sloppy_log_explorer/__init__.py", "prompts/templates/ISSUE_RESOLUTION_TEMPLATE.md"):
+        (checkout / name).parent.mkdir(parents=True)
+        shutil.copy(root / name, checkout / name)
+    subprocess.run([git, "-C", str(checkout), "add", "."], check=True)
+    subprocess.run([
+        git, "-C", str(checkout), "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "commit.gpgSign=false", "commit", "-qm", "fixture",
+    ], check=True)
+    branch = "fix/7-map"
+    subprocess.run([git, "-C", str(sibling), "switch", "-c", branch], check=True)
+    subprocess.run([git, "-C", str(checkout), "worktree", "add", "-qb", branch, str(linked)], check=True)
+
+    issue_args = ["--mode", "issue", "--issue-number", "7", "--issue-kind", "bug", "--slug", "map"]
+    monkeypatch.setattr(preflight, "__file__", str(checkout / "tools" / "session_preflight.py"))
+    for caller in (sibling, tmp_path):
+        monkeypatch.chdir(caller)
+        assert preflight.main(issue_args) == 2
+        assert "Current branch: main" in capsys.readouterr().out
+
+    monkeypatch.setattr(preflight, "__file__", str(linked / "tools" / "session_preflight.py"))
+    monkeypatch.chdir(sibling)
+    assert preflight.main(issue_args) == 0
+    assert f"Current branch: {branch}" in capsys.readouterr().out
+    subprocess.run([git, "-C", str(linked), "switch", "-c", "custom"], check=True)
+    assert preflight.main(issue_args) == 0
+    assert "PASS_WITH_WARNING" in capsys.readouterr().out
+    subprocess.run([git, "-C", str(linked), "switch", "--detach"], check=True)
+    assert preflight.main(issue_args) == 2
+    assert "detached HEAD" in capsys.readouterr().out
+
+    # Supply a colliding issue number in the caller's default GitHub repository.
+    monkeypatch.setenv("GH_REPO", "example/sibling")
+
+    def stub_gh(command, *, cwd, **kwargs):
+        assert command[:6] == ["gh", "issue", "view", "7", "--repo", "github.com/doppleganger53/SloppyLogExplorer"]
+        assert cwd == linked
+        return subprocess.CompletedProcess(command, 0, json.dumps({"number": 7, "title": "Map", "state": "OPEN"}))
+
+    monkeypatch.setattr(subprocess, "run", stub_gh)
+    for caller in (sibling, tmp_path):
+        monkeypatch.chdir(caller)
+        assert render_issue_prompt.main(["--issue-number", "7"]) == 0
+        assert not (caller / "prompts").exists()
+    assert (linked / "prompts/issues/ISSUE-7-map.md").is_file()
+    assert not (checkout / "prompts/issues").exists()
+    assert render_issue_prompt.main(["--issue-number", "7", "--output-dir", "explicit-directory"]) == 0
+    assert (tmp_path / "explicit-directory/ISSUE-7-map.md").is_file()
+
+    monkeypatch.setattr(preflight, "__file__", str(sibling / "tools" / "session_preflight.py"))
+    with pytest.raises(SystemExit, match="no checkout found"):
+        render_issue_prompt.main(["--issue-number", "7"])
+    assert not (sibling / "prompts").exists()
 
 
 SAMPLE_CHANGELOG = """# Changelog

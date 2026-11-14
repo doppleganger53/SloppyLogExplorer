@@ -17,7 +17,10 @@ ISSUE_KIND_TO_PREFIX = {
 
 
 def run_git(args: list[str]) -> str:
-    result = subprocess.run(["git", *args], text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        ["git", "--git-dir=.git", "--work-tree=.", *args],
+        cwd=repo_root(), text=True, capture_output=True, check=False,
+    )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         suffix = f": {detail}" if detail else ""
@@ -26,7 +29,11 @@ def run_git(args: list[str]) -> str:
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1]
+    # Linked worktrees have a .git file instead of a directory.
+    if not (root / ".git").exists() or not (root / "sloppy_log_explorer" / "__init__.py").is_file():
+        raise RuntimeError(f"Run this tool from a SloppyLogExplorer Git checkout; no checkout found at {root}")
+    return root
 
 
 def read_project_version(pyproject_path: Path | None = None) -> str:
@@ -103,23 +110,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def run_preflight(args: argparse.Namespace) -> int:
     try:
+        checkout = repo_root()
         branch = get_current_branch()
         dirty = is_worktree_dirty()
     except RuntimeError as exc:
         print(f"Result: ERROR\n{exc}")
         return 1
 
+    print(f"Checkout: {checkout}")
     if args.mode == "issue":
         recommended = build_recommended_branch(args.issue_kind, args.issue_number, args.slug)
         print("Mode: issue")
-        print(f"Current branch: {branch}")
+        print(f"Current branch: {branch or '(detached HEAD)'}")
         print(f"Worktree dirty: {'yes' if dirty else 'no'}")
         print(f"Recommended issue branch: {recommended}")
+        if not branch:
+            print("Result: BLOCKED")
+            print("Issue-linked work requires a branch. Switch from detached HEAD before editing.")
+            return 2
         if branch == "main":
             print("Result: BLOCKED")
             print("Issue-linked work cannot mutate on 'main'.")
-            print(f"Create/switch branch: git checkout -b {recommended}")
-            print(f"If branch exists: git checkout {recommended}")
+            print(f'Create/switch branch: git -C "{checkout}" checkout -b {recommended}')
+            print(f'If branch exists: git -C "{checkout}" checkout {recommended}')
             return 2
         if branch != recommended:
             print("Result: PASS_WITH_WARNING")
@@ -148,7 +161,7 @@ def run_preflight(args: argparse.Namespace) -> int:
         if branch != expected_branch:
             print("Result: BLOCKED")
             print(f"Release work must run on '{expected_branch}'.")
-            print(f"Create/switch branch: git checkout -b {expected_branch}")
+            print(f'Create/switch branch: git -C "{checkout}" checkout -b {expected_branch}')
             return 2
         print("Result: PASS")
         return 0

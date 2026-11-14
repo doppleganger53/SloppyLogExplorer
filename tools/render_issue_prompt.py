@@ -11,20 +11,17 @@ from pathlib import Path
 from typing import Any
 
 
-KIND_TO_BRANCH_PREFIX = {
-    "enhancement": "feature",
-    "bug": "fix",
-    "docs": "docs",
-    "chore": "chore",
-}
+if __package__:
+    from .session_preflight import ISSUE_KIND_TO_PREFIX, repo_root
+else:
+    from session_preflight import ISSUE_KIND_TO_PREFIX, repo_root
 
 
-def repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+GITHUB_REPO = "github.com/doppleganger53/SloppyLogExplorer"
 
 
 def run_gh(args: list[str]) -> str:
-    result = subprocess.run(["gh", *args], text=True, capture_output=True, check=False)
+    result = subprocess.run(["gh", *args], cwd=repo_root(), text=True, capture_output=True, check=False)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         suffix = f": {detail}" if detail else ""
@@ -66,6 +63,8 @@ def fetch_issue(issue_number: str) -> dict[str, Any]:
             "issue",
             "view",
             issue_number,
+            "--repo",
+            GITHUB_REPO,
             "--json",
             "number,title,url,state,labels,body",
         ]
@@ -94,7 +93,7 @@ def render_issue_prompt(
         raise ValueError("Issue metadata is missing a number.")
     resolved_kind = issue_kind or infer_issue_kind(labels, title)
     resolved_slug = slug or slugify(title)
-    branch = f"{KIND_TO_BRANCH_PREFIX[resolved_kind]}/{number}-{resolved_slug}"
+    branch = f"{ISSUE_KIND_TO_PREFIX[resolved_kind]}/{number}-{resolved_slug}"
     template_file = template_path or repo_root() / "prompts" / "templates" / "ISSUE_RESOLUTION_TEMPLATE.md"
     template = template_file.read_text(encoding="utf-8")
     body = str(issue.get("body", "")).strip() or "(no issue body)"
@@ -130,9 +129,9 @@ def render_issue_prompt(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a local issue-resolution prompt from GitHub issue metadata.")
     parser.add_argument("--issue-number", required=True)
-    parser.add_argument("--issue-kind", choices=sorted(KIND_TO_BRANCH_PREFIX))
+    parser.add_argument("--issue-kind", choices=sorted(ISSUE_KIND_TO_PREFIX))
     parser.add_argument("--slug", help="Override the generated lowercase kebab-case slug.")
-    parser.add_argument("--output-dir", type=Path, default=Path("prompts/issues"))
+    parser.add_argument("--output-dir", type=Path, help="Override this checkout's prompts/issues directory.")
     parser.add_argument("--dry-run", action="store_true", help="Print the rendered prompt instead of writing it.")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[0-9]+", args.issue_number):
@@ -152,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print(rendered)
         return 0
-    output_dir = args.output_dir
+    output_dir = args.output_dir or repo_root() / "prompts" / "issues"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
     output_path.write_text(rendered, encoding="utf-8")
