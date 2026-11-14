@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -412,7 +413,8 @@ def release_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     release_git(repo, "init", "-q")
-    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("dist/\n*.tmp\n", encoding="utf-8")
+    (repo / "main.py").write_text("print('fixture')\n", encoding="utf-8")
     (repo / "pyproject.toml").write_text('[project]\nversion = "1.2.3"\n', encoding="utf-8")
     for filename in package_release.RELEASE_DOCUMENTS:
         (repo / filename).write_text(filename, encoding="utf-8")
@@ -454,6 +456,61 @@ def test_public_zip_requires_onefile_even_when_local_onedir_exists(release_candi
     local = exe.parent / "SloppyLogExplorer-1.2.3-local.zip"
     with zipfile.ZipFile(local) as archive:
         assert archive.read(f"SloppyLogExplorer/{exe.name}") == b"older onedir build"
+
+
+def test_public_zip_preserves_source_and_git_metadata(release_candidate) -> None:
+    repo, _exe, output, args = release_candidate
+    tracked = repo / "dist" / "tracked.zip"
+    tracked.write_bytes(b"tracked ZIP")
+    release_git(repo, "add", "-f", "dist/tracked.zip")
+    release_git(repo, "commit", "-qm", "track a fixture archive")
+    args[1] = release_git(repo, "rev-parse", "HEAD")
+    metadata = repo / ".git" / "metadata.zip"
+    metadata.write_bytes(b"git metadata")
+    output.write_bytes(b"previous public ZIP")
+    for target in [repo / "main.py", tracked, repo / "dist" / ".." / ".git" / metadata.name]:
+        before = target.read_bytes()
+        with pytest.raises(SystemExit):
+            package_release.main([*args, "--output", str(target)])
+        assert target.read_bytes() == before
+        assert output.read_bytes() == b"previous public ZIP"
+    assert not release_git(repo, "status", "--porcelain")
+
+
+def test_public_zip_stages_at_explicit_external_destination(release_candidate) -> None:
+    repo, _exe, _output, args = release_candidate
+    target = repo.parent / "external staging" / "release.zip"
+    assert package_release.main([*args, "--output", str(target)]) == 0
+    with zipfile.ZipFile(target) as archive:
+        assert archive.testzip() is None
+    assert not release_git(repo, "status", "--porcelain")
+
+
+def test_public_zip_preserves_tracked_zip_in_sibling_checkout(release_candidate) -> None:
+    repo, _exe, _output, args = release_candidate
+    sibling = repo.parent / "sibling"
+    sibling.mkdir()
+    release_git(sibling, "init", "-q")
+    target = sibling / "release.zip"
+    target.write_bytes(b"tracked sibling asset")
+    release_git(sibling, "add", "release.zip")
+    release_git(sibling, "commit", "-qm", "sibling fixture")
+    with pytest.raises(SystemExit, match="outside other Git repositories"):
+        package_release.main([*args, "--output", str(target)])
+    assert not release_git(sibling, "status", "--porcelain")
+
+
+def test_public_zip_rejects_directory_link_to_git_metadata(release_candidate) -> None:
+    repo, _exe, _output, args = release_candidate
+    alias = repo / "dist" / "alias"
+    if os.name == "nt":
+        subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(alias), str(repo / ".git")],
+                       check=True, capture_output=True)
+    else:
+        alias.symlink_to(repo / ".git", target_is_directory=True)
+    with pytest.raises(SystemExit):
+        package_release.main([*args, "--output", str(alias / "release.zip")])
+    assert not (repo / ".git" / "release.zip").exists()
 
 
 @pytest.mark.parametrize("committed", [False, True])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -94,20 +95,62 @@ def package_release(
     return output_path
 
 
+def git(root: Path, *args: str) -> str:
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Could not verify release checkout")
+    return result.stdout.strip()
+
+
+def release_output(root: Path, output: Path) -> Path:
+    # Use the same canonical destination for checks and replacement. In
+    # particular, do not replace a tracked symlink even if its target is safe.
+    path = output.resolve()
+    if output.is_symlink():
+        raise ValueError("Release output cannot replace a symbolic link")
+    if path.suffix.lower() != ".zip":
+        raise ValueError("Public release output must be a .zip file")
+    if os.name == "nt":
+        if path.is_reserved() or any(":" in part or part.endswith((" ", ".")) for part in path.parts[1:]):
+            raise ValueError("Ambiguous Windows release output path")
+    metadata = [
+        Path(directory).resolve() for directory in
+        git(root, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").splitlines()
+    ]
+    if any(part.casefold() == ".git" for part in (*output.parts, *path.parts)) or any(
+        path.is_relative_to(directory) for directory in metadata
+    ):
+        raise ValueError("Release output cannot be inside Git metadata")
+    # Probe from an existing parent to recognize sibling and nested worktrees,
+    # even when the requested archive's own directory has not been created.
+    parent = next((directory for directory in path.parents if directory.is_dir()), None)
+    if parent is None:
+        raise ValueError("Release output needs an accessible parent directory")
+    owner = subprocess.run(
+        ["git", "-C", str(parent), "rev-parse", "--absolute-git-dir"], capture_output=True, text=True
+    )
+    if path.is_relative_to(root):
+        if owner.returncode or Path(owner.stdout.strip()).resolve() != metadata[0]:
+            raise ValueError("Release output belongs to a different checkout")
+        relative = path.relative_to(root).as_posix()
+        if git(root, "ls-files", "--", f":(literal,icase){relative}"):
+            raise ValueError("Release output cannot replace a tracked path")
+        ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative])
+        if ignored.returncode != 0:
+            raise ValueError("Use a Git-ignored release ZIP path or an external staging directory")
+    elif owner.returncode == 0:
+        raise ValueError("External release staging must be outside other Git repositories")
+    return path
+
+
 def verify_source(root: Path, source_commit: str) -> str:
     if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source_commit):
         raise ValueError("Supply the full source commit recorded before the clean onefile build")
 
-    def git(*args: str) -> str:
-        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or "Could not verify release source")
-        return result.stdout.strip()
-
-    if git("status", "--porcelain", "--untracked-files=all"):
+    if git(root, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("Release source has uncommitted changes")
     tested_tree, current_tree = git(
-        "rev-parse", f"{source_commit}^{{commit}}^{{tree}}", "HEAD^{tree}"
+        root, "rev-parse", f"{source_commit}^{{commit}}^{{tree}}", "HEAD^{tree}"
     ).splitlines()
     if current_tree != tested_tree:
         raise ValueError("Release source tree differs from the recorded build; rebuild and revalidate")
@@ -141,7 +184,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--source-commit", help="Full Git commit ID recorded before building the tested onefile.")
     parser.add_argument("--tested-exe-sha256", help="SHA-256 recorded for the onefile that passed packaged tests.")
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--output", type=Path, help="Override the archive path. Public output requires an untracked .zip file.")
     args = parser.parse_args(argv)
     if args.dist_dir is not None:
         if args.source_commit or args.tested_exe_sha256:
@@ -169,12 +212,14 @@ def main(argv: list[str] | None = None) -> int:
         if not package_source.is_file():
             raise FileNotFoundError(f"Required onefile executable missing: {package_source}")
         tree = verify_source(root, args.source_commit)
+        output = release_output(root, args.output or dist / default_archive_name(version))
 
         def verify(archive_path: Path) -> None:
             verify_onefile_zip(archive_path, args.tested_exe_sha256, root)
             verify_source(root, args.source_commit)
+            if release_output(root, output) != output:
+                raise ValueError("Release output moved during packaging")
 
-        output = args.output or dist / default_archive_name(version)
         archive = package_release(package_source, output, documentation_root=root, verify=verify)
     except (RuntimeError, OSError, ValueError, zipfile.BadZipFile) as exc:
         raise SystemExit(str(exc)) from exc

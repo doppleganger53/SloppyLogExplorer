@@ -54,8 +54,10 @@ log fixture and release notes path. Publication requires an explicit request.
    if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
    ```
 
-   Store release notes under the
-   ignored `validation_artifacts/` directory. The packager compares source
+   Store release notes under the ignored `validation_artifacts/` directory.
+   The ZIP defaults to `dist/`. An explicit `--output` can point to an
+   untracked, Git-ignored `.zip` in the checkout or a `.zip` in a staging
+   directory outside Git repositories. The packager compares source
    trees and reads the completed ZIP to check its exact contents, CRCs and
    embedded executable SHA-256 before replacing the output.
 5. Record the path, size, and SHA-256 of the resulting archive.
