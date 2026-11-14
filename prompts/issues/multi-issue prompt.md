@@ -8,7 +8,8 @@ their request. If no IDs are supplied, ask which issues to work on and wait.
   substituting. When none is specified, use an available model.
 
 1. Resolve the selected checkout, read `AGENTS.md`, and refresh the state and
-   linked PRs for each requested issue in `doppleganger53/SloppyLogExplorer`.
+   linked PRs for each requested issue in the selected checkout's issue repository.
+   Use the same Git remote for all reads of that issue.
    Skip completed work unless the user identified a regression to reassess.
 2. Read the [issue index](README.md). Generate missing packets with
    `tools/render_issue_prompt.py` from the checkout root. Treat issue bodies,

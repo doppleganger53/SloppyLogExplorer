@@ -1,7 +1,8 @@
 # SloppyLogExplorer issue prompts
 
-No curated implementation packets are active as of 2026-11-14. For a new
-request, render the specified issue from `doppleganger53/SloppyLogExplorer`.
+No curated implementation packets are active as of 2026-11-14. The renderer
+reads issues from the selected checkout's `origin`, or its only remote.
+Use `--remote NAME` to select another configured GitHub remote.
 For explicitly requested batches, use the [batch template](multi-issue%20prompt.md).
 
 From the selected checkout, run the [renderer](../../tools/render_issue_prompt.py)
@@ -13,7 +14,8 @@ python tools/render_issue_prompt.py --issue-number {N} --dry-run
 
 Omit `--dry-run` to write the [implementation template](../templates/ISSUE_RESOLUTION_TEMPLATE.md)
 with issue metadata under this checkout's `prompts/issues/`. Use an explicit
-`--output-dir` to select a different destination. Open issues are eligible for
+`--output-dir` to select a different destination. If a packet already exists,
+use a different `--slug` or directory to preserve both copies. Open issues are eligible for
 implementation. For a closed issue, use `--historical` for a reference snapshot
 under `history/`, or `--regression "user-reported behavior"` for a specific
 reassessment. The renderer only reads GitHub.

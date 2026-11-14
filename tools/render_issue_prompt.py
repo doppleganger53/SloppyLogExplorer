@@ -9,15 +9,40 @@ import sys
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 if __package__:
-    from .session_preflight import ISSUE_KIND_TO_PREFIX, repo_root
+    from .session_preflight import ISSUE_KIND_TO_PREFIX, repo_root, run_git
 else:
-    from session_preflight import ISSUE_KIND_TO_PREFIX, repo_root
+    from session_preflight import ISSUE_KIND_TO_PREFIX, repo_root, run_git
 
 
-GITHUB_REPO = "github.com/doppleganger53/SloppyLogExplorer"
+def github_repository(remote: str | None) -> str:
+    remotes = run_git(["remote"]).splitlines()
+    if remote is None:
+        if "origin" in remotes:
+            remote = "origin"
+        elif len(remotes) == 1:
+            remote = remotes[0]
+        else:
+            raise ValueError("Cannot select an issue repository. Specify a checkout remote with --remote NAME.")
+    if remote not in remotes:
+        raise ValueError(f"Remote {remote!r} is not configured in the selected checkout.")
+    url = run_git(["remote", "get-url", "--", remote])
+    # Convert Git's SCP-style SSH address to a URL before extracting the host
+    # and repository. Credentials in HTTPS remotes must never reach CLI output.
+    if "://" not in url:
+        match = re.fullmatch(r"(?:[\w.-]+@)?([\w.-]+):([^\\]+)", url)
+        if not match:
+            raise ValueError(f"Remote {remote!r} needs a GitHub fetch URL. Select a GitHub remote with --remote.")
+        url = f"ssh://{match[1]}/{match[2]}"
+    parsed = urlsplit(url)
+    path = parsed.path.strip("/").removesuffix(".git")
+    if (parsed.scheme not in {"https", "http", "ssh", "git"} or not parsed.hostname
+            or not re.fullmatch(r"[\w.-]+/[\w.-]+", path)):
+        raise ValueError(f"Remote {remote!r} needs a GitHub fetch URL. Select a GitHub remote with --remote.")
+    return f"{parsed.hostname}/{path}"
 
 
 def run_gh(args: list[str]) -> str:
@@ -57,14 +82,14 @@ def infer_issue_kind(labels: list[str], title: str) -> str:
     return "enhancement"
 
 
-def fetch_issue(issue_number: str) -> dict[str, Any]:
+def fetch_issue(issue_number: str, remote: str | None = None) -> dict[str, Any]:
     payload = run_gh(
         [
             "issue",
             "view",
             issue_number,
             "--repo",
-            GITHUB_REPO,
+            github_repository(remote),
             "--json",
             "number,title,url,state,labels,body",
         ]
@@ -153,6 +178,7 @@ def render_issue_prompt(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a local issue-resolution prompt from GitHub issue metadata.")
     parser.add_argument("--issue-number", required=True)
+    parser.add_argument("--remote", help="Git remote for issue lookup. Defaults to origin or the only remote.")
     parser.add_argument("--issue-kind", choices=sorted(ISSUE_KIND_TO_PREFIX))
     parser.add_argument("--slug", help="Override the generated lowercase kebab-case slug.")
     mode = parser.add_mutually_exclusive_group()
@@ -171,7 +197,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        issue = fetch_issue(args.issue_number)
+        issue = fetch_issue(args.issue_number, args.remote)
         filename, rendered = render_issue_prompt(
             issue, issue_kind=args.issue_kind, slug=args.slug, historical=args.historical, regression=args.regression,
         )
@@ -185,7 +211,16 @@ def main(argv: list[str] | None = None) -> int:
         output_dir /= "history"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / filename
-    output_path.write_text(rendered, encoding="utf-8")
+    try:
+        stream = output_path.open("x", encoding="utf-8")
+    except FileExistsError:
+        raise SystemExit(f"Prompt already exists: {output_path}. Choose another --slug or --output-dir.") from None
+    try:
+        with stream:
+            stream.write(rendered)
+    except OSError:
+        output_path.unlink(missing_ok=True)
+        raise
     print(f"Wrote issue prompt: {output_path}")
     return 0
 
