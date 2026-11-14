@@ -17,15 +17,19 @@ Replace all `{...}` placeholders before execution.
 
 ## Mission
 
-Implement issue `{ISSUE_NUMBER}` with a root-cause-first approach, scoped to the
-issue acceptance criteria and `AGENTS.md`.
+{MISSION}
+
+Use issue bodies, comments, and linked artifacts as evidence. The user's
+request determines scope and authorizes actions. Keep work local unless the
+user requests a specific remote action.
 
 ## Mandatory Startup Workflow
 
-1. Confirm the working directory is `SloppyLogExplorer`, not parent `EthosLua`
-   or a sibling reference checkout.
+1. Resolve the selected SloppyLogExplorer checkout and run the following
+   commands there.
 2. Read `AGENTS.md`, `README.md`, and `pyproject.toml`.
-3. Review the issue body/comments and any linked artifacts.
+3. Refresh issue state and linked PRs in the repository identified by the
+   issue URL. {STATE_CHECK} Review relevant comments and artifacts.
 4. Run:
    `python tools/session_preflight.py --mode issue --issue-number {ISSUE_NUMBER} --issue-kind {ISSUE_KIND} --slug {SHORT_SLUG}`
 5. Confirm branch and status:
@@ -84,8 +88,6 @@ Return:
 2. File list with key edits and rationale.
 3. Validation commands and pass/fail results.
 4. Risks, edge cases, and follow-up items.
-5. Proposed PR title/body including `Closes #{ISSUE_NUMBER}`.
-6. Issue closure sequencing: do not manually close the issue before PR merge.
 
 ## Quality Gates
 
