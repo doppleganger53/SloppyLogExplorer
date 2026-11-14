@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -349,14 +350,88 @@ def test_package_release_writes_onefile_and_release_documents(tmp_path: Path) ->
         ]
 
 
-def test_resolve_dist_source_prefers_onefile(tmp_path: Path) -> None:
-    dist = tmp_path / "dist"
-    onefile = dist / "SloppyLogExplorer.exe"
-    onedir = dist / "SloppyLogExplorer"
-    onedir.mkdir(parents=True)
-    onefile.write_text("exe", encoding="utf-8")
+def release_git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=Release Test", "-c", "user.email=test@example.invalid", *args],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
 
-    assert package_release.resolve_dist_source(dist) == onefile
+
+@pytest.fixture
+def release_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    release_git(repo, "init", "-q")
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    (repo / "pyproject.toml").write_text('[project]\nversion = "1.2.3"\n', encoding="utf-8")
+    for filename in package_release.RELEASE_DOCUMENTS:
+        (repo / filename).write_text(filename, encoding="utf-8")
+    release_git(repo, "add", ".")
+    release_git(repo, "commit", "-qm", "release source")
+    commit = release_git(repo, "rev-parse", "HEAD")
+    exe = repo / "dist" / "SloppyLogExplorer.exe"
+    exe.parent.mkdir()
+    exe.write_bytes(b"tested onefile")
+    digest = hashlib.sha256(exe.read_bytes()).hexdigest()
+    output = exe.parent / package_release.default_archive_name("1.2.3")
+    monkeypatch.setattr(package_release, "repo_root", lambda: repo)
+    monkeypatch.chdir(tmp_path)  # Defaults always refer to the intended checkout.
+    return repo, exe, output, ["--source-commit", commit, "--tested-exe-sha256", digest]
+
+
+def test_public_zip_reads_back_tested_onefile_from_same_tree(release_candidate, capsys) -> None:
+    repo, exe, output, args = release_candidate
+    release_git(repo, "commit", "--allow-empty", "-qm", "identical integrated tree")
+    assert package_release.main(args) == 0
+    assert release_git(repo, "rev-parse", "HEAD^{tree}") in capsys.readouterr().out
+    with zipfile.ZipFile(output) as archive:
+        assert sorted(archive.namelist()) == sorted((exe.name, *package_release.RELEASE_DOCUMENTS))
+        assert hashlib.sha256(archive.read(exe.name)).hexdigest() == args[-1]
+        for filename in package_release.RELEASE_DOCUMENTS:
+            assert archive.read(filename) == (repo / filename).read_bytes()
+
+
+def test_public_zip_requires_onefile_even_when_local_onedir_exists(release_candidate) -> None:
+    _repo, exe, output, args = release_candidate
+    exe.unlink()
+    onedir = exe.parent / "SloppyLogExplorer"
+    onedir.mkdir()
+    (onedir / exe.name).write_bytes(b"older onedir build")
+    with pytest.raises(SystemExit, match="Required onefile executable missing"):
+        package_release.main(args)
+    assert not output.exists()
+    assert package_release.main(["--dist-dir", str(onedir)]) == 0
+    local = exe.parent / "SloppyLogExplorer-1.2.3-local.zip"
+    with zipfile.ZipFile(local) as archive:
+        assert archive.read(f"SloppyLogExplorer/{exe.name}") == b"older onedir build"
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_changed_source_cannot_use_previous_release_evidence(release_candidate, committed) -> None:
+    repo, _exe, output, args = release_candidate
+    (repo / "README.md").write_text("changed input", encoding="utf-8")
+    if committed:
+        release_git(repo, "commit", "-qam", "merged change")
+    with pytest.raises(SystemExit, match="uncommitted changes|tree differs"):
+        package_release.main(args)
+    assert not output.exists()
+
+
+def test_wrong_archived_exe_preserves_previous_release(release_candidate, monkeypatch) -> None:
+    _repo, exe, output, args = release_candidate
+    output.write_bytes(b"previous ZIP")
+    write = zipfile.ZipFile.write
+
+    def write_other_exe(archive, path, name):
+        if name == exe.name:
+            archive.writestr(name, b"different bytes while archiving")
+        else:
+            write(archive, path, name)
+
+    monkeypatch.setattr(zipfile.ZipFile, "write", write_other_exe)
+    with pytest.raises(SystemExit, match="Archived executable SHA-256 differs"):
+        package_release.main(args)
+    assert output.read_bytes() == b"previous ZIP"
 
 
 def test_package_release_reads_pyproject_version(tmp_path: Path) -> None:

@@ -42,9 +42,9 @@ Run the checks that match touched files:
 - Version source of truth is `[project].version` in `pyproject.toml`.
 - Release branches use `release/v{version}`.
 - Release notes come from `CHANGELOG.md`.
-- Build Windows output, then archive it with:
-  `python tools/package_release.py`
-- Publish release notes with `gh release create --notes-file`.
+- Follow the [Windows release procedure](prompts/templates/RELEASE_RESOLUTION_TEMPLATE.md)
+  to prepare the verified onefile archive. Its publication section applies
+  when external release actions have been authorized.
 
 ## Git And Artifact Hygiene
 

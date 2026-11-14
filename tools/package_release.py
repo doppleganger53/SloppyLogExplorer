@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
+import subprocess
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 
 APP_NAME = "SloppyLogExplorer"
 RELEASE_DOCUMENTS = ("README.md", "NOTICE.md", "LICENSE", "CHANGELOG.md")
+ONEFILE_NAME = f"{APP_NAME}.exe"
 
 
 def repo_root() -> Path:
@@ -64,6 +68,8 @@ def package_release(
     package_source: Path,
     output_path: Path,
     documentation_root: Path | None = None,
+    *,
+    verify: Callable[[Path], None] | None = None,
 ) -> Path:
     # Validate before touching an existing archive or creating output inside a
     # directory that is about to be archived.
@@ -80,46 +86,100 @@ def package_release(
         with zipfile.ZipFile(temporary_path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path, archive_name in entries:
                 archive.write(path, archive_name)
+        if verify is not None:
+            verify(temporary_path)
         temporary_path.replace(output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
     return output_path
 
 
-def resolve_dist_source(dist_root: Path = Path("dist")) -> Path:
-    onefile = dist_root / f"{APP_NAME}.exe"
-    if onefile.is_file():
-        return onefile
-    onedir = dist_root / APP_NAME
-    if onedir.is_dir():
-        return onedir
-    raise FileNotFoundError(f"No {APP_NAME} onefile executable or onedir package found under {dist_root}")
+def verify_source(root: Path, source_commit: str) -> str:
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", source_commit):
+        raise ValueError("Supply the full source commit recorded before the clean onefile build")
+
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "Could not verify release source")
+        return result.stdout.strip()
+
+    if git("status", "--porcelain", "--untracked-files=all"):
+        raise ValueError("Release source has uncommitted changes")
+    tested_tree, current_tree = git(
+        "rev-parse", f"{source_commit}^{{commit}}^{{tree}}", "HEAD^{tree}"
+    ).splitlines()
+    if current_tree != tested_tree:
+        raise ValueError("Release source tree differs from the recorded build; rebuild and revalidate")
+    return tested_tree
+
+
+def verify_onefile_zip(archive_path: Path, tested_exe_sha256: str, documentation_root: Path) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        if sorted(archive.namelist()) != sorted((ONEFILE_NAME, *RELEASE_DOCUMENTS)):
+            raise ValueError("ZIP must contain the named onefile executable and all release documents")
+        digest = hashlib.sha256()
+        with archive.open(ONEFILE_NAME) as member:
+            for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != tested_exe_sha256.lower():
+            raise ValueError("Archived executable SHA-256 differs from the tested executable")
+        for filename in RELEASE_DOCUMENTS:
+            if archive.read(filename) != (documentation_root / filename).read_bytes():
+                raise ValueError(f"Archived release document differs from its source: {filename}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a Windows release ZIP from the minimal onefile or onedir build."
+        description="Package the verified Windows onefile release, or an explicit local build."
     )
     parser.add_argument("--version", help="Release version. Defaults to pyproject.toml.")
     parser.add_argument(
         "--dist-dir",
         type=Path,
-        help="Packaged app file or directory. Defaults to dist/SloppyLogExplorer.exe, then dist/SloppyLogExplorer.",
+        help="Package an explicit local file or onedir directory without public release verification.",
     )
+    parser.add_argument("--source-commit", help="Full Git commit ID recorded before building the tested onefile.")
+    parser.add_argument("--tested-exe-sha256", help="SHA-256 recorded for the onefile that passed packaged tests.")
     parser.add_argument("--output", type=Path)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.dist_dir is not None:
+        if args.source_commit or args.tested_exe_sha256:
+            parser.error("--dist-dir is for local packaging and cannot take release evidence")
+    elif not args.source_commit or not re.fullmatch(r"[0-9a-fA-F]{64}", args.tested_exe_sha256 or ""):
+        parser.error("onefile release requires --source-commit and a 64-digit --tested-exe-sha256")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        version = args.version or read_project_version()
-        output = args.output or Path("dist") / default_archive_name(version)
-        package_source = args.dist_dir or resolve_dist_source()
-        archive = package_release(package_source, output, documentation_root=repo_root())
-    except (RuntimeError, OSError, ValueError) as exc:
+        root = repo_root()
+        dist = root / "dist"
+        project_version = read_project_version()
+        version = args.version or project_version
+        if args.dist_dir is not None:
+            output = args.output or dist / f"{APP_NAME}-{version}-local.zip"
+            archive = package_release(args.dist_dir, output, documentation_root=root)
+            print(f"Wrote local archive: {archive}")
+            return 0
+        if version != project_version:
+            raise ValueError("Requested release version differs from pyproject.toml")
+        package_source = dist / ONEFILE_NAME
+        if not package_source.is_file():
+            raise FileNotFoundError(f"Required onefile executable missing: {package_source}")
+        tree = verify_source(root, args.source_commit)
+
+        def verify(archive_path: Path) -> None:
+            verify_onefile_zip(archive_path, args.tested_exe_sha256, root)
+            verify_source(root, args.source_commit)
+
+        output = args.output or dist / default_archive_name(version)
+        archive = package_release(package_source, output, documentation_root=root, verify=verify)
+    except (RuntimeError, OSError, ValueError, zipfile.BadZipFile) as exc:
         raise SystemExit(str(exc)) from exc
-    print(f"Wrote release archive: {archive}")
+    print(f"Wrote release archive: {archive}\nBuild commit: {args.source_commit}\nSource tree: {tree}")
+    print(f"Archived EXE SHA-256: {args.tested_exe_sha256.lower()}")
     return 0
 
 
