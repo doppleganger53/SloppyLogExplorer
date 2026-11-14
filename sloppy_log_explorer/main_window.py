@@ -60,6 +60,7 @@ from .analysis import (
     suggest_display_columns,
 )
 from .library import group_by_model, scan_library
+from .flight_log_widget import FlightLogWidget
 from .map_basemaps import BASEMAP_CHOICES, BASEMAP_IMAGERY, BASEMAP_OPENSTREETMAP
 from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
@@ -251,6 +252,7 @@ class MainWindow(QMainWindow):
         if tools_menu is None:
             raise RuntimeError("Failed to create Tools menu")
         tools_menu.addAction("Scan Sync Candidates", self.scan_sync)
+        tools_menu.addAction("Manage Flight Logs", lambda: self.tabs.setCurrentWidget(self.flight_logs_tab))
         tools_menu.addAction("Generate Voice Pack", self.generate_voice_pack)
 
         help_menu = menu_bar.addMenu("Help")
@@ -350,6 +352,9 @@ class MainWindow(QMainWindow):
         self._build_gps_tab()
         self._build_reception_tab()
         self._build_flight_tab()
+        self.flight_logs_tab = FlightLogWidget(self.store, self)
+        self.flight_logs_tab.library_requested.connect(self.open_library_dialog)
+        self.tabs.addTab(self.flight_logs_tab, "Flight Logs")
         self._build_battery_tab()
         self._build_sync_tab()
         self._build_alias_tab()
@@ -1186,8 +1191,11 @@ class MainWindow(QMainWindow):
     def refresh_reception_index(self, *_args) -> None:
         if self.library_root is None:
             return
+        if not self.flight_logs_tab.prepare_library_change():
+            return
         self.library_logs = scan_library(self.library_root)
         self.populate_library_tree()
+        self.flight_logs_tab.set_library(self.library_root, self.library_logs)
         self.start_reception_scan()
 
     def cancel_reception_scan(self, *_args, silent: bool = False) -> None:
@@ -2018,12 +2026,15 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Library load failed", str(exc))
             return
+        if not self.flight_logs_tab.prepare_library_change():
+            return
         self.cancel_reception_scan()
         self.cancel_reception_heatmap()
         self.library_root = path
         self.store.set_setting("library_root", str(path))
         self.library_logs = logs
         self.populate_library_tree()
+        self.flight_logs_tab.set_library(self.library_root, self.library_logs)
         self.reception_scan_refresh_button.setEnabled(True)
         self._load_cached_reception_sites(preserve_selection=False)
         self.start_reception_scan()
@@ -3170,6 +3181,10 @@ class MainWindow(QMainWindow):
         return f"{size / (1024 * 1024):.1f} MB"
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        if not self.flight_logs_tab.prepare_close():
+            if a0 is not None:
+                a0.ignore()
+            return
         if not self._confirm_flight_notes_saved():
             if a0 is not None:
                 a0.ignore()
@@ -3179,5 +3194,6 @@ class MainWindow(QMainWindow):
         self.cancel_reception_heatmap()
         self._reception_pool.clear()
         self._reception_pool.waitForDone(2000)
+        self.flight_logs_tab.shutdown()
         self.store.close()
         super().closeEvent(a0)

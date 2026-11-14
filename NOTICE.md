@@ -20,6 +20,12 @@ No assets from `Ethos_LogView/img` are included in this repository. The implemen
 
 The feature target was the publicly documented behavior and screenshots for PhaedraDG's "Ethos log explorer" on itch.io, including model-organized browsing, graph inspection, compare mode, GPS path viewing, battery health history, SD-card sync, flight notes/video links, switch aliases, and voice-pack generation. No proprietary code or downloadable binary content from that tool is included.
 
+## Flight Log Detection
+
+The bundled flight-log detector is adapted from the repository owner's `maintain-rc-flight-log` Codex skill and its `update_flight_logs.py` helper. The owner requested this integration. The skill is locally authored; no separate third-party code or assets were introduced by this adaptation. The bundled implementation is distributed under this application's GPL-3.0-or-later license and does not require Codex or an installed skill.
+
+Google Sheets access uses Google's `google-auth-oauthlib` Python library (Apache-2.0) and `keyring` (MIT) for Windows Credential Manager, with their dependency licenses retained by the Python distribution. Google Sheets is a trademark of Google LLC. The integration uses the official Google Sheets API and a registered desktop OAuth client; it is not affiliated with or endorsed by Google.
+
 ## MapLibre And Raster Basemaps
 
 The Flight Map and HeatMap use MapLibre GL JS 6.4.1, bundled in `sloppy_log_explorer/assets/maplibre/`, with selectable OpenStreetMap and public imagery raster layers. The official release files and their license are included; `VERSION.txt` records the source archive and verified integrity hash.

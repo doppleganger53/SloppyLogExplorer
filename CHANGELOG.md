@@ -4,6 +4,20 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Add a Flight Logs workspace for selecting aircraft, reviewing detected flights, maintaining chronological Markdown logs, editing pilot notes, and exporting CSV tables (#42).
+- Add default and per-aircraft telemetry choices with source-derived VFR minima, temperature maxima, exact sensor maxima, and exclusions.
+- Add Google Sheets workbook creation and repeatable sync with aircraft tabs, an all-aircraft view, and pilot-note conflict checks (#42).
+- Add draggable flight-log column ordering that persists to Markdown, CSV and Sheets without rebuilding existing flights.
+- Capture servo-current maxima by default from matching named current/temperature telemetry pairs, retaining custom names and units with per-aircraft opt-out and sensor exclusions.
+- Add personal Google account browser sign-in, a guided one-time OAuth setup, securely remembered authorization in Windows Credential Manager, and disconnect controls.
+
+### Changed
+
+- Simplify flight review with a Needs review filter, selected-flight Accept/Reject actions, next-flight navigation, a generated-table preview, and immediate candidate decisions.
+- Make rebuild approval a deliberate final action and show Sheets sync review inline before publishing.
+
 ## [0.2.1] - 2026-10-06
 
 ### Added
