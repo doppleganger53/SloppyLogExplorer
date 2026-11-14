@@ -1,41 +1,38 @@
-# Issue Prompt Pack
+# SloppyLogExplorer issue prompts
 
-Generated issue-resolution prompts live in this folder.
+No curated implementation packets are active as of 2026-11-14. The renderer
+reads issues from the selected checkout's `origin`, or its only remote.
+Use `--remote NAME` to select another configured GitHub remote.
+For explicitly requested batches, use the [batch template](multi-issue%20prompt.md).
 
-- Repository: `doppleganger53/SloppyLogExplorer`
-- Template: `../templates/ISSUE_RESOLUTION_TEMPLATE.md`
-- Generator: `python tools/render_issue_prompt.py --issue-number {N} --issue-kind {enhancement|bug|docs|chore}`
-- Snapshot date: 2026-06-23
+From the selected checkout, run the [renderer](../../tools/render_issue_prompt.py)
+with a numeric issue ID in place of `{N}`.
 
-The generator reads GitHub issue metadata with `gh issue view` and writes a
-local prompt file named `ISSUE-{number}-{slug}.md`. It does not create, edit,
-label, close, or comment on GitHub issues.
+```text
+python tools/render_issue_prompt.py --issue-number {N} --dry-run
+```
 
-Curated prompts are split by the model tier that should execute them.
+Omit `--dry-run` to write the [implementation template](../templates/ISSUE_RESOLUTION_TEMPLATE.md)
+with issue metadata under this checkout's `prompts/issues/`. Use an explicit
+`--output-dir` to select a different destination. If a packet already exists,
+use a different `--slug` or directory to preserve both copies. Open issues are eligible for
+implementation. For a closed issue, use `--historical` for a reference snapshot
+under `history/`, or `--regression "user-reported behavior"` for a specific
+reassessment. The renderer only reads GitHub.
 
-## Smaller High-Speed Coding Model
+## Completed packets
 
-Use these prompts for localized issues where the implementation path is clear,
-the code surface is narrow, and tests can be made deterministic.
+GitHub showed these issues closed as completed by the linked merged PRs on
+2026-07-05. Move future completed packets to `done/` after verifying the issue
+and its merged resolution.
 
-| Issue | Prompt | Rationale |
-| --- | --- | --- |
-| #6 | `high-speed/ISSUE-006-selectable-statistics-view.md` | Mostly a new tab backed by existing `analysis.basic_stats()` plus focused table tests. |
-| #7 | `high-speed/ISSUE-007-raw-log-table-view.md` | Prescribed `QAbstractTableModel` approach keeps performance bounded and avoids architecture exploration. |
-| #9 | `high-speed/ISSUE-009-normalize-library-file-size-display.md` | Local formatter and library tree display tests only. |
-| #10 | `high-speed/ISSUE-010-default-telemetry-drag-mode-to-zoom.md` | Local default-state change across existing telemetry controls and Plotly layout. |
-
-## Frontier Coding Model
-
-Use these prompts where the work needs architectural judgment, live UI or
-packaging validation, performance measurement, or cross-language coordination.
-
-| Issue | Prompt | Rationale |
-| --- | --- | --- |
-| #5 | `frontier/ISSUE-005-link-telemetry-x-axis-zoom-range.md` | Crosses Plotly JS, PyQt WebChannel, GPS payloads, playback state, and live map validation. |
-| #8 | `frontier/ISSUE-008-lazy-view-loading-performance.md` | Requires measurement-driven staging across startup restore, log parsing, tab initialization, and regressions. |
-| #11 | `frontier/ISSUE-011-multi-axis-telemetry-readability.md` | Needs visual layout judgment and validation beyond simple schema assertions. |
-| #12 | `frontier/ISSUE-012-pyinstaller-build-targets.md` | Requires packaging investigation, target design, executable validation, and size reporting. |
-
-Move completed prompt files into `prompts/issues/done/` after the associated PR
-is merged.
+| Archived packet | Merged PR |
+| --- | --- |
+| [#5 · Telemetry x-axis zoom range](done/ISSUE-005-link-telemetry-x-axis-zoom-range.md) | [#15](https://github.com/doppleganger53/SloppyLogExplorer/pull/15) |
+| [#6 · Selectable statistics](done/ISSUE-006-selectable-statistics-view.md) | [#14](https://github.com/doppleganger53/SloppyLogExplorer/pull/14) |
+| [#7 · Raw log table](done/ISSUE-007-raw-log-table-view.md) | [#14](https://github.com/doppleganger53/SloppyLogExplorer/pull/14) |
+| [#8 · Lazy view loading](done/ISSUE-008-lazy-view-loading-performance.md) | [#15](https://github.com/doppleganger53/SloppyLogExplorer/pull/15) |
+| [#9 · Library file-size display](done/ISSUE-009-normalize-library-file-size-display.md) | [#14](https://github.com/doppleganger53/SloppyLogExplorer/pull/14) |
+| [#10 · Default telemetry drag mode](done/ISSUE-010-default-telemetry-drag-mode-to-zoom.md) | [#14](https://github.com/doppleganger53/SloppyLogExplorer/pull/14) |
+| [#11 · Multi-axis telemetry readability](done/ISSUE-011-multi-axis-telemetry-readability.md) | [#15](https://github.com/doppleganger53/SloppyLogExplorer/pull/15) |
+| [#12 · PyInstaller build targets](done/ISSUE-012-pyinstaller-build-targets.md) | [#16](https://github.com/doppleganger53/SloppyLogExplorer/pull/16) |

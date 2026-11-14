@@ -26,6 +26,9 @@ Local machine-readable evidence and screenshots are stored under the ignored
 - Release ZIP: **passed** CRC and content verification. It contains only the
   validated executable, README, NOTICE, LICENSE, and CHANGELOG. The embedded
   executable's SHA-256 matches the tested file.
+  This record covers the 0.2.0 artifact identified below. For a new candidate,
+  capture its own source commit/tree and tested EXE hash using the
+  [release procedure](../prompts/templates/RELEASE_RESOLUTION_TEMPLATE.md).
 - Real FrSky log: 6,251 rows, comparison flight, battery analysis, 893-file
   library scan, and native Qt telemetry graph passed.
 - UX: all 10 tabs, 45 screenshots, dark/light themes, exact 1500x940 and
@@ -87,11 +90,6 @@ python tools/validate_release_ux.py
 python tools/validate_real_log.py "{LOG_PATH}" --compare "{COMPARE_PATH}" --library-root "{LIBRARY_ROOT}" --state-root validation_artifacts/real-log-state --ui-platform native --render-graph validation_artifacts/real-log.png
 python tools/validate_gps_map_runtime.py "{GPS_LOG_PATH}" --state-root validation_artifacts/gps-state --output validation_artifacts/gps-map.png
 python tools/validate_reception_map_runtime.py --state-root validation_artifacts/heatmap-state --output validation_artifacts/heatmap.png
-python tools/session_preflight.py --mode release
-.\build_windows.bat --target minimal
-.\dist\SloppyLogExplorer.exe --smoke-test
-.\dist\SloppyLogExplorer.exe --validate-log "{LOG_PATH}"
-python tools/package_release.py
 ```
 
 Run smoke/UI validations with a temporary `APPDATA` directory to isolate saved

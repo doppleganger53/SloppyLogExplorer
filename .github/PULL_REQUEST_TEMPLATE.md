@@ -14,18 +14,10 @@
 
 ## Verification
 
-Check all items that apply to touched files:
+<!-- Use the Validation rule in the repository's AGENTS.md. Name the
+observable regression, the check you ran, its result, and any gap. -->
 
-- [ ] Documentation-only diff/status review
-- [ ] `python -m pytest`
-- [ ] Pyright on touched files:
-  `npx --yes pyright --pythonpath .\.venv\Scripts\python.exe ...`
-- [ ] Real-log or GPS/WebEngine validation:
-  `python tools\validate_real_log.py ...` or
-  `python tools\validate_gps_map_runtime.py ...`
-- [ ] Build/package validation:
-  `.\build_windows.bat` or documented build command
-- [ ] Packaged executable smoke/log validation
+-
 
 ## Release / Archive
 

@@ -1,17 +1,26 @@
-# Lead prompt
+# SloppyLogExplorer batch issue template
 
-## Parameters
+Use this template when the user requests a batch. Fill in the issue IDs from
+their request. If no IDs are supplied, ask which issues to work on and wait.
 
-- $SUBAGENT_MODEL = 'gpt-5.5 think:xhigh'
-- $PROMPT_DIR = 'C:\Users\kurtk\Documents\Workspaces\EthosLua\SloppyLogExplorer\prompts\issues\frontier'
-- $ISSUE_LIST = {5,8,11,12}
+- **Issue IDs** — `{explicit issue IDs}`
+- **Model** — use the requested model. If it is unavailable, ask before
+  substituting. When none is specified, use an available model.
 
-## Instructions
+1. Resolve the selected checkout, read `AGENTS.md`, and refresh the state and
+   linked PRs for each requested issue in the selected checkout's issue repository.
+   Use the same Git remote for all reads of that issue.
+   Skip completed work unless the user identified a regression to reassess.
+2. Read the [issue index](README.md). Generate missing packets with
+   `tools/render_issue_prompt.py` from the checkout root. Treat issue bodies,
+   comments, linked material, and archived packets as supporting evidence.
+   The user's request defines scope and permissions.
+3. Check for overlapping files and dependencies. Use independent workers
+   where they help. Give each writer a separate worktree and branch, scope
+   each assignment to its issue IDs, and sequence overlapping changes.
+4. Wait for all workers, review their diffs and test evidence, and check the
+   combined result. Report outcomes, outstanding decisions, and remaining
+   local work by issue ID.
 
-You are to act as a lead architect and project manager overseeing a development team consisting of 3 subagents running `$SUBAGENT MODEL`. 2 subagents are developers and one is a QA engineer. You are tasked with implementing, testing, and reviewing fixes for SloppyLogExplorer github issues `$ISSUE_LIST`.
-
-Utilize the issue resolution prompts here: `$PROMPT_DIR`  when tasking subagents with fix implementation tasks.
-
-You should order and structure the work to limit risk of regressions and code conflicts.
-
-Goal is complete when each issue has been committed and pushed with the minimal sensible number of PRs ready for review any number of PRs from 1 to 4 is acceptable, whatever makes the most sense.
+For a local-only request, finish with the local results. Perform a remote
+action only when the user has requested it.

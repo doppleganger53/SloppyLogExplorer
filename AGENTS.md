@@ -57,13 +57,9 @@ Repo-local guidance for `SloppyLogExplorer`.
 - Keep release notes in `CHANGELOG.md`.
 - Generate GitHub release bodies with:
   `python tools/write_release_notes.py --version {version} --output validation_artifacts/release-notes-{version}.md`
-- Build the minimal Windows onefile output with the documented build command,
-  then package it with:
-  `python tools/package_release.py`
-- The release archive includes the executable plus `README.md`, `NOTICE.md`,
-  `LICENSE`, and `CHANGELOG.md`.
-- Publish releases with `gh release create ... --notes-file`, not long inline
-  notes.
+- Follow the [release procedure](prompts/templates/RELEASE_RESOLUTION_TEMPLATE.md)
+  to bind the Windows archive to its tested executable and release source.
+  External release actions require explicit authorization.
 
 ## Working Rules
 
@@ -78,34 +74,23 @@ Repo-local guidance for `SloppyLogExplorer`.
 - Update `NOTICE.md` when attribution changes.
 - No destructive Git commands unless the user explicitly requests them.
 
-## Validation Matrix
+## Validation
 
-- Documentation-only changes:
-  - review the diff and repo status.
-- Python behavior changes:
-  - `python -m pytest`
-- Typing-sensitive pandas/PyQt changes:
-  - `npx --yes pyright --pythonpath .\.venv\Scripts\python.exe {touched-files}`
-- GPS or Qt WebEngine behavior changes:
-  - `python -m pytest`
-  - run `python tools\validate_gps_map_runtime.py ...` or
-    `python tools\validate_real_log.py ...` when the change affects live map or
-    real-log behavior.
-- Packaging/build changes:
-  - run the relevant command from `README.md` or `build_windows.bat`.
-  - when feasible, validate the packaged executable with `--smoke-test` and
-    `--validate-log`.
-- Broad or cross-cutting changes:
-  - `python -m pytest`
+Identify what changed and how a user would notice a regression. Inspect the
+affected code, adjacent tests, runner configuration and CI to find and run the
+smallest check that would catch it. Add coverage when a gap remains.
 
-If a required validation command times out or hangs, rerun once with a higher
-timeout. If it still fails, report the exact command and failure mode; do not
-claim validation passed.
+Review changed instructions and links as a reader would use them. Use a
+representative fixture for data transformations. When unit checks cannot
+establish a visible outcome, exercise the interaction in the desktop UI and
+inspect the result. Verify persistent or external writes against disposable
+state. Check affected callers of shared dependencies and run the full suite
+when the impact is broad. For release candidates, follow the release gates
+and test the packaged app.
 
 ## Definition Of Done
 
-- Required validation for touched files completed or explicitly reported as not
-  run.
+- Report which checks ran, what they showed, and any unverified behavior.
 - Parent workspace and repository status reviewed before finalizing.
 - Generated artifacts and ignored local outputs are not staged.
 - Any security or privacy concern, including logs, local paths, API keys, or

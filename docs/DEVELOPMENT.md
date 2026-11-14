@@ -33,24 +33,14 @@ references unless explicitly targeted.
 
 ## Release Workflow
 
-1. Update `pyproject.toml` and `CHANGELOG.md` on a release branch named
-   `release/v{version}`. Ensure `CHANGELOG.md` is comprehensive at a high level.
-2. Run:
-   `python tools/session_preflight.py --mode release`
-3. Run:
-   `python -m pytest`
-4. Build the minimal onefile executable:
-   `.\build_windows.bat`
-5. Validate packaged executable when feasible:
-   - `.\dist\SloppyLogExplorer.exe --smoke-test`
-   - `.\dist\SloppyLogExplorer.exe --validate-log "{LOG_PATH}"`
-6. Generate release notes:
-   `python tools\write_release_notes.py --version {version} --output validation_artifacts\release-notes-{version}.md`
-7. Create the release archive (onefile executable plus README, NOTICE, LICENSE,
-   and CHANGELOG):
-   `python tools\package_release.py --version {version}`
-8. Publish:
-   `gh release create v{version} dist/SloppyLogExplorer-{version}-windows-x64.zip --title "Sloppy Log Explorer v{version}" --notes-file validation_artifacts\release-notes-{version}.md`
+Update `pyproject.toml` and `CHANGELOG.md` on `release/v{version}`.
+Follow the [Windows release procedure](../prompts/templates/RELEASE_RESOLUTION_TEMPLATE.md)
+for local preparation, including recording the clean source, exercising the
+packaged executable, and verifying the ZIP. It also covers readback after
+authorized publication.
+
+For a local onedir archive, pass the directory explicitly:
+`python tools/package_release.py --dist-dir dist/SloppyLogExplorer`.
 
 ## Versioning
 
