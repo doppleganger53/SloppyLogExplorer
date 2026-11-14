@@ -17,3 +17,5 @@ validation_artifacts/
 *.tmp
 *.wav
 *.zip
+sloppy_log_explorer/assets/google-oauth-client.json
+client_secret_*.json

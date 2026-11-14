@@ -19,6 +19,8 @@ dependencies = [
   "PyQt6-WebEngine-Qt6>=6.11.2",
   "plotly>=7.1.0",
   "pyttsx3>=2.90",
+  "google-auth-oauthlib>=1.2.0",
+  "keyring>=25.6.0",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +34,7 @@ sloppy-log-explorer = "sloppy_log_explorer.__main__:main"
 include = ["sloppy_log_explorer*"]
 
 [tool.setuptools.package-data]
-sloppy_log_explorer = ["assets/*.ico", "assets/*.png", "assets/maplibre/*"]
+sloppy_log_explorer = ["assets/*.ico", "assets/*.png", "assets/maplibre/*", "assets/google-oauth-client.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
