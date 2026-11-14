@@ -56,29 +56,9 @@ user requests a specific remote action.
 
 1. Reproduce or define baseline behavior.
 2. Implement the smallest coherent change set.
-3. Add or update tests for new behavior and regressions.
+3. Apply the Validation rule in the repository's `AGENTS.md`.
 4. Update docs when behavior, commands, or workflow change.
 5. Keep generated artifacts out of Git.
-
-## Validation Matrix
-
-Choose the minimum required checks based on touched files:
-
-- Documentation-only changes:
-  - review diff and repo status.
-- Python behavior changes:
-  - `python -m pytest`
-- Typing-sensitive pandas/PyQt changes:
-  - `npx --yes pyright --pythonpath .\.venv\Scripts\python.exe {TOUCHED_FILES}`
-- GPS or Qt WebEngine changes:
-  - `python -m pytest`
-  - `python tools\validate_gps_map_runtime.py ...`
-- Packaging/build changes:
-  - documented build command from `README.md` or `build_windows.bat`
-  - packaged `--smoke-test` and `--validate-log` when feasible.
-
-If validation times out or hangs, rerun once with a higher timeout. If it still
-fails, report the exact command and failure mode.
 
 ## Delivery Contract
 
@@ -86,7 +66,7 @@ Return:
 
 1. Change summary mapped to acceptance criteria.
 2. File list with key edits and rationale.
-3. Validation commands and pass/fail results.
+3. The check used for each affected behavior, its result, and any gaps.
 4. Risks, edge cases, and follow-up items.
 
 ## Quality Gates

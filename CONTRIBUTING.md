@@ -25,17 +25,16 @@
 
 ## Validation
 
-Run the checks that match touched files:
+Choose checks using the guidance in [AGENTS.md](AGENTS.md#validation).
 
-- Python behavior: `python -m pytest`
-- Typing-sensitive edits:
-  `npx --yes pyright --pythonpath .\.venv\Scripts\python.exe {touched-files}`
-- GPS/WebEngine behavior:
-  `python tools\validate_gps_map_runtime.py ...`
-- Real-log validation:
-  `python tools\validate_real_log.py ...`
-- Packaging/build changes:
-  `.\build_windows.bat` or the documented build command.
+- Run a selected test with `python -m pytest {path}::{test_name}`, or the full
+  suite with `python -m pytest`.
+- Check types with
+  `npx --yes pyright --pythonpath .\.venv\Scripts\python.exe {touched-files}`.
+- Inspect runtime validator inputs with
+  `python tools/validate_gps_map_runtime.py --help` or
+  `python tools/validate_real_log.py --help`.
+- Build commands are in the [README](README.md#build-a-windows-executable).
 
 ## Release Flow
 
