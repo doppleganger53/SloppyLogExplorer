@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QComboBox, QDialog, QFileDialog, QInputDialog, QMenu, QMessageBox
 
 from sloppy_log_explorer.flight_log_sheets import SheetsSyncReport, Workbook, stable_flight_id
 from sloppy_log_explorer.flight_log_widget import FlightLogWidget, GoogleSignInSetupDialog, _review_text
@@ -176,6 +176,36 @@ def test_bulk_candidate_review_only_changes_explicitly_selected_flights(ui, tmp_
     _settle(app, widget)
     assert len(widget.service.read_log("Glider").rows) == 1
     assert not errors
+
+
+def test_maintained_row_context_menu_requests_only_the_chosen_matching_source(ui, tmp_path: Path, monkeypatch) -> None:
+    app, widget, _, _ = ui
+    root = tmp_path / "library"
+    first, second = [_telemetry(root / folder / "Falcon-2026-07-01.csv") for folder in ("a", "b")]
+    widget.set_library(root, [first, second])
+    widget.preview_button.click()
+    _settle(app, widget)
+    widget.generate_button.click()
+    _settle(app, widget)
+    assert widget.log_table.rowCount() == 1
+    requested = []
+    widget.telemetry_requested.connect(lambda *args: requested.append(args))
+    position = widget.log_table.visualRect(widget.log_table.model().index(0, 0)).center()
+    monkeypatch.setattr(QMenu, "exec", lambda menu, *_args: menu.actions()[0])
+    monkeypatch.setattr(QInputDialog, "getItem", lambda *_args: ("", False))
+    widget.log_table.customContextMenuRequested.emit(position)
+    _settle(app, widget)
+    assert not requested
+    monkeypatch.setattr(QInputDialog, "getItem", lambda *_args: (str(second.path), True))
+    widget.log_table.customContextMenuRequested.emit(position)
+    _settle(app, widget)
+    assert requested == [(str(second.path), "2026-07-01 09:01:00", "2026-07-01 09:03:00")]
+    first.path.unlink()
+    second.path.unlink()
+    widget.log_table.customContextMenuRequested.emit(position)
+    _settle(app, widget)
+    assert len(requested) == 1
+    assert "No matching telemetry" in widget.status_label.text()
 
 
 def test_google_setup_wizard_accepts_desktop_client_and_rejects_service_account(ui, tmp_path: Path, monkeypatch) -> None:

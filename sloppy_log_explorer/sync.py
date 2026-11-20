@@ -40,11 +40,18 @@ def discover_sync_candidates(source: str | Path, target: str | Path) -> list[Syn
         # Preserve the relative structure from the source tree when mirroring
         # files into the target library.
         rel = source_file.relative_to(source_root)
+        if rel.is_relative_to(NONFLIGHT_ARCHIVE):
+            continue
         target_file = target_root / rel
-        if not source_file.resolve().is_relative_to(source_root):
+        resolved_source = source_file.resolve()
+        resolved_target = target_file.resolve()
+        if not resolved_source.is_relative_to(source_root):
             raise ValueError(f"A source link points outside the selected logs directory: {rel}")
-        if not target_file.resolve().is_relative_to(target_root):
+        if not resolved_target.is_relative_to(target_root):
             raise ValueError(f"A target link points outside the selected PC library: {rel}")
+        if (resolved_source.is_relative_to(source_root / NONFLIGHT_ARCHIVE)
+                or resolved_target.is_relative_to(target_root / NONFLIGHT_ARCHIVE)):
+            continue
         source_mtime = source_file.stat().st_mtime
 
         if not target_file.exists():
@@ -106,11 +113,16 @@ def _validate_candidate(candidate: SyncCandidate) -> None:
         raise ValueError("The sync candidate has an invalid relative file path; scan again.")
     source_root = candidate.source_root or candidate.source.parents[len(relative.parts) - 1].resolve()
     target_root = candidate.target_root or candidate.target.parents[len(relative.parts) - 1].resolve()
-    if not candidate.source.resolve().is_relative_to(source_root):
+    source = candidate.source.resolve()
+    target = candidate.target.resolve()
+    if (relative.is_relative_to(NONFLIGHT_ARCHIVE) or source.is_relative_to(source_root / NONFLIGHT_ARCHIVE)
+            or target.is_relative_to(target_root / NONFLIGHT_ARCHIVE)):
+        raise ValueError(f"SD sync excludes the non-flight archive: {relative}")
+    if not source.is_relative_to(source_root):
         raise ValueError(f"A source link points outside the selected logs directory: {relative}")
-    if not candidate.target.resolve().is_relative_to(target_root):
+    if not target.is_relative_to(target_root):
         raise ValueError(f"A target link points outside the selected PC library: {relative}")
-    if candidate.source.resolve() == candidate.target.resolve():
+    if source == target:
         raise ValueError("The source and destination log file must be different.")
     if candidate.source.stat().st_mtime != candidate.source_mtime:
         raise ValueError(f"The source log changed after scanning; scan again: {relative}")

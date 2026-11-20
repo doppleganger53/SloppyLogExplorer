@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, guess_cell_count
+from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE
 from sloppy_log_explorer.parser import _deduplicate_columns, load_log, relative_seconds
 from sloppy_log_explorer.storage import app_data_dir
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
@@ -256,3 +257,54 @@ def test_sync_rejects_a_target_symlink_escaping_the_library(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="outside"):
         discover_sync_candidates(source, target)
     assert outside.read_text(encoding="utf-8") == "private"
+
+
+def test_sync_preserves_archive_and_imports_distinct_same_size_recording(tmp_path: Path) -> None:
+    source, target = _sync_directories(tmp_path)
+    original = source / "flight.csv"
+    archive = target / NONFLIGHT_ARCHIVE
+    archive.mkdir()
+    saved = archive / original.name
+    original.write_bytes(b"recorder-A")
+    saved.write_bytes(b"recorder-A")
+    assert discover_sync_candidates(source, target) == []
+    # The SD itself may contain an archive folder. Its contents must never
+    # target the PC archive, even if the source file has a newer timestamp.
+    (source / NONFLIGHT_ARCHIVE).mkdir()
+    duplicate = source / NONFLIGHT_ARCHIVE / original.name
+    duplicate.write_bytes(b"newer SD-side archive file")
+    os.utime(duplicate, (saved.stat().st_mtime + 5,) * 2)
+    stamp = original.stat()
+    original.write_bytes(b"recorder-B")
+    os.utime(original, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    candidates = discover_sync_candidates(source, target)
+    assert [c.relative_path for c in candidates] == [Path("flight.csv")]
+    assert copy_candidates(candidates) == 1
+    assert (target / original.name).read_bytes() == b"recorder-B"
+    assert saved.read_bytes() == b"recorder-A"
+
+
+@pytest.mark.parametrize("linked_after_scan", [False, True])
+def test_sync_refuses_to_write_through_archive_directory_alias(tmp_path: Path, linked_after_scan: bool) -> None:
+    source, target = _sync_directories(tmp_path)
+    (source / "flight.csv").unlink()
+    (source / "Alias").mkdir()
+    (source / "Alias" / "recording.csv").write_bytes(b"must remain on the SD")
+    archive = target / NONFLIGHT_ARCHIVE
+    archive.mkdir()
+    alias = target / "Alias"
+    if linked_after_scan:
+        candidates = discover_sync_candidates(source, target)
+        assert len(candidates) == 1
+    if os.name == "nt":
+        # Directory junctions are available to CI without symlink privileges.
+        import _winapi
+        _winapi.CreateJunction(str(archive), str(alias))
+    else:
+        alias.symlink_to(archive, target_is_directory=True)
+    if linked_after_scan:
+        with pytest.raises(ValueError, match="(?i)archive"):
+            copy_candidates(candidates)
+    else:
+        assert discover_sync_candidates(source, target) == []
+    assert not list(archive.iterdir())
