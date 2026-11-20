@@ -7,6 +7,7 @@ Sloppy Log Explorer is a desktop telemetry application for FrSky Ethos and OpenT
 - Browse a log library grouped by model.
 - Open individual Ethos/OpenTX CSV or log files.
 - Select telemetry parameters and view a native multi-series telemetry graph.
+- Drag mostly horizontally on Telemetry to zoom in on a time interval while keeping the Y scales. Drag a taller rectangle to zoom both time and values.
 - Click the graph or use left/right arrow keys in the graph to inspect telemetry values in the cursor panel.
 - Load a comparison flight and view matching parameter deltas.
 - View detected GPS latitude/longitude/altitude on a 3D MapLibre flight map with selectable OpenStreetMap or aerial/satellite imagery.
@@ -98,6 +99,8 @@ To measure ground distance, select **Measure** on the Flight Map and click two o
 
 These map services require normal internet access and are cached by Qt WebEngine under the app data directory. Imagery mode can contact USGS, NASA, and OpenStreetMap concurrently because the fallback layers are stacked. Each tile request necessarily reveals the viewed map area and network address to the applicable provider. No Google Maps, Mapbox, paid subscription, account sign-in, API key, or additional Python dependency is required. Provider details and attribution are listed in `NOTICE.md` and remain visible in each map view.
 
+Flight Map and HeatMap share a local cache for NAIP and NASA imagery. When you revisit a zoom level, either tab can draw fresh tiles from the cache. The app retries temporary download failures and can show previously downloaded imagery during an outage when the provider's cache rules permit it. The cache holds up to 384 tiles (96 MiB of image data). Tiles are eligible for reuse for up to seven days.
+
 The HeatMap tab keeps the normal library tree scan metadata-only, then refreshes a separate GPS/site index in one background worker. Unchanged files are reused from the local SQLite cache. Logs whose headers identify a position field receive one whole-file, every-twentieth-GPS-update pass so late or phase-offset GPS acquisition is still found; other logs use a sparse 200-record fallback for unhinted coordinate formats and are skipped when that finds no valid GPS. Site centroids use the dominant local fix cloud so partial-lock and distant corrupt fixes do not create false sites. Generating a selected heatmap reads the matching logs and summarizes observed samples into 5 m cells, giving each flight equal weight. Duplicate telemetry headers represented by terminal `.1`, `.2`, and later indices are combined per row, and an optional paired telemetry item can normalize the mapped values by ratio, difference, or dB power correction. Ratio references can use their observed range or user-supplied clamping bounds. Additional reference controls stay hidden until normalization is enabled. The automatic camera centers on the densest observed sample neighborhood and never opens wider than a 2 km radius, while the complete generated cell layer remains available for manual navigation. Flying-site names, notes, dates, centroids, raw channel names, file fingerprints, and index versions stay in the local application database; raw or normalized reception samples are not persisted. Telemetry values remain local.
 
 ## Flight Logs
@@ -115,6 +118,12 @@ workspace has four tabs:
    Review counts, warnings and **Flight-log preview**, then choose **Save new
    flights**. Saving opens the maintained log. Use **Detection details and
    warnings** for the complete source report.
+   After reviewing the selected aircraft, choose **Archive non-flight logs…** to
+   see eligible recordings. Check the files to move and choose **Archive checked
+   logs**. Find them under `non-flight telemetry` in the library, with their
+   original subfolders and filenames. Move a file back to its original folder
+   and refresh the library to restore it. SD sync recognizes an identical
+   archived recording and still offers a changed recording with the same name.
 2. **Flight logs:** view maintained aircraft tables, edit pilot Notes, save changes, and
    export CSV. Choose an existing skill-generated flight-log directory to
    continue maintaining those Markdown files. Drag headings, then choose
@@ -123,6 +132,9 @@ workspace has four tabs:
    dragging headings in **Add flights → Flight-log preview** before saving.
    CSV export and per-aircraft Sheets tabs use the saved order. The combined
    Sheets view follows the first aircraft's order, with other columns added.
+   Right-click a maintained row and choose **Open flight telemetry** to view
+   its source recording at that flight's interval. If several recordings match,
+   the app lets you choose the source.
 3. **Telemetry:** configure defaults and aircraft-specific overrides. Automatic
    VFR minima and temperature maxima use only sensors present in accepted
    telemetry. **Capture paired servo-current maxima** is enabled by default:

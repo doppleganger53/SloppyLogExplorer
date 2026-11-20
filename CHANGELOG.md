@@ -6,6 +6,8 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ### Added
 
+- Archive reviewed non-flight recordings in bulk and open a flight's source telemetry from its maintained log row (#45, #46).
+- Share a bounded local imagery tile cache between Flight Map and HeatMap (#48).
 - Add a Flight Logs workspace for selecting aircraft, reviewing detected flights, maintaining chronological Markdown logs, editing pilot notes, and exporting CSV tables (#42).
 - Add default and per-aircraft telemetry choices with source-derived VFR minima, temperature maxima, exact sensor maxima, and exclusions.
 - Add Google Sheets workbook creation and repeatable sync with aircraft tabs, an all-aircraft view, and pilot-note conflict checks (#42).
@@ -15,8 +17,14 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ### Changed
 
+- Reduce large-file parsing and chart redraw time while retaining original sample indices, spikes, and telemetry gaps (#49).
 - Simplify flight review with a Needs review filter, selected-flight Accept/Reject actions, next-flight navigation, a generated-table preview, and immediate candidate decisions.
 - Make rebuild approval a deliberate final action and show Sheets sync review inline before publishing.
+
+### Fixed
+
+- Keep mostly horizontal telemetry zooms on the time axis, including when the pointer crosses a chart edge (#47).
+- Recover from temporary imagery tile failures while the map camera stays in place (#48).
 
 ## [0.2.1] - 2026-10-06
 
