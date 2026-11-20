@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections import defaultdict
 from pathlib import Path
 
@@ -18,6 +19,21 @@ def in_nonflight_archive(path: Path) -> bool:
     return any(os.path.normcase(part) == _ARCHIVE_NAME for part in path.parts)
 
 
+def _archive_directory(parent: Path, name: str) -> bool:
+    if os.path.normcase(name) == _ARCHIVE_NAME:
+        return True
+    # os.walk skips symbolic links by default, but traverses Windows junctions.
+    # Resolve only junction targets, never the contents of ordinary cloud folders.
+    if os.name == "nt":
+        directory = parent / name
+        try:
+            if directory.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT:
+                return in_nonflight_archive(directory.resolve())
+        except OSError:
+            pass
+    return False
+
+
 def scan_library(root: str | Path) -> list[LibraryLogInfo]:
     root_path = Path(root)
     logs: list[LibraryLogInfo] = []
@@ -26,9 +42,9 @@ def scan_library(root: str | Path) -> list[LibraryLogInfo]:
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Maintained libraries can also have an archive below their flight-log
         # directory. Explicitly opening an archive still lets the pilot browse it.
-        dirnames[:] = sorted(name for name in dirnames if os.path.normcase(name) != _ARCHIVE_NAME)
-        filenames.sort()
         current = Path(dirpath)
+        dirnames[:] = sorted(name for name in dirnames if not _archive_directory(current, name))
+        filenames.sort()
         for filename in filenames:
             path = current / filename
             if path.suffix.lower() not in LOG_EXTENSIONS:

@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from sloppy_log_explorer.analysis import basic_stats, calculate_internal_resistance, cursor_values, guess_cell_count
-from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE
+from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE, scan_library
 from sloppy_log_explorer.parser import _deduplicate_columns, load_log, relative_seconds
 from sloppy_log_explorer.storage import app_data_dir
 from sloppy_log_explorer.sync import copy_candidates, discover_sync_candidates
@@ -303,9 +303,13 @@ def test_sync_refuses_to_write_through_archive_directory_alias(tmp_path: Path, l
         _winapi.CreateJunction(str(archive), str(alias))
     else:
         alias.symlink_to(archive, target_is_directory=True)
+    recorded = archive / "ground.csv"
+    recorded.write_bytes(b"archived")
+    assert scan_library(target) == []
     if linked_after_scan:
         with pytest.raises(ValueError, match="(?i)archive"):
             copy_candidates(candidates)
     else:
         assert discover_sync_candidates(source, target) == []
-    assert not list(archive.iterdir())
+    assert list(archive.iterdir()) == [recorded]
+    assert recorded.read_bytes() == b"archived"
