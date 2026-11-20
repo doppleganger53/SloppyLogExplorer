@@ -29,8 +29,9 @@ def test_telemetry_zoom_gestures(monkeypatch) -> None:
         plot.layout = {dragmode: 'zoom'};
         bindTelemetryZoom(plot);
         function press(options = {}) {
-          plot.mousedown(Object.assign({button: 0, clientX: 0, clientY: 0,
-            target: {matches: selector => selector === '.nsewdrag'}}, options));
+          const target = {matches: selector => selector === '.nsewdrag',
+            getBoundingClientRect: () => ({left: -400, right: 400, top: -250, bottom: 250})};
+          plot.mousedown(Object.assign({button: 0, clientX: 0, clientY: 0, target}, options));
         }
         function move(x, y) {
           const event = {buttons: 1, clientX: x, clientY: y};
@@ -45,6 +46,8 @@ def test_telemetry_zoom_gestures(monkeypatch) -> None:
         ("move(180, 75)", 75),
         ("move(400, 90)", 90),
         ("move(2, 80)", 80),
+        ("press({clientX: 372}); move(482, 30)", 30),
+        ("press({clientX: -377}); move(-452, 24)", 24),
         ("window.mouseup(); move(180, 30)", 30),
         ("press({shiftKey: true}); move(180, 30)", 30),
         ("press({ctrlKey: true}); move(180, 30)", 30),

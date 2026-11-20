@@ -1091,13 +1091,16 @@ function bindTelemetryZoom(plot) {
   plot.addEventListener('mousedown', event => {
     if (event.button === 0 && !event.shiftKey && !event.ctrlKey &&
         plot.layout.dragmode === 'zoom' && event.target.matches('.nsewdrag')) {
-      origin = {x: event.clientX, y: event.clientY};
+      origin = {x: event.clientX, y: event.clientY, bounds: event.target.getBoundingClientRect()};
     }
   }, true);
   window.addEventListener('mousemove', event => {
     if (!origin || !(event.buttons & 1)) return;
-    const width = Math.abs(event.clientX - origin.x);
-    const height = Math.abs(event.clientY - origin.y);
+    // Plotly clips the selection at the graph edge when the pointer leaves.
+    const x = Math.max(origin.bounds.left, Math.min(event.clientX, origin.bounds.right));
+    const y = Math.max(origin.bounds.top, Math.min(event.clientY, origin.bounds.bottom));
+    const width = Math.abs(x - origin.x);
+    const height = Math.abs(y - origin.y);
     // Allow more drift on long time selections. The cap leaves deliberate
     // wide rectangles available even across the full chart.
     if (height <= Math.min(72, width / 3)) {
