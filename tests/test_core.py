@@ -3453,6 +3453,22 @@ def test_compare_traces_inherit_grouped_telemetry_axis(tmp_path: Path) -> None:
     assert fig.layout.yaxis.title.text == "A group"
 
 
+def test_repeated_packed_gps_fixes_replace_preexisting_helper_columns(tmp_path: Path) -> None:
+    path = tmp_path / "packed.csv"
+    path.write_text(
+        "Time,__gps_longitude,GPS,Current(A),__gps_latitude\n"
+        "0,old,39.5 -75.1 21,4,old\n"
+        "1,old,39.5 -75.1 21,5,old\n"
+        "2,old,,6,old\n"
+        "3,old,39.6 -75.2 22,7,old\n",
+        encoding="utf-8",
+    )
+    log = load_log(path)
+    assert log.numeric_columns == ["__gps_longitude", "Current(A)", "__gps_latitude", "__gps_altitude"]
+    assert log.dataframe["__gps_latitude"].tolist() == pytest.approx([39.5, 39.5, math.nan, 39.6], nan_ok=True)
+    assert log.dataframe["__gps_altitude"].tolist() == pytest.approx([21, 21, math.nan, 22], nan_ok=True)
+
+
 def test_trace_sampling_keeps_first_extrema_and_gaps_in_partial_buckets() -> None:
     # Three five-row buckets. The middle one has no finite samples and the
     # last one ends early. The first occurrence wins for equal extrema.

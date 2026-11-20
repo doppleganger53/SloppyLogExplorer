@@ -6,6 +6,7 @@ import csv
 import re
 import warnings
 from collections.abc import Iterable
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -264,9 +265,11 @@ def _model_from_path(path: Path, library_root: Path | None = None) -> str:
     return re.split(r"[-_ ]\d{4}", stem, maxsplit=1)[0] or "Unsorted"
 
 
-def _numeric_columns(df: pd.DataFrame, timeline_columns: frozenset[str]) -> list[str]:
+def _numeric_columns(
+    df: pd.DataFrame, timeline_columns: frozenset[str], columns: Iterable[str] | None = None,
+) -> list[str]:
     numeric: list[str] = []
-    for col in df.columns:
+    for col in df.columns if columns is None else columns:
         if col in timeline_columns:
             continue
         source = df[col]
@@ -448,6 +451,9 @@ def _series_axis_score(series: pd.Series, axis: str, column: str) -> float | Non
 def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) -> GpsColumns | None:
     best: tuple[float, str, pd.Series, pd.Series, pd.Series, str] | None = None
     numeric_set = set(numeric_columns)
+    # A transmitter can record the same GPS fix for many telemetry samples.
+    # Keep only recent values and release them when this log finishes parsing.
+    parse_position = lru_cache(maxsize=256)(_parse_coordinate_text)
     for column in df.columns:
         if column in numeric_set:
             continue
@@ -459,13 +465,9 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
         alt_values: list[float | None] = []
         parsed_count = 0
         for value in series:
-            if pd.isna(value):
-                lat_values.append(float("nan"))
-                lon_values.append(float("nan"))
-                alt_values.append(None)
-                continue
-            text = str(value).strip().strip("()[]{}")
-            parsed = _parse_coordinate_text(text)
+            parsed = None
+            if isinstance(value, str) or not pd.isna(value):
+                parsed = parse_position(str(value).strip().strip("()[]{}"))
             if parsed is None:
                 lat_values.append(float("nan"))
                 lon_values.append(float("nan"))
@@ -671,8 +673,15 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     numeric = _numeric_columns(df, timeline_columns)
     gps = detect_gps_columns(df, numeric)
     # Only bundled GPS text can add or replace columns during detection.
-    if gps is not None and gps.latitude == _GPS_HELPER_LAT:
-        numeric = _numeric_columns(df, timeline_columns)
+    if gps is not None and (gps.latitude, gps.longitude) == (_GPS_HELPER_LAT, _GPS_HELPER_LON):
+        helpers = {gps.latitude, gps.longitude}
+        if gps.altitude == _GPS_HELPER_ALT:
+            helpers.add(gps.altitude)
+        # A source may already contain a column with a helper's name. Include
+        # it according to its new contents, retaining the raw table's order.
+        channels = set(numeric).difference(helpers)
+        channels.update(_numeric_columns(df, timeline_columns, helpers))
+        numeric = [column for column in df.columns if column in channels]
     if not numeric:
         raise InvalidTelemetryLogError(
             f"{file_path.name} has no usable numeric telemetry columns. "
