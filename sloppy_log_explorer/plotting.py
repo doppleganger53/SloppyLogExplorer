@@ -1085,6 +1085,34 @@ def build_gps_map_html(
     return render_gps_map_html(payload, dark=dark)
 
 
+TELEMETRY_ZOOM_JAVASCRIPT = """
+function bindTelemetryZoom(plot) {
+  let origin = null;
+  plot.addEventListener('mousedown', event => {
+    if (event.button === 0 && !event.shiftKey && !event.ctrlKey &&
+        plot.layout.dragmode === 'zoom' && event.target.matches('.nsewdrag')) {
+      origin = {x: event.clientX, y: event.clientY};
+    }
+  }, true);
+  window.addEventListener('mousemove', event => {
+    if (!origin || !(event.buttons & 1)) return;
+    const width = Math.abs(event.clientX - origin.x);
+    const height = Math.abs(event.clientY - origin.y);
+    // Allow more drift on long time selections. The cap leaves deliberate
+    // wide rectangles available even across the full chart.
+    if (height <= Math.min(72, width / 3)) {
+      // Plotly uses the same mouse movements for its live selection and
+      // committed ranges. Snap the coordinate before its drag handler runs.
+      Object.defineProperty(event, 'clientY', {value: origin.y});
+    }
+  }, true);
+  const endDrag = () => { origin = null; };
+  window.addEventListener('mouseup', endDrag, true);
+  window.addEventListener('blur', endDrag);
+}
+"""
+
+
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
     body = fig.to_html(
         include_plotlyjs=False,
@@ -1121,6 +1149,8 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 function plotDiv() {{
   return document.querySelector('.plotly-graph-div');
 }}
+{TELEMETRY_ZOOM_JAVASCRIPT}
+bindTelemetryZoom(plotDiv());
 function bindPlot() {{
   const plot = plotDiv();
   if (!plot) return;
