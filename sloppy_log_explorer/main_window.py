@@ -2436,7 +2436,8 @@ class MainWindow(QMainWindow):
             number = math.nan
         if math.isfinite(number):
             return number
-        if self.current_log.time is None or not self.current_log.time.notna().any():
+        start_timestamp = self.current_log.info.start_time
+        if start_timestamp is None:
             return None
         try:
             parsed_timestamp = pd.to_datetime(str(value), errors="coerce")
@@ -2445,10 +2446,6 @@ class MainWindow(QMainWindow):
         if pd.isna(parsed_timestamp):
             return None
         timestamp = pd.Timestamp(str(parsed_timestamp))
-        time_series = self.current_log.time.ffill().bfill()
-        start_timestamp = pd.Timestamp(time_series.iloc[0])
-        if pd.isna(start_timestamp):
-            return None
         if timestamp.tzinfo is not None:
             timestamp = timestamp.tz_localize(None)
         if start_timestamp.tzinfo is not None:
@@ -2464,11 +2461,8 @@ class MainWindow(QMainWindow):
             return None
         if end_elapsed < start_elapsed:
             start_elapsed, end_elapsed = end_elapsed, start_elapsed
-        elapsed_values = relative_seconds(self.current_log)
-        if not elapsed_values:
-            return None
-        timeline_start = min(elapsed_values)
-        timeline_end = max(elapsed_values)
+        timeline_start = 0.0
+        timeline_end = self._gps_duration_seconds()
         if timeline_end <= timeline_start:
             return None
         empty_scope_width = min(0.001, (timeline_end - timeline_start) / 1000.0)
@@ -2486,14 +2480,12 @@ class MainWindow(QMainWindow):
         if self.current_log is None or self.telemetry_visible_elapsed_range is None:
             return None
         start_elapsed, end_elapsed = self.telemetry_visible_elapsed_range
-        if self.telemetry_time_mode == "absolute" and self.current_log.time is not None and self.current_log.time.notna().any():
-            time_series = self.current_log.time.ffill().bfill()
-            start_timestamp = pd.Timestamp(time_series.iloc[0])
-            if not pd.isna(start_timestamp):
-                return (
-                    start_timestamp + pd.Timedelta(seconds=start_elapsed),
-                    start_timestamp + pd.Timedelta(seconds=end_elapsed),
-                )
+        start_timestamp = self.current_log.info.start_time
+        if self.telemetry_time_mode == "absolute" and start_timestamp is not None:
+            return (
+                start_timestamp + pd.Timedelta(seconds=start_elapsed),
+                start_timestamp + pd.Timedelta(seconds=end_elapsed),
+            )
         return start_elapsed, end_elapsed
 
     def _gps_index_at_or_after_elapsed(self, elapsed_seconds: float, scope_end: float | None = None) -> int | None:

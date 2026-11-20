@@ -20,6 +20,7 @@ from sloppy_log_explorer.main_window import MainWindow
 from sloppy_log_explorer.models import GpsGradientOptions
 from sloppy_log_explorer.parser import InvalidTelemetryLogError, load_log
 from sloppy_log_explorer.plotting import (
+    _sample_numeric_series,
     _telemetry_right_axis_positions,
     _telemetry_right_margin,
     _telemetry_trace_point_budget,
@@ -3450,6 +3451,16 @@ def test_compare_traces_inherit_grouped_telemetry_axis(tmp_path: Path) -> None:
 
     assert [trace.yaxis for trace in fig.data] == ["y", "y", "y", "y"]
     assert fig.layout.yaxis.title.text == "A group"
+
+
+def test_trace_sampling_keeps_first_extrema_and_gaps_in_partial_buckets() -> None:
+    # Three five-row buckets. The middle one has no finite samples and the
+    # last one ends early. The first occurrence wins for equal extrema.
+    series = pd.Series([4, 9, 9, -2, -2, math.nan, math.inf, -math.inf, math.nan, math.nan, 3, 5, 4])
+    indices, values = _sample_numeric_series(series, maximum=8)
+    assert indices == [0, 1, 3, 5, 10, 11, 12]
+    assert math.isnan(values[3])
+    assert [value for value in values if math.isfinite(value)] == [4, 9, -2, 3, 5, 4]
 
 
 def test_large_telemetry_figure_downsamples_and_preserves_source_indexes(tmp_path: Path) -> None:

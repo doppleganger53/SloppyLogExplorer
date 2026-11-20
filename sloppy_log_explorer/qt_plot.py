@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, cast
 
+import pandas as pd
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
@@ -178,7 +179,7 @@ class TelemetryPlotWidget(QWidget):
         self.ungrouped_axis_columns: set[str] = set()
         self._view: QWebEngineView | QTextEdit
         self._page: QWebEnginePage | None = None
-        self._cursor_x_values: list[object] = []
+        self._cursor_x_values: pd.DatetimeIndex | Sequence[float] = []
         self._html_path: Path | None = None
         self._last_trace_point_budget = MAX_TELEMETRY_TRACE_POINTS_HARD_CAP
         self.setMinimumHeight(420)
@@ -338,7 +339,7 @@ class TelemetryPlotWidget(QWidget):
         page = self._page
         if page is None:
             return
-        if not self._cursor_x_values:
+        if not len(self._cursor_x_values):
             return
         safe_index = max(0, min(selected_index, len(self._cursor_x_values) - 1))
         x_value = _json_plotly_value(self._cursor_x_values[safe_index])
@@ -361,7 +362,7 @@ class TelemetryPlotWidget(QWidget):
         self._render_generation = getattr(self, "_render_generation", 0) + 1
         if self._web_engine and getattr(self, "_reset_view_pending", False):
             self._reset_target_generation = self._render_generation
-        self._cursor_x_values = list(_telemetry_x_values(self.log, self.time_mode)) if self.log is not None else []
+        self._cursor_x_values = _telemetry_x_values(self.log, self.time_mode) if self.log is not None else []
         trace_point_budget = self._current_trace_point_budget()
         manual_axis_groups = getattr(self, "manual_axis_groups", [])
         ungrouped_axis_columns = tuple(getattr(self, "ungrouped_axis_columns", ()))

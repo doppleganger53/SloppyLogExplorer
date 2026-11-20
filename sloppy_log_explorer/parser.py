@@ -19,6 +19,7 @@ LOG_EXTENSIONS = {".csv", ".log"}
 _GPS_HELPER_LAT = "__gps_latitude"
 _GPS_HELPER_LON = "__gps_longitude"
 _GPS_HELPER_ALT = "__gps_altitude"
+_COORDINATE_SEPARATOR_RE = re.compile(r"[,;|/ ]")
 _COORDINATE_DECIMAL_RE = re.compile(
     r"(?P<prefix>[NSEW])?\s*(?P<value>[+-]?\d+(?:\.\d+)?)\s*(?P<suffix>[NSEW])?",
     re.IGNORECASE,
@@ -268,14 +269,16 @@ def _numeric_columns(df: pd.DataFrame, timeline_columns: frozenset[str]) -> list
     for col in df.columns:
         if col in timeline_columns:
             continue
-        converted = _coerce_numeric_series(df[col])
+        source = df[col]
+        converted = _coerce_numeric_series(source)
         finite_values = np.isfinite(converted)
         if finite_values.any():
-            if _should_preserve_coordinate_text_column(col, df[col], converted):
+            if _should_preserve_coordinate_text_column(col, source, converted):
                 continue
             # Coerce in place so downstream plotting and GPS heuristics can use
             # a stable numeric dtype instead of re-parsing each column later.
-            df[col] = converted.where(finite_values)
+            if not pd.api.types.is_numeric_dtype(source.dtype) or np.isinf(converted).any():
+                df[col] = converted.where(finite_values)
             numeric.append(col)
     return numeric
 
@@ -285,6 +288,8 @@ def _should_preserve_coordinate_text_column(column: str, series: pd.Series | pd.
         return False
     if isinstance(series, pd.DataFrame):
         series = series.iloc[:, 0]
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        return False
     raw_text = series.astype("string").str.strip()
     has_unparsed_text = bool((series.notna() & raw_text.ne("") & converted.isna()).any())
     return has_unparsed_text and _series_has_coordinate_text_sample(series)
@@ -382,7 +387,7 @@ def _parse_coordinate_text(text: str) -> tuple[float, float, float | None] | Non
     if not cleaned:
         return None
     # Ignore strings that do not look like coordinate pairs/triples at all.
-    if not any(sep in cleaned for sep in (",", ";", "|", "/")) and cleaned.count(" ") < 1:
+    if not _COORDINATE_SEPARATOR_RE.search(cleaned):
         return None
 
     tokens: list[tuple[float, str | None]] = []
@@ -521,29 +526,16 @@ def _detect_coordinate_string_gps(df: pd.DataFrame, numeric_columns: list[str]) 
     )
 
 
-def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame, sample_size: int = 200) -> bool:
+def _series_has_coordinate_text_sample(series: pd.Series | pd.DataFrame) -> bool:
     if isinstance(series, pd.DataFrame):
         series = pd.Series(series.to_numpy()[:, 0], index=series.index)
     parsed = 0
-    checked = 0
-    iterator = iter(series)
-    for value in iterator:
-        if pd.isna(value):
+    # Search through the last row for late GPS acquisition. Only strings with
+    # a pair separator can be coordinates in a CSV field.
+    for value in series:
+        if not isinstance(value, str) or not _COORDINATE_SEPARATOR_RE.search(value):
             continue
-        checked += 1
-        if _parse_coordinate_text(str(value)) is not None:
-            parsed += 1
-            if parsed >= 2:
-                return True
-        if checked >= sample_size:
-            break
-    # If no GPS-like coordinates were found in the initial startup/status rows,
-    # keep scanning the remaining rows so late-emitted coordinate strings can
-    # still be discovered in unhinted text columns.
-    for value in iterator:
-        if pd.isna(value):
-            continue
-        if _parse_coordinate_text(str(value)) is not None:
+        if _parse_coordinate_text(value) is not None:
             parsed += 1
             if parsed >= 2:
                 return True
@@ -677,12 +669,10 @@ def load_log(path: str | Path, library_root: str | Path | None = None) -> Loaded
     _validate_table_structure(df, file_path)
     time, timeline_columns = _detect_time(df)
     numeric = _numeric_columns(df, timeline_columns)
-    df = df.copy()
-    # GPS detection can inject helper columns, so rerun the numeric pass after
-    # the detector has had a chance to normalize coordinate text.
     gps = detect_gps_columns(df, numeric)
-    numeric = _numeric_columns(df, timeline_columns)
-    df = df.copy()
+    # Only bundled GPS text can add or replace columns during detection.
+    if gps is not None and gps.latitude == _GPS_HELPER_LAT:
+        numeric = _numeric_columns(df, timeline_columns)
     if not numeric:
         raise InvalidTelemetryLogError(
             f"{file_path.name} has no usable numeric telemetry columns. "
