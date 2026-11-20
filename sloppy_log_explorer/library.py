@@ -11,6 +11,11 @@ from .parser import LOG_EXTENSIONS, _model_from_path
 
 
 NONFLIGHT_ARCHIVE = "non-flight telemetry"
+_ARCHIVE_NAME = os.path.normcase(NONFLIGHT_ARCHIVE)
+
+
+def in_nonflight_archive(path: Path) -> bool:
+    return any(os.path.normcase(part) == _ARCHIVE_NAME for part in path.parts)
 
 
 def scan_library(root: str | Path) -> list[LibraryLogInfo]:
@@ -19,9 +24,9 @@ def scan_library(root: str | Path) -> list[LibraryLogInfo]:
     # Walk directories without opening file contents so large telemetry
     # libraries stay fast and the scan can be used for indexing.
     for dirpath, dirnames, filenames in os.walk(root_path):
-        if Path(dirpath) == root_path:
-            dirnames[:] = [name for name in dirnames if os.path.normcase(name) != os.path.normcase(NONFLIGHT_ARCHIVE)]
-        dirnames.sort()
+        # Maintained libraries can also have an archive below their flight-log
+        # directory. Explicitly opening an archive still lets the pilot browse it.
+        dirnames[:] = sorted(name for name in dirnames if os.path.normcase(name) != _ARCHIVE_NAME)
         filenames.sort()
         current = Path(dirpath)
         for filename in filenames:

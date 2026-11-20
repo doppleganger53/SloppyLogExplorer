@@ -12,9 +12,24 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .library import NONFLIGHT_ARCHIVE
+from .library import NONFLIGHT_ARCHIVE, in_nonflight_archive
 from .models import SyncCandidate
 from .parser import LOG_EXTENSIONS
+
+
+def _matches_archived_copy(source: Path, relative: Path, archives: tuple[Path, ...]) -> bool:
+    for archive in archives:
+        saved = archive / relative
+        if not saved.is_file() or saved.resolve() != saved or saved.stat().st_size != source.stat().st_size:
+            continue
+        with source.open("rb") as original, saved.open("rb") as copy:
+            for block in iter(lambda: original.read(1024 * 1024), b""):
+                if copy.read(len(block)) != block:
+                    break
+            else:
+                if not copy.read(1):
+                    return True
+    return False
 
 
 def discover_sync_candidates(source: str | Path, target: str | Path) -> list[SyncCandidate]:
@@ -28,6 +43,9 @@ def discover_sync_candidates(source: str | Path, target: str | Path) -> list[Syn
     if source_root.is_relative_to(target_root) or target_root.is_relative_to(source_root):
         raise ValueError("Select separate, non-overlapping source and target directories.")
     candidates: list[SyncCandidate] = []
+    # Older maintained libraries kept the same relative paths under flight-logs.
+    archive_locations = (target_root / NONFLIGHT_ARCHIVE, target_root / "flight-logs" / NONFLIGHT_ARCHIVE)
+    archives = tuple(directory for directory in archive_locations if directory.is_dir())
 
     # Walk recursively so nested log folders are handled without special cases.
     # Sorting keeps the output stable for the UI and for tests.
@@ -40,7 +58,7 @@ def discover_sync_candidates(source: str | Path, target: str | Path) -> list[Syn
         # Preserve the relative structure from the source tree when mirroring
         # files into the target library.
         rel = source_file.relative_to(source_root)
-        if rel.is_relative_to(NONFLIGHT_ARCHIVE):
+        if in_nonflight_archive(rel):
             continue
         target_file = target_root / rel
         resolved_source = source_file.resolve()
@@ -49,19 +67,14 @@ def discover_sync_candidates(source: str | Path, target: str | Path) -> list[Syn
             raise ValueError(f"A source link points outside the selected logs directory: {rel}")
         if not resolved_target.is_relative_to(target_root):
             raise ValueError(f"A target link points outside the selected PC library: {rel}")
-        if (resolved_source.is_relative_to(source_root / NONFLIGHT_ARCHIVE)
-                or resolved_target.is_relative_to(target_root / NONFLIGHT_ARCHIVE)):
+        if in_nonflight_archive(resolved_source) or in_nonflight_archive(resolved_target):
             continue
         source_mtime = source_file.stat().st_mtime
 
         if not target_file.exists():
             # An unchanged SD-card original must not undo a reviewed archive.
-            archived = target_root / NONFLIGHT_ARCHIVE / rel
-            if (archived.is_file() and archived.resolve() == archived
-                    and archived.stat().st_size == source_file.stat().st_size):
-                with source_file.open("rb") as original, archived.open("rb") as saved:
-                    if all(saved.read(len(block)) == block for block in iter(lambda: original.read(1024 * 1024), b"")):
-                        continue
+            if _matches_archived_copy(source_file, rel, archives):
+                continue
             candidates.append(SyncCandidate(source_file, target_file, rel, "missing", source_mtime, None, source_root, target_root))
             continue
 
@@ -115,8 +128,7 @@ def _validate_candidate(candidate: SyncCandidate) -> None:
     target_root = candidate.target_root or candidate.target.parents[len(relative.parts) - 1].resolve()
     source = candidate.source.resolve()
     target = candidate.target.resolve()
-    if (relative.is_relative_to(NONFLIGHT_ARCHIVE) or source.is_relative_to(source_root / NONFLIGHT_ARCHIVE)
-            or target.is_relative_to(target_root / NONFLIGHT_ARCHIVE)):
+    if in_nonflight_archive(relative) or in_nonflight_archive(source) or in_nonflight_archive(target):
         raise ValueError(f"SD sync excludes the non-flight archive: {relative}")
     if not source.is_relative_to(source_root):
         raise ValueError(f"A source link points outside the selected logs directory: {relative}")

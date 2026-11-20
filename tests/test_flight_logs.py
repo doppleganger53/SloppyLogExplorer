@@ -598,6 +598,19 @@ def test_cold_lookup_runs_detector_only_for_sources_containing_the_actual_timest
     assert calls == [matching]
 
 
+def test_legacy_archive_remains_browsable_without_offering_to_rearchive(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    archive = root / "flight-logs" / NONFLIGHT_ARCHIVE
+    archive.mkdir(parents=True)
+    old = archive / "ground.csv"
+    telemetry(old, ground=True)
+    assert scan_library(root) == []
+    assert [log.path for log in scan_library(archive)] == [old]
+    preview = service(tmp_path).preview({old: "Falcon"})
+    assert preview.archivable_sources(root) == []
+    assert preview.archivable_sources(archive) == []
+
+
 def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_colliding_files(tmp_path: Path) -> None:
     root = tmp_path / "library"
     sources = root / "Falcon"

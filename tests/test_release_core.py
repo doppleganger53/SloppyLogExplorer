@@ -259,19 +259,20 @@ def test_sync_rejects_a_target_symlink_escaping_the_library(tmp_path: Path) -> N
     assert outside.read_text(encoding="utf-8") == "private"
 
 
-def test_sync_preserves_archive_and_imports_distinct_same_size_recording(tmp_path: Path) -> None:
+@pytest.mark.parametrize("archive_parent", [Path(), Path("flight-logs")])
+def test_sync_preserves_archive_and_imports_distinct_same_size_recording(tmp_path: Path, archive_parent: Path) -> None:
     source, target = _sync_directories(tmp_path)
     original = source / "flight.csv"
-    archive = target / NONFLIGHT_ARCHIVE
-    archive.mkdir()
+    archive = target / archive_parent / NONFLIGHT_ARCHIVE
+    archive.mkdir(parents=True)
     saved = archive / original.name
     original.write_bytes(b"recorder-A")
     saved.write_bytes(b"recorder-A")
     assert discover_sync_candidates(source, target) == []
     # The SD itself may contain an archive folder. Its contents must never
     # target the PC archive, even if the source file has a newer timestamp.
-    (source / NONFLIGHT_ARCHIVE).mkdir()
-    duplicate = source / NONFLIGHT_ARCHIVE / original.name
+    (source / archive_parent / NONFLIGHT_ARCHIVE).mkdir(parents=True)
+    duplicate = source / archive_parent / NONFLIGHT_ARCHIVE / original.name
     duplicate.write_bytes(b"newer SD-side archive file")
     os.utime(duplicate, (saved.stat().st_mtime + 5,) * 2)
     stamp = original.stat()

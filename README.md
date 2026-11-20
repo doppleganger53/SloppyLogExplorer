@@ -124,6 +124,7 @@ workspace has four tabs:
    original subfolders and filenames. Move a file back to its original folder
    and refresh the library to restore it. SD sync recognizes an identical
    archived recording and still offers a changed recording with the same name.
+   Existing archives under `flight-logs/non-flight telemetry` are also recognized.
 2. **Flight logs:** view maintained aircraft tables, edit pilot Notes, save changes, and
    export CSV. Choose an existing skill-generated flight-log directory to
    continue maintaining those Markdown files. Drag headings, then choose

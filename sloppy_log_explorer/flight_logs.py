@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import _flight_log_engine as engine
-from .library import NONFLIGHT_ARCHIVE
+from .library import NONFLIGHT_ARCHIVE, in_nonflight_archive
 
 
 DEFAULT_POLICY: dict[str, Any] = {
@@ -185,8 +185,7 @@ class FlightLogPreview:
 
     def archivable_sources(self, root: Path) -> list[Path]:
         root = root.resolve()
-        archive = root / NONFLIGHT_ARCHIVE
-        return [path for path in self._archive_files if path.is_relative_to(root) and not path.is_relative_to(archive)]
+        return [path for path in self._archive_files if path.is_relative_to(root) and not in_nonflight_archive(path)]
 
 
 def _read_headers(path: Path) -> list[str]:
