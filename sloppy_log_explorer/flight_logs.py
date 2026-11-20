@@ -236,6 +236,7 @@ class FlightLogService:
         """Match a maintained row to actual detected windows, including older Markdown tables."""
         matches: dict[Path, FlightSource] = {}
         key = (start, duration)
+        requested_start = datetime.fromisoformat(start)
         for source, name in file_aircraft.items():
             if name.casefold() != aircraft.casefold():
                 continue
@@ -245,6 +246,8 @@ class FlightLogService:
                 cached = self._source_windows.get(path)
                 if (cached is None or not self._same_source(cached.stat, before)
                         or (key in cached.windows and _fingerprint(path) != cached.fingerprint)):
+                    if not engine.contains_flight_start(path, requested_start):
+                        continue
                     digest = _fingerprint(path)
                     if digest is None:
                         continue

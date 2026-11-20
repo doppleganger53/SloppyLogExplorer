@@ -10,6 +10,7 @@ import pytest
 
 from sloppy_log_explorer.flight_logs import FlightLogService, effective_policy, infer_aircraft
 from sloppy_log_explorer._flight_log_engine import servo_current_headers
+from sloppy_log_explorer import _flight_log_engine as engine
 from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE, scan_library
 from sloppy_log_explorer.sync import discover_sync_candidates
 
@@ -564,6 +565,37 @@ def test_find_sources_on_restart_handles_offset_multiflight_ambiguity_and_replac
     duplicate.unlink()
     assert not reopened.find_flight_sources({path: "Falcon", duplicate: "Falcon"}, "Falcon", *key)
     assert document.path.read_text(encoding="utf-8") == document.text
+
+
+def test_cold_lookup_runs_detector_only_for_sources_containing_the_actual_timestamp(tmp_path: Path, monkeypatch) -> None:
+    matching, unrelated = tmp_path / "mislabeled-2025-01-01.csv", tmp_path / "2026-07-01.csv"
+    telemetry(matching)
+    telemetry(unrelated, day=2)
+    with matching.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    # Blank, malformed and out-of-order records cannot hide a matching sample.
+    rows.insert(12, list(rows[-1]))
+    rows.insert(30, ["unknown", "missing"])
+    rows.insert(40, [])
+    for row in rows[1:]:
+        if row and row[0].startswith("2026"):
+            row[1] += ".375-04:00"
+    with matching.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    sources = {matching: "Falcon", unrelated: "Falcon"}
+    calls = []
+    original = engine.analyze_file
+    def record(path, **kwargs):
+        calls.append(path)
+        return original(path, **kwargs)
+    monkeypatch.setattr(engine, "analyze_file", record)
+    hits = logs.find_flight_sources(sources, "Falcon", "2026-07-01 09:01:00", "00:02:00")
+    assert len(hits) == 1 and hits[0].path == matching
+    assert hits[0].start == datetime(2026, 7, 1, 13, 1, 0, 375000)
+    assert calls == [matching]
+    assert not logs.find_flight_sources(sources, "Falcon", "2024-12-05 10:00:00", "00:02:00")
+    assert calls == [matching]
 
 
 def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_colliding_files(tmp_path: Path) -> None:

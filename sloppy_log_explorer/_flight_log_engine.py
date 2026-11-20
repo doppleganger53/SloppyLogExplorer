@@ -378,6 +378,23 @@ def open_csv(path: Path) -> tuple[Iterator[list[str]], TextIO]:
     return csv.reader(handle, dialect), handle
 
 
+def contains_flight_start(path: Path, start: datetime) -> bool:
+    """A detected window always starts at an observed wall-clock second."""
+    reader, handle = open_csv(path)
+    try:
+        columns = classify_columns(deduplicate_headers(next(reader, [])))
+        if columns.date is None and columns.time is None and columns.combined_time is None:
+            return False
+        for row in reader:
+            timestamp = parse_timestamp(row_value(row, columns.date), row_value(row, columns.time),
+                                        row_value(row, columns.combined_time))
+            if timestamp is not None and timestamp.replace(tzinfo=None, microsecond=0) == start:
+                return True
+        return False
+    finally:
+        handle.close()
+
+
 def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (), *,
                  exclude_sensors: Sequence[str] = (), auto_vfr: bool = True,
                  auto_temperatures: bool = True,
@@ -419,6 +436,9 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
                 continue
             if start_time is None:
                 start_time = timestamp
+            if (timestamp.tzinfo is None) != (start_time.tzinfo is None):
+                complete = False
+                continue
             elapsed = (timestamp - start_time).total_seconds()
             if elapsed < 0:
                 complete = False
