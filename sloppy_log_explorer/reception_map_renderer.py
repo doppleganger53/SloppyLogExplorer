@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .imagery_tiles import IMAGERY_TILE_JAVASCRIPT
 from .map_basemaps import BASEMAP_RUNTIME_JAVASCRIPT, build_basemap_config
 
 MAP_MAX_ZOOM = 22
@@ -899,6 +900,7 @@ __BASEMAP_RUNTIME__
       const center = viewportFocus
         ? [wrapLongitude(viewportFocus.longitude), clamp(viewportFocus.latitude, -mercatorMaxLatitude, mercatorMaxLatitude)]
         : [-75, 39];
+      installImageryTileLoader();
       map = new maplibregl.Map({
         container: "map",
         style: buildRasterBaseStyle(),
@@ -969,7 +971,7 @@ __BASEMAP_RUNTIME__
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__RECEPTION_DATA__": data_json,
         "__BASEMAP_CONFIG__": basemap_config_json,
-        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT,
+        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT + IMAGERY_TILE_JAVASCRIPT,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
         "__PANEL_FG__": panel_fg,

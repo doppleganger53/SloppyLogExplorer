@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from .gps_measurement import MEASUREMENT_RUNTIME_JAVASCRIPT
+from .imagery_tiles import IMAGERY_TILE_JAVASCRIPT
 from .map_basemaps import (
     BASEMAP_RUNTIME_JAVASCRIPT,
     OPENSTREETMAP_RASTER_TILE_MAX_ZOOM,
@@ -1767,6 +1768,7 @@ __MEASUREMENT_RUNTIME__
       initialBearing = calculateBearing(startPoint, endPoint);
       flightBounds = calculateBounds(flightData.points);
       const center = coordinateFromPoint(startPoint) || [-75, 39];
+      installImageryTileLoader();
       map = new maplibregl.Map({
         container: "map",
         style: buildRasterBaseStyle(),
@@ -1871,7 +1873,7 @@ __MEASUREMENT_RUNTIME__
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__FLIGHT_DATA__": data_json,
         "__BASEMAP_CONFIG__": basemap_config_json,
-        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT,
+        "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT + IMAGERY_TILE_JAVASCRIPT,
         "__MEASUREMENT_RUNTIME__": MEASUREMENT_RUNTIME_JAVASCRIPT,
         "__BACKGROUND__": background,
         "__PANEL_BG__": panel_bg,
