@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +10,8 @@ import pytest
 
 from sloppy_log_explorer.flight_logs import FlightLogService, effective_policy, infer_aircraft
 from sloppy_log_explorer._flight_log_engine import servo_current_headers
+from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE, scan_library
+from sloppy_log_explorer.sync import discover_sync_candidates
 
 
 def telemetry(path: Path, *, windows: tuple[tuple[int, int], ...] = ((60, 180),),
@@ -532,3 +536,73 @@ def test_existing_duplicate_flight_numbers_are_not_editable(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="ascending flight dates and numbers"):
         logs.save_notes("Falcon", 1, "Cannot choose between duplicate rows")
     assert path.read_bytes() == before
+
+
+def test_find_sources_on_restart_handles_offset_multiflight_ambiguity_and_replaced_file(tmp_path: Path) -> None:
+    path = tmp_path / "Multi.csv"
+    telemetry(path, windows=((30, 120), (270, 390)))
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    for row in rows[1:]:
+        row[1] += "-04:00"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    logs.generate(logs.preview({path: "Falcon"}))
+    document = logs.save_notes("Falcon", 2, "Keep this pilot note")
+    duplicate = tmp_path / "Copy.csv"
+    shutil.copy2(path, duplicate)
+    # Another installation can use the maintained Markdown without any local source index.
+    reopened = service(tmp_path)
+    key = (document.rows[1][1], document.rows[1][2])
+    matches = reopened.find_flight_sources({path: "Falcon", duplicate: "Falcon"}, "Falcon", *key)
+    assert {hit.path for hit in matches} == {path, duplicate}
+    assert all(hit.start == datetime(2026, 7, 1, 13, 4, 30) for hit in matches)
+    stat = path.stat()
+    path.write_bytes(path.read_bytes().replace(b"2026-07-01", b"2026-07-04"))
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    duplicate.unlink()
+    assert not reopened.find_flight_sources({path: "Falcon", duplicate: "Falcon"}, "Falcon", *key)
+    assert document.path.read_text(encoding="utf-8") == document.text
+
+
+def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_colliding_files(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    sources = root / "Falcon"
+    sources.mkdir(parents=True)
+    paths = {name: sources / f"{name}.csv" for name in
+             ("flight", "pending", "overlap", "incomplete", "unsupported", "good", "changed", "collision")}
+    telemetry(paths["flight"])
+    telemetry(paths["pending"], direct=False, windows=((30, 270),))
+    for name in ("overlap", "good", "changed", "collision", "incomplete"):
+        telemetry(paths[name], ground=True, day=1 if name == "overlap" else 2)
+    paths["unsupported"].write_text("Date,Time\n2026-07-03,11:00:00\n", encoding="utf-8")
+    with paths["incomplete"].open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    with paths["incomplete"].open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(rows[:2])
+        writer.writerows([*row[:2], *([""] * (len(row) - 2))] for row in rows[2:])
+    logs = service(tmp_path)
+    logs.generate(logs.preview({paths["flight"]: "Falcon"}))
+    preview = logs.preview(dict.fromkeys(paths.values(), "Falcon"))
+    assert set(preview.archivable_sources(root)) == {paths[name] for name in ("good", "changed", "collision")}
+    archived = root / NONFLIGHT_ARCHIVE / "Falcon"
+    archived.mkdir(parents=True)
+    (archived / "collision.csv").write_text("Do not overwrite", encoding="utf-8")
+    paths["changed"].write_text("Changed after review", encoding="utf-8")
+    with pytest.raises(ValueError, match="outside"):
+        logs.archive_nonflights(preview, root, [paths["flight"]])
+    radio = tmp_path / "radio"
+    (radio / "Falcon").mkdir(parents=True)
+    shutil.copy2(paths["good"], radio / "Falcon" / "good.csv")
+    moved, errors = logs.archive_nonflights(preview, root, preview.archivable_sources(root))
+    assert moved == {paths["good"]: archived / "good.csv"}
+    assert len(errors) == 2
+    assert (archived / "collision.csv").read_text() == "Do not overwrite"
+    assert not (archived / "changed.csv").exists()
+    assert {info.path for info in scan_library(root)} == set(paths.values()) - {paths["good"]}
+    assert (archived / "good.csv").read_bytes() == (radio / "Falcon" / "good.csv").read_bytes()
+    assert not discover_sync_candidates(radio, root)
+    (radio / "Falcon" / "good.csv").write_bytes(b"A replacement recording")
+    assert len(discover_sync_candidates(radio, root)) == 1

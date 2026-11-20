@@ -13,14 +13,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from . import _flight_log_engine as engine
+from .library import NONFLIGHT_ARCHIVE
 
 
 DEFAULT_POLICY: dict[str, Any] = {
@@ -122,6 +124,31 @@ class FlightLogDocument:
     fingerprint: str
 
 
+@dataclass(frozen=True)
+class FlightSource:
+    path: Path
+    start: datetime
+    end: datetime
+
+    @staticmethod
+    def _plot_time(stamp: datetime) -> datetime:
+        # The telemetry parser converts offset-bearing timestamps to naive UTC.
+        return stamp.astimezone(timezone.utc).replace(tzinfo=None) if stamp.tzinfo is not None else stamp
+
+    @classmethod
+    def windows(cls, analysis: engine.FileAnalysis) -> dict[tuple[str, str], FlightSource]:
+        return {(flight.display_datetime, flight.display_duration):
+                    cls(analysis.path, cls._plot_time(flight.start), cls._plot_time(flight.end))
+                for flight in analysis.flights}
+
+
+@dataclass(frozen=True)
+class _SourceIndex:
+    stat: os.stat_result
+    fingerprint: str
+    windows: dict[tuple[str, str], FlightSource]
+
+
 @dataclass
 class FlightLogPreview:
     report: dict[str, Any]
@@ -133,6 +160,7 @@ class FlightLogPreview:
     _output_paths: dict[str, Path] = field(repr=False)
     _settings: dict[str, Any] = field(repr=False)
     _rebuild: bool = field(repr=False)
+    _archive_files: dict[Path, Path] = field(default_factory=dict, repr=False)
     _plans: dict[Path, str] = field(default_factory=dict, repr=False)
 
     @property
@@ -154,6 +182,11 @@ class FlightLogPreview:
     @property
     def rebuild(self) -> bool:
         return self._rebuild
+
+    def archivable_sources(self, root: Path) -> list[Path]:
+        root = root.resolve()
+        archive = root / NONFLIGHT_ARCHIVE
+        return [path for path in self._archive_files if path.is_relative_to(root) and not path.is_relative_to(archive)]
 
 
 def _read_headers(path: Path) -> list[str]:
@@ -182,6 +215,11 @@ def _flight_key(flight: engine.Flight) -> tuple[datetime, str]:
     return datetime.strptime(flight.display_datetime, "%Y-%m-%d %H:%M:%S"), flight.display_duration
 
 
+def flight_end(start: datetime, duration: str) -> datetime:
+    hours, minutes, seconds = map(int, duration.split(":"))
+    return start + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
 def _schema_changes(before: Sequence[str], after: Sequence[str]) -> dict[str, list[str]]:
     return {"before": list(before), "after": list(after),
             "added": [column for column in after if column not in before],
@@ -191,6 +229,42 @@ def _schema_changes(before: Sequence[str], after: Sequence[str]) -> dict[str, li
 class FlightLogService:
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir).expanduser().resolve()
+        self._source_windows: dict[Path, _SourceIndex] = {}
+
+    def find_flight_sources(self, file_aircraft: Mapping[str | Path, str], aircraft: str,
+                            start: str, duration: str) -> list[FlightSource]:
+        """Match a maintained row to actual detected windows, including older Markdown tables."""
+        matches: dict[Path, FlightSource] = {}
+        key = (start, duration)
+        for source, name in file_aircraft.items():
+            if name.casefold() != aircraft.casefold():
+                continue
+            path = Path(source).resolve()
+            try:
+                before = path.stat()
+                cached = self._source_windows.get(path)
+                if (cached is None or not self._same_source(cached.stat, before)
+                        or (key in cached.windows and _fingerprint(path) != cached.fingerprint)):
+                    digest = _fingerprint(path)
+                    if digest is None:
+                        continue
+                    analysis = engine.analyze_file(path, plane_override=aircraft, scan_root=None,
+                                                   **DETECTION_POLICY)
+                    if (analysis.status == "error" or not self._same_source(before, path.stat())
+                            or _fingerprint(path) != digest):
+                        continue
+                    cached = _SourceIndex(before, digest, FlightSource.windows(analysis))
+                    self._source_windows[path] = cached
+            except (OSError, ValueError, csv.Error):
+                continue
+            if key in cached.windows:
+                matches[path] = cached.windows[key]
+        return [matches[path] for path in sorted(matches)]
+
+    @staticmethod
+    def _same_source(first: os.stat_result, second: os.stat_result) -> bool:
+        return (os.path.samestat(first, second) and first.st_mtime_ns == second.st_mtime_ns
+                and first.st_ctime_ns == second.st_ctime_ns and first.st_size == second.st_size)
 
     @property
     def settings_path(self) -> Path:
@@ -277,12 +351,15 @@ class FlightLogService:
         }
         canonical = {name.casefold(): name for name in self.list_aircraft()}
         mapping: dict[Path, str] = {}
+        linked_sources: set[Path] = set()
         for source, raw_aircraft in file_aircraft.items():
             aircraft = _validate_aircraft(raw_aircraft)
             if selected is not None and aircraft.casefold() not in selected:
                 continue
             aircraft = canonical.setdefault(aircraft.casefold(), aircraft)
             path = Path(source).expanduser().resolve()
+            if path != Path(source).expanduser().absolute():
+                linked_sources.add(path)
             if path in mapping and mapping[path] != aircraft:
                 raise ValueError(f"Telemetry file is mapped to multiple aircraft: {path}")
             mapping[path] = aircraft
@@ -290,6 +367,7 @@ class FlightLogService:
         outputs: dict[Path, str | None] = {}
         output_texts: dict[Path, str | None] = {}
         output_paths: dict[str, Path] = {}
+        logged_intervals: dict[str, list[tuple[datetime, datetime]]] = {}
         for aircraft in sorted(set(mapping.values()), key=str.casefold):
             output = self._path_for(aircraft)
             owner = owners.get(output.name.casefold())
@@ -305,9 +383,17 @@ class FlightLogService:
                 output_texts[output] = None
             if outputs[output] != _fingerprint(output):
                 raise ValueError(f"Local log changed during preview: {output.name}; preview again")
+            existing = output_texts[output]
+            try:
+                rows = _parse_snapshot(existing, output.name)[0] if existing is not None else []
+                logged_intervals[aircraft] = [(row.timestamp, flight_end(row.timestamp, row.duration)) for row in rows]
+            except (ValueError, OverflowError):
+                # An unreadable maintained table cannot establish that a recording is unused.
+                pass
 
         sources: dict[Path, str | None] = {}
         candidates: dict[str, engine.Flight] = {}
+        archive_files: dict[Path, Path] = {}
         files: list[dict[str, Any]] = []
         available: dict[str, list[str]] = defaultdict(list)
         for path, aircraft in sorted(mapping.items(), key=lambda item: str(item[0]).casefold()):
@@ -331,8 +417,15 @@ class FlightLogService:
                 )
                 if sources[path] != _fingerprint(path):
                     raise ValueError("Telemetry changed during analysis; preview again")
+                digest = sources[path]
+                if analysis.status != "error" and digest is not None:
+                    self._source_windows[path] = _SourceIndex(path.stat(), digest, FlightSource.windows(analysis))
                 file_report.update(status=analysis.status, detail=analysis.detail,
                                    rejected_candidates=analysis.rejected_candidates)
+                if analysis.archive_interval and aircraft in logged_intervals and path not in linked_sources:
+                    first, last = (stamp.replace(tzinfo=None) for stamp in analysis.archive_interval)
+                    if not any(first <= end and last >= start for start, end in logged_intervals[aircraft]):
+                        archive_files[path] = output_paths[aircraft]
                 # Servo capture changes metrics only. Keep the existing review
                 # identity so an added default never undoes a pilot decision.
                 decision_policy = {key: value for key, value in policy.items() if key != "auto_servo_currents"}
@@ -359,8 +452,56 @@ class FlightLogService:
         preview = FlightLogPreview({"files": files, "available_headers": dict(available),
                                     "files_scanned": len(files), "dry_run": True, "rebuild": bool(rebuild)},
                                    self.output_dir, candidates, sources, outputs, output_texts, output_paths,
-                                   checked_settings, bool(rebuild))
+                                   checked_settings, bool(rebuild), _archive_files=archive_files)
         return self.with_decisions(preview, decisions or {})
+
+    def archive_nonflights(self, preview: FlightLogPreview, root: Path,
+                           selected: Sequence[Path]) -> tuple[dict[Path, Path], list[str]]:
+        self._check_owner(preview)
+        root = root.resolve()
+        archive = root / NONFLIGHT_ARCHIVE
+        eligible = set(preview.archivable_sources(root))
+        if not set(selected) <= eligible:
+            raise ValueError("The selection contains a source outside this non-flight review.")
+        moved: dict[Path, Path] = {}
+        errors: list[str] = []
+        for source in dict.fromkeys(selected):
+            relative = source.relative_to(root)
+            target = archive / relative
+            output = preview._archive_files[source]
+            try:
+                if source.resolve() != source or target.resolve() != target:
+                    raise ValueError("a linked path changed the source or archive location")
+                if _fingerprint(output) != preview._output_fingerprints[output]:
+                    raise ValueError("the maintained flight log changed since review")
+                expected = preview._source_fingerprints[source]
+                if expected is None:
+                    raise ValueError("missing source fingerprint")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # Exclusive creation also handles races with another archiver. Keep the
+                # original until the closed archive copy and the source both verify.
+                before = source.stat()
+                saved = target.open("xb")
+                try:
+                    with saved, source.open("rb") as original:
+                        shutil.copyfileobj(original, saved, 1024 * 1024)
+                        saved.flush()
+                        os.fsync(saved.fileno())
+                    shutil.copystat(source, target)
+                    if (_fingerprint(target) != expected or not self._same_source(before, source.stat())
+                            or _fingerprint(source) != expected):
+                        raise ValueError("source changed since review or archive verification failed")
+                    if _fingerprint(output) != preview._output_fingerprints[output]:
+                        raise ValueError("the maintained flight log changed during archiving")
+                    source.unlink()
+                except (OSError, ValueError):
+                    if source.exists():
+                        target.unlink()
+                    raise
+                moved[source] = target
+            except (OSError, ValueError) as exc:
+                errors.append(f"{relative}: {exc}")
+        return moved, errors
 
     def with_decisions(self, preview: FlightLogPreview, decisions: Mapping[str, str]) -> FlightLogPreview:
         self._check_owner(preview)

@@ -10,12 +10,17 @@ from .models import LibraryLogInfo
 from .parser import LOG_EXTENSIONS, _model_from_path
 
 
+NONFLIGHT_ARCHIVE = "non-flight telemetry"
+
+
 def scan_library(root: str | Path) -> list[LibraryLogInfo]:
     root_path = Path(root)
     logs: list[LibraryLogInfo] = []
     # Walk directories without opening file contents so large telemetry
     # libraries stay fast and the scan can be used for indexing.
     for dirpath, dirnames, filenames in os.walk(root_path):
+        if Path(dirpath) == root_path:
+            dirnames[:] = [name for name in dirnames if os.path.normcase(name) != os.path.normcase(NONFLIGHT_ARCHIVE)]
         dirnames.sort()
         filenames.sort()
         current = Path(dirpath)

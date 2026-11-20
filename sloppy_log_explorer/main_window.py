@@ -8,6 +8,7 @@ import sqlite3
 import time
 import traceback
 from bisect import bisect_left, bisect_right
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -354,6 +355,8 @@ class MainWindow(QMainWindow):
         self._build_flight_tab()
         self.flight_logs_tab = FlightLogWidget(self.store, self)
         self.flight_logs_tab.library_requested.connect(self.open_library_dialog)
+        self.flight_logs_tab.telemetry_requested.connect(self.open_flight_telemetry)
+        self.flight_logs_tab.sources_archived.connect(self._refresh_archived_sources)
         self.tabs.addTab(self.flight_logs_tab, "Flight Logs")
         self._build_battery_tab()
         self._build_sync_tab()
@@ -367,6 +370,7 @@ class MainWindow(QMainWindow):
 
     def _build_graph_tab(self) -> None:
         tab = QWidget()
+        self.telemetry_tab = tab
         layout = QVBoxLayout(tab)
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Drag mode"))
@@ -2040,6 +2044,18 @@ class MainWindow(QMainWindow):
         self.start_reception_scan()
         self.status.showMessage(f"Loaded {len(self.library_logs)} logs from {path}")
 
+    def _refresh_archived_sources(self, moved: dict[Path, Path]) -> None:
+        self.store.relocate_flight_files(moved)
+        for log in (self.current_log, self.compare_log):
+            if log and (new_path := moved.get(log.info.path.resolve())) is not None:
+                log.info = replace(log.info, path=new_path)
+        if self._flight_notes_path and (new_path := moved.get(Path(self._flight_notes_path).resolve())):
+            self._flight_notes_path = str(new_path)
+        if self.current_log:
+            self.store.set_setting("last_log", str(self.current_log.info.path))
+        if self.library_root and any(log.path.resolve() in moved for log in self.library_logs):
+            self.load_library(self.library_root)
+
     def populate_library_tree(self) -> None:
         self.library_tree.clear()
         for model, logs in group_by_model(self.library_logs).items():
@@ -2120,7 +2136,10 @@ class MainWindow(QMainWindow):
         self._deferred_views_dirty.discard("flight_notes")
         self.load_flight_notes()
 
-    def load_log(self, path: Path) -> None:
+    def open_flight_telemetry(self, path: str, start: str, end: str) -> None:
+        self.load_log(Path(path), flight_interval=(start, end))
+
+    def load_log(self, path: Path, *, flight_interval: tuple[str, str] | None = None) -> None:
         try:
             next_log = load_log(path, self.library_root)
             if not self._confirm_flight_notes_saved():
@@ -2134,6 +2153,12 @@ class MainWindow(QMainWindow):
             # Axis overrides belong to this session. The renderer filters out
             # unavailable columns, retaining the full groups for later logs.
             self._reset_gps_playback()
+            if flight_interval is not None:
+                self.telemetry_visible_elapsed_range = self._normalise_telemetry_elapsed_range(*flight_interval)
+                if self.telemetry_visible_elapsed_range is not None:
+                    self.selected_index = self._clamp_index_to_elapsed_scope(self.telemetry_visible_elapsed_range)
+                    self.gps_playback_elapsed_seconds = self._gps_elapsed_for_index(self.selected_index)
+                self.tabs.setCurrentWidget(self.telemetry_tab)
             self.store.set_setting("last_log", str(path))
             # Every dependent widget needs a refresh because a new log changes
             # the available columns, GPS choices, and saved notes target.

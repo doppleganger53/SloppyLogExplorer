@@ -12,6 +12,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from .library import NONFLIGHT_ARCHIVE
 from .models import SyncCandidate
 from .parser import LOG_EXTENSIONS
 
@@ -46,8 +47,14 @@ def discover_sync_candidates(source: str | Path, target: str | Path) -> list[Syn
             raise ValueError(f"A target link points outside the selected PC library: {rel}")
         source_mtime = source_file.stat().st_mtime
 
-        # A missing target file is always a copy candidate.
         if not target_file.exists():
+            # An unchanged SD-card original must not undo a reviewed archive.
+            archived = target_root / NONFLIGHT_ARCHIVE / rel
+            if (archived.is_file() and archived.resolve() == archived
+                    and archived.stat().st_size == source_file.stat().st_size):
+                with source_file.open("rb") as original, archived.open("rb") as saved:
+                    if all(saved.read(len(block)) == block for block in iter(lambda: original.read(1024 * 1024), b"")):
+                        continue
             candidates.append(SyncCandidate(source_file, target_file, rel, "missing", source_mtime, None, source_root, target_root))
             continue
 
