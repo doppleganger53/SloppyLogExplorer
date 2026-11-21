@@ -1,12 +1,65 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from threading import Event
 import time
 
+import pytest
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
+
+from sloppy_log_explorer.flight_logs import FlightLogService
+
+
+@pytest.mark.parametrize(("readings", "archivable"), [
+    ("flight", False),
+    ("controls only", False),
+    ("missing sensors", False),
+    ("sentinel values", False),
+    ("sparse speed", False),
+    ("moderate speed", False),
+    ("moderate altitude change", False),
+    ("climbing", False),
+    ("late fix", False),
+    ("acquiring altitude", True),
+    ("stationary speed", True),
+])
+def test_bulk_archive_requires_ground_evidence_without_segments(tmp_path: Path, readings, archivable) -> None:
+    source = tmp_path / "Falcon.csv"
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        headers = ["Date", "Time", "Rudder", "Elevator", "Aileron", "Throttle", "Rx VFR(%)"]
+        if readings != "controls only":
+            altitude_header = "GPS alt(ft)" if readings == "sentinel values" else "GPS alt(m)"
+            headers += ["GPS speed(mph)", altitude_header, "Vertical speed(m/s)"]
+        writer.writerow(headers)
+        for second in range(300):
+            row = ["2026-07-01", f"09:{second // 60:02}:{second % 60:02}", 0, 0, 0, -1024, 100]
+            if readings != "controls only":
+                row += {
+                    "flight": (35, 50 + second / 3, ""),
+                    "missing sensors": ("", "", ""),
+                    "sentinel values": ("", -1024, ""),
+                    "sparse speed": (0 if second < 12 else "", "", ""),
+                    "moderate speed": (15, 50, ""),
+                    "moderate altitude change": (0, 50 + second / 20, ""),
+                    "climbing": (0, "", 3),
+                    "late fix": ("", 0 if second < 280 else 50, ""),
+                    "acquiring altitude": ("", 0 if second < 20 else 50, ""),
+                    "stationary speed": (0, "", ""),
+                }[readings]
+            writer.writerow(row)
+    service = FlightLogService(tmp_path / "maintained")
+    preview = service.preview({source: "Falcon"})
+    assert not preview.candidates
+    assert preview.archivable_sources(tmp_path) == ([source] if archivable else [])
+    if not archivable:
+        assert "retained" in preview.report["files"][0]["detail"]
+        with pytest.raises(ValueError, match="outside"):
+            service.archive_nonflights(preview, tmp_path, [source])
+        assert source.is_file()
 
 
 def _wait(view) -> None:

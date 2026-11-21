@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import os
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +10,10 @@ import pytest
 
 from sloppy_log_explorer.flight_logs import FlightLogService, effective_policy, infer_aircraft
 from sloppy_log_explorer._flight_log_engine import servo_current_headers
+from sloppy_log_explorer import _flight_log_engine as engine
+from sloppy_log_explorer import flight_logs
+from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE, scan_library
+from sloppy_log_explorer.sync import discover_sync_candidates
 
 
 def telemetry(path: Path, *, windows: tuple[tuple[int, int], ...] = ((60, 180),),
@@ -532,3 +538,211 @@ def test_existing_duplicate_flight_numbers_are_not_editable(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="ascending flight dates and numbers"):
         logs.save_notes("Falcon", 1, "Cannot choose between duplicate rows")
     assert path.read_bytes() == before
+
+
+def test_find_sources_on_restart_handles_offset_multiflight_ambiguity_and_replaced_file(tmp_path: Path) -> None:
+    path = tmp_path / "Multi.csv"
+    telemetry(path, windows=((30, 120), (270, 390)))
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    for row in rows[1:]:
+        row[1] += "-04:00"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    logs.generate(logs.preview({path: "Falcon"}))
+    document = logs.save_notes("Falcon", 2, "Keep this pilot note")
+    duplicate = tmp_path / "Copy.csv"
+    shutil.copy2(path, duplicate)
+    # Another installation can use the maintained Markdown without any local source index.
+    reopened = service(tmp_path)
+    key = (document.rows[1][1], document.rows[1][2])
+    matches = reopened.find_flight_sources({path: "Falcon", duplicate: "Falcon"}, "Falcon", *key)
+    assert {hit.path for hit in matches} == {path, duplicate}
+    assert all(hit.start == datetime(2026, 7, 1, 13, 4, 30) for hit in matches)
+    stat = path.stat()
+    path.write_bytes(path.read_bytes().replace(b"2026-07-01", b"2026-07-04"))
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    duplicate.unlink()
+    assert not reopened.find_flight_sources({path: "Falcon", duplicate: "Falcon"}, "Falcon", *key)
+    assert document.path.read_text(encoding="utf-8") == document.text
+
+
+def test_cold_lookup_runs_detector_only_for_sources_containing_the_actual_timestamp(tmp_path: Path, monkeypatch) -> None:
+    matching, unrelated = tmp_path / "mislabeled-2025-01-01.csv", tmp_path / "2026-07-01.csv"
+    telemetry(matching)
+    telemetry(unrelated, day=2)
+    with matching.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    # Blank, malformed and out-of-order records cannot hide a matching sample.
+    rows.insert(12, list(rows[-1]))
+    rows.insert(30, ["unknown", "missing"])
+    rows.insert(40, [])
+    for row in rows[1:]:
+        if row and row[0].startswith("2026"):
+            row[1] += ".375-04:00"
+    with matching.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    sources = {matching: "Falcon", unrelated: "Falcon"}
+    calls = []
+    original = engine.analyze_file
+    def record(path, **kwargs):
+        calls.append(path)
+        return original(path, **kwargs)
+    monkeypatch.setattr(engine, "analyze_file", record)
+    hits = logs.find_flight_sources(sources, "Falcon", "2026-07-01 09:01:00", "00:02:00")
+    assert len(hits) == 1 and hits[0].path == matching
+    assert hits[0].start == datetime(2026, 7, 1, 13, 1, 0, 375000)
+    assert calls == [matching]
+    assert not logs.find_flight_sources(sources, "Falcon", "2024-12-05 10:00:00", "00:02:00")
+    assert calls == [matching]
+
+
+def test_legacy_archive_remains_browsable_without_offering_to_rearchive(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    archive = root / "flight-logs" / NONFLIGHT_ARCHIVE
+    archive.mkdir(parents=True)
+    old = archive / "ground.csv"
+    telemetry(old, ground=True)
+    assert scan_library(root) == []
+    assert [log.path for log in scan_library(archive)] == [old]
+    preview = service(tmp_path).preview({old: "Falcon"})
+    assert preview.archivable_sources(root) == []
+    assert preview.archivable_sources(archive) == []
+
+
+@pytest.mark.parametrize(("duration", "speed_mph", "climb_m", "vertical", "retained_reason"), [
+    (200, 40, 100, False, "flight speed"),
+    (20, 35, 0, False, "flight speed"),
+    (20, 0, 45, False, "altitude change"),
+    (20, 0, 0, True, "climb and descent"),
+    (200, 0, 0, False, ""),
+])
+def test_archive_checks_airborne_evidence_outside_control_segments(
+        tmp_path: Path, duration, speed_mph, climb_m, vertical, retained_reason) -> None:
+    source = tmp_path / "Falcon.csv"
+    telemetry(source)
+    with source.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    headers = rows[0]
+    headers.append("Vertical speed(m/s)")
+    for second, row in enumerate(rows[1:]):
+        progress = (second - 30) / duration
+        active = 0 <= progress <= 1
+        for control in ("Rudder", "Elevator", "Aileron"):
+            row[headers.index(control)] = "0"
+        row[headers.index("Throttle")] = "-1024"
+        row[headers.index("Rx VFR(%)")] = "98"
+        row[headers.index("GPS speed(mph)")] = str(speed_mph if active else 0)
+        # A stationary receiver also acquires its field elevation after boot.
+        altitude = 50 if second >= 10 else 0
+        if active:
+            altitude += 2 * min(progress, 1 - progress) * climb_m
+        row[headers.index("GPS alt(m)")] = str(altitude)
+        row.append("3" if vertical and active and progress < 0.5 else "-3" if vertical and active else "0")
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    assert not preview.candidates
+    if retained_reason:
+        assert retained_reason in preview.report["files"][0]["detail"]
+        assert not preview.archivable_sources(tmp_path)
+        with pytest.raises(ValueError, match="outside"):
+            logs.archive_nonflights(preview, tmp_path, [source])
+    else:
+        assert preview.archivable_sources(tmp_path) == [source]
+
+
+def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_colliding_files(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    sources = root / "Falcon"
+    sources.mkdir(parents=True)
+    paths = {name: sources / f"{name}.csv" for name in
+             ("flight", "pending", "overlap", "incomplete", "unsupported", "good", "changed", "collision")}
+    telemetry(paths["flight"])
+    telemetry(paths["pending"], direct=False, windows=((30, 270),))
+    for name in ("overlap", "good", "changed", "collision", "incomplete"):
+        telemetry(paths[name], ground=True, day=1 if name == "overlap" else 2)
+    paths["unsupported"].write_text("Date,Time\n2026-07-03,11:00:00\n", encoding="utf-8")
+    with paths["incomplete"].open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    with paths["incomplete"].open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerows(rows[:2])
+        writer.writerows([*row[:2], *([""] * (len(row) - 2))] for row in rows[2:])
+    logs = service(tmp_path)
+    logs.generate(logs.preview({paths["flight"]: "Falcon"}))
+    preview = logs.preview(dict.fromkeys(paths.values(), "Falcon"))
+    assert set(preview.archivable_sources(root)) == {paths[name] for name in ("good", "changed", "collision")}
+    archived = root / NONFLIGHT_ARCHIVE / "Falcon"
+    archived.mkdir(parents=True)
+    (archived / "collision.csv").write_text("Do not overwrite", encoding="utf-8")
+    paths["changed"].write_text("Changed after review", encoding="utf-8")
+    with pytest.raises(ValueError, match="outside"):
+        logs.archive_nonflights(preview, root, [paths["flight"]])
+    radio = tmp_path / "radio"
+    (radio / "Falcon").mkdir(parents=True)
+    shutil.copy2(paths["good"], radio / "Falcon" / "good.csv")
+    moved, errors = logs.archive_nonflights(preview, root, preview.archivable_sources(root))
+    assert moved == {paths["good"]: archived / "good.csv"}
+    assert len(errors) == 2
+    assert (archived / "collision.csv").read_text() == "Do not overwrite"
+    assert not (archived / "changed.csv").exists()
+    assert {info.path for info in scan_library(root)} == set(paths.values()) - {paths["good"]}
+    assert (archived / "good.csv").read_bytes() == (radio / "Falcon" / "good.csv").read_bytes()
+    assert not discover_sync_candidates(radio, root)
+    (radio / "Falcon" / "good.csv").write_bytes(b"A replacement recording")
+    assert len(discover_sync_candidates(radio, root)) == 1
+
+
+@pytest.mark.parametrize("reoccupied", [False, True])
+def test_archive_preserves_sync_replacements_during_source_retirement(tmp_path: Path, monkeypatch, reoccupied) -> None:
+    source = tmp_path / "bench.csv"
+    telemetry(source, ground=True)
+    original = source.read_bytes()
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    output = preview._output_paths["Falcon"]
+    target = tmp_path / NONFLIGHT_ARCHIVE / source.name
+    fingerprint = flight_logs._fingerprint
+    def concurrent_sync(path):
+        digest = fingerprint(path)
+        if path == output and target.exists():
+            # A sync between checking the archive bytes and retiring the source.
+            source.write_bytes(b"new recording")
+        elif path.suffix == ".archive-recovery" and reoccupied:
+            # Another recording recreates the public name during rollback.
+            source.write_bytes(b"third recording")
+        return digest
+    monkeypatch.setattr(flight_logs, "_fingerprint", concurrent_sync)
+    moved, errors = logs.archive_nonflights(preview, tmp_path, [source])
+    assert not moved and len(errors) == 1 and "source changed" in errors[0]
+    assert target.read_bytes() == original
+    held = list(tmp_path.glob("*.archive-recovery"))
+    if reoccupied:
+        assert source.read_bytes() == b"third recording"
+        assert len(held) == 1 and held[0].read_bytes() == b"new recording"
+        assert str(held[0]) in errors[0]
+    else:
+        assert source.read_bytes() == b"new recording" and not held
+
+
+def test_archive_failed_copy_leaves_original_and_can_retry(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "bench.csv"
+    telemetry(source, ground=True)
+    original = source.read_bytes()
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    target = tmp_path / NONFLIGHT_ARCHIVE / source.name
+    def interrupted(reader, writer, _length):
+        writer.write(reader.read(64))
+        raise OSError("interrupted copy")
+    with monkeypatch.context() as changes:
+        changes.setattr(shutil, "copyfileobj", interrupted)
+        moved, errors = logs.archive_nonflights(preview, tmp_path, [source])
+    assert not moved and len(errors) == 1 and "interrupted copy" in errors[0]
+    assert source.read_bytes() == original and not target.exists()
+    assert logs.archive_nonflights(preview, tmp_path, [source]) == ({source: target}, [])
+    assert target.read_bytes() == original and not source.exists()

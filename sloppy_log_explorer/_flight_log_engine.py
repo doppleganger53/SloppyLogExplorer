@@ -101,6 +101,7 @@ class Bucket:
     throttle_active: int = 0
     throttle_samples: int = 0
     row_count: int = 0
+    altitude_has_sentinel: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class FileAnalysis:
     status: str
     detail: str = ""
     rejected_candidates: list[dict[str, str]] = field(default_factory=list)
+    archive_interval: tuple[datetime, datetime] | None = None
 
 
 @dataclass(frozen=True)
@@ -377,16 +379,33 @@ def open_csv(path: Path) -> tuple[Iterator[list[str]], TextIO]:
     return csv.reader(handle, dialect), handle
 
 
+def contains_flight_start(path: Path, start: datetime) -> bool:
+    """A detected window always starts at an observed wall-clock second."""
+    reader, handle = open_csv(path)
+    try:
+        columns = classify_columns(deduplicate_headers(next(reader, [])))
+        if columns.date is None and columns.time is None and columns.combined_time is None:
+            return False
+        for row in reader:
+            timestamp = parse_timestamp(row_value(row, columns.date), row_value(row, columns.time),
+                                        row_value(row, columns.combined_time))
+            if timestamp is not None and timestamp.replace(tzinfo=None, microsecond=0) == start:
+                return True
+        return False
+    finally:
+        handle.close()
+
+
 def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (), *,
                  exclude_sensors: Sequence[str] = (), auto_vfr: bool = True,
                  auto_temperatures: bool = True,
-                 auto_servo_currents: bool = True) -> tuple[list[str], list[Bucket], str | None]:
+                 auto_servo_currents: bool = True) -> tuple[list[str], list[Bucket], str | None, bool]:
     reader, handle = open_csv(path)
     try:
         try:
             headers = deduplicate_headers(next(reader))
         except StopIteration:
-            return [], [], "empty file"
+            return [], [], "empty file", False
         columns = classify_columns(headers)
         excluded = {normalize_header(name) for name in exclude_sensors}
         requested = {normalize_header(name) for name in max_sensors}
@@ -394,26 +413,36 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
             requested.update(normalize_header(name) for name in servo_current_headers(headers))
         maximum_indexes = [(i, name) for i, name in enumerate(headers) if normalize_header(name) in requested]
         if columns.date is None and columns.time is None and columns.combined_time is None:
-            return headers, [], "no usable timestamp column"
+            return headers, [], "no usable timestamp column", False
         if not all(control in columns.controls for control in CONTROL_NAMES):
-            return headers, [], "missing one or more primary control columns"
+            return headers, [], "missing one or more primary control columns", False
         if not any(columns.vfr.values()) and not columns.rssi:
-            return headers, [], "no VFR or RSSI link-quality column"
+            return headers, [], "no VFR or RSSI link-quality column", False
 
         start_time: datetime | None = None
         buckets_by_index: dict[int, Bucket] = {}
+        complete = True
         for row in reader:
+            if not row:
+                continue
+            if len(row) != len(headers):
+                complete = False
             timestamp = parse_timestamp(
                 row_value(row, columns.date),
                 row_value(row, columns.time),
                 row_value(row, columns.combined_time),
             )
             if timestamp is None:
+                complete = False
                 continue
             if start_time is None:
                 start_time = timestamp
+            if (timestamp.tzinfo is None) != (start_time.tzinfo is None):
+                complete = False
+                continue
             elapsed = (timestamp - start_time).total_seconds()
             if elapsed < 0:
+                complete = False
                 continue
             index = int(elapsed // bucket_seconds)
             bucket = buckets_by_index.get(index)
@@ -428,16 +457,19 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
             for control, column_index in columns.controls.items():
                 value = parse_number(row_value(row, column_index) or "")
                 if value is None:
+                    complete = False
                     continue
                 bucket.controls[control].add(value)
                 if control == "throttle":
                     bucket.throttle_samples += 1
                     if throttle_is_active(value, headers[column_index]):
                         bucket.throttle_active += 1
+            has_link = False
             for family, indexes in columns.vfr.items():
                 for column_index in indexes:
                     value = parse_number(row_value(row, column_index) or "")
                     if value is not None:
+                        has_link |= 0 <= value <= 100
                         bucket.vfr[family].add(value, vfr=True)
                         if auto_vfr and normalize_header(headers[column_index]) not in excluded:
                             bucket.output_vfr[family].add(value, vfr=True)
@@ -445,8 +477,11 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
                 value = parse_number(row_value(row, column_index) or "")
                 if value is None or not -150.0 <= value <= 120.0:
                     continue
+                has_link = True
                 key = normalize_header(headers[column_index])
                 bucket.rssi.setdefault(key, RangeStats()).add(value)
+            if not has_link:
+                complete = False
             for column_index, unit in columns.motion:
                 value = parse_number(row_value(row, column_index) or "")
                 if value is not None and motion_is_active(value, unit):
@@ -455,6 +490,8 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
                 value = parse_number(row_value(row, column_index) or "")
                 if value is not None:
                     scaled = value * scale
+                    if family == "altitude_m" and value == -1024:
+                        bucket.altitude_has_sentinel = True
                     if family == "vertical_speed_mps" and abs(scaled) > 50.0:
                         continue
                     bucket.evidence.setdefault(family, RangeStats()).add(scaled)
@@ -466,7 +503,7 @@ def load_buckets(path: Path, bucket_seconds: int, max_sensors: Sequence[str] = (
                 value = parse_number(row_value(row, column_index) or "")
                 if normalize_header(label) not in excluded and value is not None and value != -1024:
                     bucket.sensor_maxima.setdefault(label, RangeStats()).add(value)
-        return headers, [buckets_by_index[key] for key in sorted(buckets_by_index)], None
+        return headers, [buckets_by_index[key] for key in sorted(buckets_by_index)], None, complete
     finally:
         handle.close()
 
@@ -577,6 +614,64 @@ def robust_span(values: Sequence[float]) -> float | None:
     low = percentile(values, 0.05)
     high = percentile(values, 0.95)
     return None if low is None or high is None else high - low
+
+
+def archive_airborne_evidence(buckets: Sequence[Bucket]) -> str:
+    """Keep recordings with airborne sensor evidence even without a detected control segment."""
+    end = len(buckets) - 1
+    for family in ("gps_speed_mph", "air_speed_mph"):
+        speeds = evidence_series(buckets, 0, end, family)
+        if sum(speed >= MIN_DIRECT_SPEED_MPH for speed in speeds) >= MIN_DIRECT_SPEED_SECONDS:
+            return "sustained flight speed"
+    if vertical_activity(buckets, 0, end):
+        return "climb and descent"
+    # Ignore zero altitude during GPS acquisition. Requiring three observed
+    # buckets at each extreme discounts isolated spikes without diluting a short
+    # flight in an otherwise long recording on the ground.
+    altitudes = sorted(value for value in evidence_series(buckets, 0, end, "altitude_m") if value != 0)
+    if len(altitudes) >= 6 and altitudes[-3] - altitudes[2] >= STRONG_DIRECT_ALTITUDE_SPAN_M:
+        return "sustained altitude change"
+    return ""
+
+
+def has_unsegmented_ground_evidence(buckets: Sequence[Bucket], min_flight_seconds: int) -> bool:
+    """Require directly observed ground conditions when there is no classified segment."""
+    if len(buckets) < MIN_DIRECT_SPEED_SECONDS:
+        return False
+    speed_covers_recording = True
+    altitude_covers_recording = True
+    altitude_range = RangeStats()
+    altitude_buckets = 0
+    previous_end = buckets[0].first_time
+    for bucket in buckets:
+        if (bucket.first_time - previous_end).total_seconds() >= min_flight_seconds:
+            return False
+        previous_end = bucket.last_time
+        has_slow_speed = False
+        for family in ("gps_speed_mph", "air_speed_mph"):
+            speed = bucket.evidence.get(family)
+            if speed and speed.minimum is not None and speed.maximum is not None:
+                if speed.minimum < 0 or motion_is_active(speed.maximum, "mph"):
+                    return False
+                has_slow_speed = True
+        speed_covers_recording &= has_slow_speed
+
+        vertical = bucket.evidence.get("vertical_speed_mps")
+        if vertical and vertical.minimum is not None and vertical.maximum is not None:
+            if vertical.minimum <= -1.0 or vertical.maximum >= 1.0:
+                return False
+        altitude = bucket.evidence.get("altitude_m")
+        if altitude is None or bucket.altitude_has_sentinel or altitude.minimum == 0 or altitude.maximum == 0:
+            # Ignore acquisition until the initial fix unless the unobserved
+            # interval could contain a complete flight, or a later fix is lost.
+            if altitude_buckets or (bucket.last_time - buckets[0].first_time).total_seconds() >= min_flight_seconds:
+                altitude_covers_recording = False
+            continue
+        altitude_range.merge(altitude)
+        altitude_buckets += 1
+        if altitude_range.span >= MAX_GROUND_ALTITUDE_SPAN_M:
+            return False
+    return speed_covers_recording or (altitude_covers_recording and altitude_buckets >= MIN_DIRECT_SPEED_SECONDS)
 
 
 def count_directional_swings(values: Sequence[float], threshold: float) -> int:
@@ -812,7 +907,7 @@ def analyze_file(
 ) -> FileAnalysis:
     plane = plane_override or infer_plane(path, scan_root)
     try:
-        _headers, buckets, error = load_buckets(path, bucket_seconds, max_sensors,
+        _headers, buckets, error, complete = load_buckets(path, bucket_seconds, max_sensors,
                                               exclude_sensors=exclude_sensors, auto_vfr=auto_vfr,
                                               auto_temperatures=auto_temperatures,
                                               auto_servo_currents=auto_servo_currents)
@@ -867,7 +962,17 @@ def analyze_file(
         temperature_maximums={k: v for k, v in flight.temperature_maximums.items() if normalize_header(k) not in excluded},
         sensor_maximums={k: v for k, v in flight.sensor_maximums.items() if normalize_header(k) not in excluded})
         for flight in flights]
-    return FileAnalysis(path, plane, flights, "flight" if flights else "not-flight", detail, rejected)
+    archive_interval = None
+    if not flights and buckets and complete and all(item["classification"] == "ground" for item in rejected):
+        evidence = archive_airborne_evidence(buckets)
+        if evidence:
+            detail = f"Recording retained because telemetry shows {evidence}"
+        elif not segments and not has_unsegmented_ground_evidence(buckets, min_flight_seconds):
+            detail = "Recording retained because telemetry does not establish ground activity."
+        else:
+            archive_interval = buckets[0].first_time, buckets[-1].last_time
+    return FileAnalysis(path, plane, flights, "flight" if flights else "not-flight", detail, rejected,
+                        archive_interval)
 
 
 def collect_inputs(paths: Sequence[Path]) -> tuple[list[Path], Path | None]:

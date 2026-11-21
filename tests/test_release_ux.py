@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtQml import QJSEngine
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox, QTableWidgetItem
 
 from sloppy_log_explorer import main_window as ui
-from sloppy_log_explorer.plotting import build_telemetry_figure, figure_html
+from sloppy_log_explorer.plotting import TELEMETRY_ZOOM_JAVASCRIPT, build_telemetry_figure, figure_html
 
 
 def test_telemetry_chart_explicitly_disables_cloud_upload(tmp_path, monkeypatch) -> None:
@@ -16,6 +17,48 @@ def test_telemetry_chart_explicitly_disables_cloud_upload(tmp_path, monkeypatch)
     rendered = figure_html(build_telemetry_figure(None, []))
     assert '"showSendToCloud": false' in rendered
     assert '"modeBarButtonsToRemove": ["sendChartToCloud"]' in rendered
+
+
+def test_telemetry_zoom_gestures(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    engine = QJSEngine()
+    setup = engine.evaluate(TELEMETRY_ZOOM_JAVASCRIPT + """
+        const target = { addEventListener(name, callback) { this[name] = callback; } };
+        var plot = Object.create(target), window = Object.create(target);
+        plot.layout = {dragmode: 'zoom'};
+        bindTelemetryZoom(plot);
+        function press(options = {}) {
+          const target = {matches: selector => selector === '.nsewdrag',
+            getBoundingClientRect: () => ({left: -400, right: 400, top: -250, bottom: 250})};
+          plot.mousedown(Object.assign({button: 0, clientX: 0, clientY: 0, target}, options));
+        }
+        function move(x, y) {
+          const event = {buttons: 1, clientX: x, clientY: y};
+          window.mousemove(event);
+          return event.clientY;
+        }
+    """)
+    assert not setup.isError(), setup.toString()
+    for script, expected_y in [
+        ("press(); move(180, 30)", 0),
+        ("move(-180, -30)", 0),
+        ("move(180, 75)", 75),
+        ("move(400, 90)", 90),
+        ("move(2, 80)", 80),
+        ("press({clientX: 372}); move(482, 30)", 30),
+        ("press({clientX: -377}); move(-452, 24)", 24),
+        ("window.mouseup(); move(180, 30)", 30),
+        ("press({shiftKey: true}); move(180, 30)", 30),
+        ("press({ctrlKey: true}); move(180, 30)", 30),
+        ("press({target: {matches: () => false}}); move(180, 30)", 30),
+        ("press(); window.blur(); move(180, 30)", 30),
+        ("plot.layout.dragmode = 'pan'; press(); move(180, 30)", 30),
+    ]:
+        result = engine.evaluate(script)
+        assert not result.isError(), result.toString()
+        assert result.toNumber() == expected_y, script
+    assert app is not None
 
 
 @pytest.fixture

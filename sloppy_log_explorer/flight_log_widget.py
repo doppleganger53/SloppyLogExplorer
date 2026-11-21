@@ -8,19 +8,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
-from PyQt6.QtCore import QThread, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QPoint, QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSplitter,
+    QInputDialog, QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QTextEdit, QToolButton,
     QVBoxLayout, QWidget, QWizard, QWizardPage,
 )
 
-from .flight_logs import FlightLogDocument, FlightLogPreview, FlightLogService, infer_aircraft
+from .flight_logs import FlightLogDocument, FlightLogPreview, FlightLogService, FlightSource, infer_aircraft
 from .flight_log_sheets import FlightLogSheet, GoogleSheetsClient, GoogleSheetsError, SheetsSyncReport, Workbook, default_google_oauth_client, google_credential_config, stable_flight_id, workbook_url
 from .models import LibraryLogInfo
+from .library import NONFLIGHT_ARCHIVE
 from .storage import AppStore, app_data_dir
 
 
@@ -168,6 +169,8 @@ class FlightLogWidget(QWidget):
     """One workspace for local log maintenance and a deliberate cloud export."""
 
     library_requested = pyqtSignal()
+    telemetry_requested = pyqtSignal(str, str, str)
+    sources_archived = pyqtSignal(object)
 
     def __init__(self, store: AppStore, parent: QWidget | None = None):
         super().__init__(parent)
@@ -282,10 +285,14 @@ class FlightLogWidget(QWidget):
         self.generate_button = QPushButton("Save reviewed flights")
         self.generate_button.clicked.connect(self.generate_logs)
         self.rebuild_button = QPushButton("Review rebuild…")
+        self.archive_button = QPushButton("Archive non-flight logs…")
+        self.archive_button.setToolTip("Review and move eligible source recordings into the library's non-flight telemetry folder.")
+        self.archive_button.clicked.connect(self._archive_nonflights)
         self.rebuild_button.setToolTip("Preview replacing generated rows, changing columns, and renumbering flights. Requires a separate review and approval.")
         self.rebuild_button.clicked.connect(self.preview_rebuild)
         buttons.addWidget(self.preview_button, 0, 0)
         buttons.addWidget(self.generate_button, 0, 1)
+        buttons.addWidget(self.archive_button, 1, 0)
         right.addLayout(buttons)
         self.preview_summary = QLabel("No preview yet.")
         self.preview_summary.setWordWrap(True)
@@ -374,6 +381,8 @@ class FlightLogWidget(QWidget):
         columns_hint.setWordWrap(True)
         layout.addWidget(columns_hint)
         self.log_table = QTableWidget()
+        self.log_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.log_table.customContextMenuRequested.connect(self._flight_menu)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.log_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         _header(self.log_table).setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -641,6 +650,8 @@ class FlightLogWidget(QWidget):
             widget.setEnabled(idle)
         selected = bool(self.selected_aircraft())
         self.preview_button.setEnabled(idle and selected and not self._settings_error)
+        self.archive_button.setEnabled(bool(idle and self._preview and self._root
+                                           and self._preview.archivable_sources(self._root)))
         self.rebuild_button.setEnabled(idle and selected and not self._settings_error)
         self.save_policy_button.setEnabled(idle and not self._settings_error)
         self.import_notes_button.setEnabled(idle and bool(self._remote_notes))
@@ -852,6 +863,56 @@ class FlightLogWidget(QWidget):
             return
         self._write_preview(preview, False)
 
+    def _archive_nonflights(self) -> None:
+        preview, root = self._preview, self._root
+        if not preview or root is None or not self.prepare_library_change():
+            return
+        root = root.resolve()
+        paths = preview.archivable_sources(root)
+        if not paths:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review non-flight archive")
+        dialog.resize(640, 440)
+        layout = QVBoxLayout(dialog)
+        label = QLabel(f"Move checked recordings to {root / NONFLIGHT_ARCHIVE}. "
+                       "Their folders and filenames will be preserved.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        listing = QListWidget()
+        for path in paths:
+            item = QListWidgetItem(str(path.relative_to(root)), listing)
+            item.setCheckState(Qt.CheckState.Checked)
+        layout.addWidget(listing)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        ok = cast(QPushButton, buttons.button(QDialogButtonBox.StandardButton.Ok))
+        ok.setText("Archive checked logs")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = [path for i, path in enumerate(paths)
+                    if (item := listing.item(i)) is not None and item.checkState() == Qt.CheckState.Checked]
+        if not selected:
+            return
+        service = self.service
+
+        def ready(result: object) -> None:
+            moved, errors = cast(tuple[dict[Path, Path], list[str]], result)
+            if moved:
+                self.sources_archived.emit(moved)
+            message = f"Archived {len(moved)} of {len(selected)} recordings to {root / NONFLIGHT_ARCHIVE}."
+            self._invalidate_preview(message)
+            if errors:
+                details = QMessageBox(QMessageBox.Icon.Warning, "Non-flight archive", message, parent=self)
+                details.setInformativeText(f"{len(errors)} could not be moved. Open details for the filenames and reasons.")
+                details.setDetailedText("\n".join(errors))
+                details.exec()
+
+        self._run("Verifying and archiving selected recordings…",
+                  lambda: service.archive_nonflights(preview, root, selected), ready)
+
     def _review_rebuild(self, preview: FlightLogPreview) -> None:
         if not preview.can_generate or preview.pending_candidates:
             return
@@ -1051,6 +1112,51 @@ class FlightLogWidget(QWidget):
     def _open_log(self) -> None:
         if self._document:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._document.path)))
+
+    def _flight_menu(self, position: QPoint) -> None:
+        row = self.log_table.rowAt(position.y())
+        document = self._document
+        if self._busy or document is None or not 0 <= row < len(document.rows):
+            return
+        menu = QMenu(self)
+        action = menu.addAction("Open flight telemetry")
+        if menu.exec(self.log_table.viewport().mapToGlobal(position)) == action:
+            self._open_flight_telemetry(document, row)
+
+    def _open_flight_telemetry(self, document: FlightLogDocument, row: int) -> None:
+        if self._root is None:
+            self.library_requested.emit()
+            if self._root is None:
+                return
+        values = document.rows[row]
+        start = values[document.headers.index("Date/time")]
+        duration = values[document.headers.index("Flight duration")]
+        service, mapping, revision = self.service, self._file_aircraft(), self._revision
+
+        def ready(result: object) -> None:
+            if revision != self._revision:
+                return
+            matches = cast(list[FlightSource], result)
+            if not matches:
+                self.status_label.setText(f"No matching telemetry found for {document.aircraft} at {start}.")
+                QMessageBox.information(self, "Flight telemetry unavailable",
+                    f"No matching flight was found for {document.aircraft} at {start} in the current library.")
+                return
+            match = matches[0]
+            if len(matches) > 1:
+                choices = {str(hit.path): hit for hit in matches}
+                chosen, confirmed = QInputDialog.getItem(self, "Choose flight telemetry",
+                    "Multiple recordings contain this flight. Choose the source to open:",
+                    list(choices), 0, False)
+                if not confirmed:
+                    self.status_label.setText("Telemetry selection cancelled.")
+                    return
+                match = choices[chosen]
+            self.status_label.setText(f"Selected {match.path.name} for the flight at {start}.")
+            self.telemetry_requested.emit(str(match.path), match.start.isoformat(sep=" "), match.end.isoformat(sep=" "))
+
+        self._run("Finding the source telemetry for this flight…",
+                  lambda: service.find_flight_sources(mapping, document.aircraft, start, duration), ready)
 
     def _populate_policy_aircraft(self) -> None:
         aircraft = str(self.policy_aircraft_combo.currentData() or "")

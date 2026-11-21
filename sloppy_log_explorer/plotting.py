@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from numbers import Real
 from typing import Any, TypedDict
 
+import numpy as np
 import pandas as pd
 import plotly
 import plotly.graph_objects as go
@@ -329,39 +330,32 @@ def _sample_numeric_series(
     return indices, [values[index] for index in indices]
 
 
-def _sample_numeric_indices(values: Any, bucket_count: int) -> list[int]:
+def _sample_numeric_indices(values: np.ndarray, bucket_count: int) -> list[int]:
     length = len(values)
-    bucket_size = max(1, math.ceil(length / bucket_count))
-    selected = {0, length - 1}
-    for start in range(0, length, bucket_size):
-        end = min(start + bucket_size, length)
-        min_index: int | None = None
-        max_index: int | None = None
-        missing_index: int | None = None
-        min_value = math.inf
-        max_value = -math.inf
-        for index in range(start, end):
-            number = _coerce_float(values[index])
-            if number is None:
-                if missing_index is None:
-                    missing_index = index
-                continue
-            if number < min_value:
-                min_value = number
-                min_index = index
-            if number > max_value:
-                max_value = number
-                max_index = index
-        if min_index is None or max_index is None:
-            if missing_index is not None:
-                selected.add(missing_index)
-        else:
-            selected.add(min_index)
-            selected.add(max_index)
-            if missing_index is not None:
-                selected.add(missing_index)
-
-    return sorted(selected)
+    width = math.ceil(length / bucket_count)
+    # Work on equal-size buckets so extrema and gap locations are found in
+    # NumPy. argmin/argmax retain the first original row when values tie.
+    if values.dtype.kind in "iuf":
+        numbers = values.astype(float, copy=False)
+    else:
+        numbers = np.fromiter((_coerce_float(v) for v in values), dtype=float, count=length)
+    padding = -length % width
+    if padding:
+        numbers = np.pad(numbers, (0, padding), constant_values=np.nan)
+    buckets = numbers.reshape(-1, width)
+    starts = np.arange(0, length, width)
+    finite = np.isfinite(buckets)
+    if finite.all():
+        minima = starts + buckets.argmin(axis=1)
+        maxima = starts + buckets.argmax(axis=1)
+        gaps = np.empty(0, dtype=np.intp)
+    else:
+        has_values = finite.any(axis=1)
+        minima = (starts + np.where(finite, buckets, np.inf).argmin(axis=1))[has_values]
+        maxima = (starts + np.where(finite, buckets, -np.inf).argmax(axis=1))[has_values]
+        gaps = (starts + finite.argmin(axis=1))[~finite.all(axis=1)]
+        gaps = gaps[gaps < length]  # Ignore padding in the final bucket.
+    return np.unique(np.concatenate(([0, length - 1], minima, maxima, gaps))).tolist()
 
 
 def _coerce_float(value: object) -> float | None:
@@ -563,6 +557,7 @@ def build_telemetry_figure(
         return fig
 
     x = _telemetry_x_values(primary, time_mode)
+    compare_x = None
     plotted_columns = columns[:MAX_RENDERED_TELEMETRY_TRACES]
     hidden_trace_count = max(0, len(columns) - len(plotted_columns))
     axis_groups = _resolve_telemetry_axis_groups(
@@ -582,7 +577,7 @@ def build_telemetry_figure(
         primary_indices, primary_values = _sample_numeric_series(
             _numeric_series(primary.dataframe, col), maximum=max_trace_points
         )
-        primary_x = [x[index] for index in primary_indices] if primary_indices else []
+        primary_x = _trace_x_values(x, primary_indices)
         trace_class = go.Scattergl if len(primary_indices) > 2000 else go.Scatter
         color = COLORS[idx % len(COLORS)]
         axis = axis_by_column.get(col, _axis_name(idx))
@@ -599,14 +594,15 @@ def build_telemetry_figure(
             )
         )
         if compare is not None and col in compare.dataframe.columns:
+            if compare_x is None:
+                compare_x = _telemetry_x_values(compare, time_mode)
             compare_indices, compare_values = _sample_numeric_series(
                 _numeric_series(compare.dataframe, col), maximum=max_trace_points
             )
-            compare_x_values = _telemetry_x_values(compare, time_mode)
             compare_trace_class = go.Scattergl if len(compare_indices) > 2000 else go.Scatter
             fig.add_trace(
                 compare_trace_class(
-                    x=[compare_x_values[index] for index in compare_indices],
+                    x=_trace_x_values(compare_x, compare_indices),
                     y=compare_values,
                     customdata=compare_indices,
                     name=f"{col} compare",
@@ -737,7 +733,7 @@ def build_telemetry_figure(
             font={"size": 12},
         )
 
-    if selected_index is not None and x:
+    if selected_index is not None and len(x):
         # Mark the currently selected sample so the plot aligns with the cursor
         # panel and any compare-log delta readout.
         selected_index = max(0, min(selected_index, len(x) - 1))
@@ -745,15 +741,21 @@ def build_telemetry_figure(
     return fig
 
 
-def _telemetry_x_values(log: LoadedLog, time_mode: str) -> Sequence[pd.Timestamp | float]:
+def _trace_x_values(timeline: pd.DatetimeIndex | Sequence[float], indices: list[int]) -> list[pd.Timestamp | float]:
+    if isinstance(timeline, pd.DatetimeIndex):
+        return list(timeline.take(indices))
+    return [timeline[index] for index in indices]
+
+
+def _telemetry_x_values(log: LoadedLog, time_mode: str) -> pd.DatetimeIndex | Sequence[float]:
     if time_mode == "absolute" and log.time is not None and log.time.notna().any():
-        return list(log.time.ffill().bfill())
+        return pd.DatetimeIndex(log.time.ffill().bfill())
     if time_mode == "relative_time" and log.time is not None and log.time.notna().any():
         # Keep the axis formatted like a clock while shifting the series to a
         # stable epoch anchor so relative timestamps still render cleanly.
         time_series = log.time.ffill().bfill()
         start = time_series.iloc[0]
-        return list(pd.Timestamp("1970-01-01") + (time_series - start))
+        return pd.DatetimeIndex(pd.Timestamp("1970-01-01") + (time_series - start))
     return relative_seconds(log)
 
 
@@ -1083,6 +1085,37 @@ def build_gps_map_html(
     return render_gps_map_html(payload, dark=dark)
 
 
+TELEMETRY_ZOOM_JAVASCRIPT = """
+function bindTelemetryZoom(plot) {
+  let origin = null;
+  plot.addEventListener('mousedown', event => {
+    if (event.button === 0 && !event.shiftKey && !event.ctrlKey &&
+        plot.layout.dragmode === 'zoom' && event.target.matches('.nsewdrag')) {
+      origin = {x: event.clientX, y: event.clientY, bounds: event.target.getBoundingClientRect()};
+    }
+  }, true);
+  window.addEventListener('mousemove', event => {
+    if (!origin || !(event.buttons & 1)) return;
+    // Plotly clips the selection at the graph edge when the pointer leaves.
+    const x = Math.max(origin.bounds.left, Math.min(event.clientX, origin.bounds.right));
+    const y = Math.max(origin.bounds.top, Math.min(event.clientY, origin.bounds.bottom));
+    const width = Math.abs(x - origin.x);
+    const height = Math.abs(y - origin.y);
+    // Allow more drift on long time selections. The cap leaves deliberate
+    // wide rectangles available even across the full chart.
+    if (height <= Math.min(72, width / 3)) {
+      // Plotly uses the same mouse movements for its live selection and
+      // committed ranges. Snap the coordinate before its drag handler runs.
+      Object.defineProperty(event, 'clientY', {value: origin.y});
+    }
+  }, true);
+  const endDrag = () => { origin = null; };
+  window.addEventListener('mouseup', endDrag, true);
+  window.addEventListener('blur', endDrag);
+}
+"""
+
+
 def figure_html(fig: go.Figure, bridge: bool = False, dark: bool = True) -> str:
     body = fig.to_html(
         include_plotlyjs=False,
@@ -1119,6 +1152,8 @@ new QWebChannel(qt.webChannelTransport, function(channel) {{
 function plotDiv() {{
   return document.querySelector('.plotly-graph-div');
 }}
+{TELEMETRY_ZOOM_JAVASCRIPT}
+bindTelemetryZoom(plotDiv());
 function bindPlot() {{
   const plot = plotDiv();
   if (!plot) return;

@@ -243,6 +243,14 @@ class AppStore:
         )
         self.conn.commit()
 
+    def relocate_flight_files(self, moved: Mapping[Path, Path]) -> None:
+        updates = [(str(target), str(source)) for source, target in moved.items()]
+        with self.conn:
+            # An older annotation at the archive path keeps its own identity.
+            # OR IGNORE leaves both original notes available on a conflict.
+            self.conn.executemany("update or ignore flights set file_path = ? where file_path = ?", updates)
+            self.conn.executemany("update battery_history set file_path = ? where file_path = ?", updates)
+
     def get_flight(self, file_path: str) -> dict[str, str]:
         row = self.conn.execute("select * from flights where file_path = ?", (file_path,)).fetchone()
         if row is None:
