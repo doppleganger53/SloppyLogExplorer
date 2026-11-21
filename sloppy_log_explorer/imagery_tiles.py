@@ -19,8 +19,13 @@ IMAGERY_TILE_JAVASCRIPT = r"""
       let opening;
       function database() {
         if (!opening) opening = new Promise((resolve, reject) => {
-          const request = indexedDB.open("sloppy-imagery-v1", 1);
-          request.onupgradeneeded = () => {
+          const request = indexedDB.open("sloppy-imagery-v1", 2);
+          request.onupgradeneeded = event => {
+            if (event.oldVersion) {
+              // Older entries did not distinguish hidden response age from zero.
+              request.transaction.objectStore("tiles").clear();
+              return;
+            }
             const tiles = request.result.createObjectStore("tiles", {keyPath: "url"});
             tiles.createIndex("saved", "saved");
           };
@@ -59,21 +64,34 @@ IMAGERY_TILE_JAVASCRIPT = r"""
         };
       }
 
-      function cacheEntry(url, blob, headers) {
+      function cacheEntry(url, blob, response, requestedAt) {
+        const headers = response.headers;
         const control = (headers.get("cache-control") || "").toLowerCase();
         const directives = new Set(control.split(",").map(s => s.trim().split("=")[0]));
         if (directives.has("no-store") || directives.has("no-cache")
           || headers.get("vary") === "*" || blob.size > maxTileBytes) return null;
         const saved = Date.now();
         const seconds = control.match(/(?:^|,)\s*max-age\s*=\s*"?(\d+)/);
-        const responseDate = Date.parse(headers.get("date")) || saved;
-        const age = Math.max(saved - responseDate, (Number(headers.get("age")) || 0) * 1000);
-        const expires = seconds ? saved + Number(seconds[1]) * 1000 - age
-          : Date.parse(headers.get("expires")) || saved;
-        const freshUntil = Math.min(saved + maxAge, expires);
+        let expires = Date.parse(headers.get("expires"));
+        if (seconds) {
+          // Date and Age can both be hidden by CORS, even for a near-expired
+          // CDN or HTTP-cache hit. Let Chromium decide freshness in that case.
+          // A visible max-age takes precedence over any Expires header.
+          const originDate = Date.parse(headers.get("date"));
+          const ageHeader = headers.get("age");
+          const ageVisible = ageHeader !== null || response.type !== "cors";
+          const lifetime = Number(seconds[1]) * 1000;
+          // These are independent upper bounds: Age is already the time spent
+          // upstream. The request timestamp also accounts for time in transit.
+          expires = ageVisible ? Math.min(originDate + lifetime,
+            requestedAt + lifetime - Number(ageHeader) * 1000) : NaN;
+        }
+        const freshUntil = Number.isFinite(expires) ? Math.min(saved + maxAge, expires) : 0;
         const staleSeconds = control.match(/(?:^|,)\s*stale-if-error\s*=\s*"?(\d+)/);
-        const staleUntil = directives.has("must-revalidate") ? freshUntil
-          : Math.min(saved + maxAge, staleSeconds ? freshUntil + Number(staleSeconds[1]) * 1000 : Infinity);
+        let staleUntil = saved + maxAge;
+        if (directives.has("must-revalidate")) staleUntil = freshUntil;
+        else if (staleSeconds) staleUntil = Number.isFinite(expires)
+          ? Math.min(staleUntil, expires + Number(staleSeconds[1]) * 1000) : 0;
         return {url, blob, saved, freshUntil, staleUntil};
       }
 
@@ -116,6 +134,7 @@ IMAGERY_TILE_JAVASCRIPT = r"""
           let response;
           try {
             const timeout = AbortSignal.timeout(15000);
+            const requestedAt = Date.now();
             response = await fetch(url, {
               signal: AbortSignal.any([signal, timeout]), credentials: "omit",
               headers: request.headers, cache: attempt === 0 ? "default" : "reload"
@@ -126,7 +145,7 @@ IMAGERY_TILE_JAVASCRIPT = r"""
             // before persisting and pass the decoded (possibly transparent)
             // bitmap straight to MapLibre.
             const image = await createImageBitmap(blob);
-            const entry = cacheEntry(url, blob, response.headers);
+            const entry = cacheEntry(url, blob, response, requestedAt);
             storeTile(url, entry).catch(() => {});
             return {data: image, expires: entry && entry.freshUntil > Date.now()
               ? new Date(entry.freshUntil).toUTCString() : undefined};

@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -55,13 +56,25 @@ def run_browser_checks(root: Path) -> None:
             if path == "/missing":
                 status = 404
             invalid = path == "/invalid" and counts[path] == 1
-            self.send_response(status)
+            self.send_response_only(status)
+            date = time.time()
+            hidden_timing = path.startswith("/hidden")
+            age = 3599 if hidden_timing else 0
+            if path == "/aged":
+                date -= 900
+                age = 1000
+            self.send_header("Date", self.date_time_string(date))
+            self.send_header("Age", str(age))
             self.send_header("Access-Control-Allow-Origin", "*")
+            if not hidden_timing:
+                self.send_header("Access-Control-Expose-Headers", "Date, Age")
             self.send_header("Content-Type", "application/json" if invalid else "image/png")
             control = {
                 "/old": "max-age=0",
                 "/strict": "max-age=0, must-revalidate",
                 "/private": "no-store",
+                "/hidden-strict": "max-age=3600, must-revalidate",
+                "/hidden-stale": "max-age=3600, stale-if-error=1",
             }.get(path, "max-age=3600")
             self.send_header("Cache-Control", control if status == 200 else "no-store")
             self.end_headers()
@@ -125,16 +138,42 @@ def run_browser_checks(root: Path) -> None:
 
     try:
         open_map("flight")
+        # Version 1 could treat an age-hidden CDN response as freshly generated.
+        assert evaluate_async("""new Promise(resolve => {
+          const open = indexedDB.open("sloppy-imagery-v1", 1);
+          open.onupgradeneeded = () => {
+            const store = open.result.createObjectStore("tiles", {keyPath: "url"});
+            store.createIndex("saved", "saved");
+            store.put({url: "https://example.org/legacy", saved: 1, freshUntil: Date.now() + 3600000});
+          };
+          open.onsuccess = () => { open.result.close(); resolve(true); };
+        })""") is True
         color = load("/flaky")
         assert color.endswith(",120") and counts["/flaky"] == 2
         assert load("/invalid") == color and counts["/invalid"] == 2
-        for path in ("/old", "/strict", "/private"):
+        for path in ("/old", "/strict", "/private", "/aged", "/hidden", "/hidden-strict", "/hidden-stale"):
             assert load(path) == color
+        freshness = evaluate_async("""new Promise(resolve => {
+          const open = indexedDB.open("sloppy-imagery-v1");
+          open.onsuccess = () => {
+            const records = open.result.transaction("tiles").objectStore("tiles").getAll();
+            records.onsuccess = () => resolve(Object.fromEntries(records.result.map(
+              tile => [new URL(tile.url).pathname, tile.freshUntil ? (tile.freshUntil - tile.saved) / 1000 : 0]
+            )));
+          };
+        })""")
+        # Age=1000 already includes the 900 seconds suggested by Date.
+        assert 2597 < freshness["/aged"] <= 2600
+        assert freshness["/hidden"] == 0
+        assert "/legacy" not in freshness
         open_map("heat")
-        failing.update(("/flaky", "/old", "/private", "/strict", "/abort"))
+        failing.update(("/flaky", "/old", "/private", "/strict", "/abort", "/hidden", "/hidden-strict", "/hidden-stale"))
         assert load("/flaky") == color and counts["/flaky"] == 2
         assert load("/old") == color and counts["/old"] == 2
-        for path in ("/private", "/strict"):
+        # Chromium's HTTP cache is disabled here. The app must ask the provider
+        # about an age-hidden tile before using an eligible outage fallback.
+        assert load("/hidden") == color and counts["/hidden"] == 2
+        for path in ("/private", "/strict", "/hidden-strict", "/hidden-stale"):
             assert load(path) == "failed" and counts[path] == 4
         assert load("/missing") == "failed" and counts["/missing"] == 1
         assert load("/abort", abort=True) == "aborted" and counts["/abort"] == 1
