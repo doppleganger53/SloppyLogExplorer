@@ -611,6 +611,49 @@ def test_legacy_archive_remains_browsable_without_offering_to_rearchive(tmp_path
     assert preview.archivable_sources(archive) == []
 
 
+@pytest.mark.parametrize(("duration", "speed_mph", "climb_m", "vertical", "retained_reason"), [
+    (200, 40, 100, False, "flight speed"),
+    (20, 35, 0, False, "flight speed"),
+    (20, 0, 45, False, "altitude change"),
+    (20, 0, 0, True, "climb and descent"),
+    (200, 0, 0, False, ""),
+])
+def test_archive_checks_airborne_evidence_outside_control_segments(
+        tmp_path: Path, duration, speed_mph, climb_m, vertical, retained_reason) -> None:
+    source = tmp_path / "Falcon.csv"
+    telemetry(source)
+    with source.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+    headers = rows[0]
+    headers.append("Vertical speed(m/s)")
+    for second, row in enumerate(rows[1:]):
+        progress = (second - 30) / duration
+        active = 0 <= progress <= 1
+        for control in ("Rudder", "Elevator", "Aileron"):
+            row[headers.index(control)] = "0"
+        row[headers.index("Throttle")] = "-1024"
+        row[headers.index("Rx VFR(%)")] = "98"
+        row[headers.index("GPS speed(mph)")] = str(speed_mph if active else 0)
+        # A stationary receiver also acquires its field elevation after boot.
+        altitude = 50 if second >= 10 else 0
+        if active:
+            altitude += 2 * min(progress, 1 - progress) * climb_m
+        row[headers.index("GPS alt(m)")] = str(altitude)
+        row.append("3" if vertical and active and progress < 0.5 else "-3" if vertical and active else "0")
+    with source.open("w", encoding="utf-8", newline="") as handle:
+        csv.writer(handle).writerows(rows)
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    assert not preview.candidates
+    if retained_reason:
+        assert retained_reason in preview.report["files"][0]["detail"]
+        assert not preview.archivable_sources(tmp_path)
+        with pytest.raises(ValueError, match="outside"):
+            logs.archive_nonflights(preview, tmp_path, [source])
+    else:
+        assert preview.archivable_sources(tmp_path) == [source]
+
+
 def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_colliding_files(tmp_path: Path) -> None:
     root = tmp_path / "library"
     sources = root / "Falcon"

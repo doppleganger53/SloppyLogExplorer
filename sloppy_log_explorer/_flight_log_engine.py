@@ -613,6 +613,24 @@ def robust_span(values: Sequence[float]) -> float | None:
     return None if low is None or high is None else high - low
 
 
+def archive_airborne_evidence(buckets: Sequence[Bucket]) -> str:
+    """Keep recordings with airborne sensor evidence even without a detected control segment."""
+    end = len(buckets) - 1
+    for family in ("gps_speed_mph", "air_speed_mph"):
+        speeds = evidence_series(buckets, 0, end, family)
+        if sum(speed >= MIN_DIRECT_SPEED_MPH for speed in speeds) >= MIN_DIRECT_SPEED_SECONDS:
+            return "sustained flight speed"
+    if vertical_activity(buckets, 0, end):
+        return "climb and descent"
+    # Ignore zero altitude during GPS acquisition. Requiring three observed
+    # buckets at each extreme discounts isolated spikes without diluting a short
+    # flight in an otherwise long recording on the ground.
+    altitudes = sorted(value for value in evidence_series(buckets, 0, end, "altitude_m") if value != 0)
+    if len(altitudes) >= 6 and altitudes[-3] - altitudes[2] >= STRONG_DIRECT_ALTITUDE_SPAN_M:
+        return "sustained altitude change"
+    return ""
+
+
 def count_directional_swings(values: Sequence[float], threshold: float) -> int:
     if len(values) < 2:
         return 0
@@ -903,7 +921,11 @@ def analyze_file(
         for flight in flights]
     archive_interval = None
     if not flights and buckets and complete and all(item["classification"] == "ground" for item in rejected):
-        archive_interval = buckets[0].first_time, buckets[-1].last_time
+        evidence = archive_airborne_evidence(buckets)
+        if evidence:
+            detail = f"Recording retained because telemetry shows {evidence}"
+        else:
+            archive_interval = buckets[0].first_time, buckets[-1].last_time
     return FileAnalysis(path, plane, flights, "flight" if flights else "not-flight", detail, rejected,
                         archive_interval)
 
