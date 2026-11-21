@@ -45,6 +45,12 @@ def run_browser_checks(root: Path) -> None:
     assert image.save(buf, "PNG")
     counts: Counter[str] = Counter()
     failing: set[str] = set()
+    rate_limits = {
+        "/limited-no-header": None,
+        "/hidden-rate-limit": "30",
+        "/limited-long-wait": "30",
+        "/limited-retry": "0",
+    }
 
     class TileServer(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -55,6 +61,8 @@ def run_browser_checks(root: Path) -> None:
                 status = 503
             if path == "/missing":
                 status = 404
+            if path in rate_limits and counts[path] == 1:
+                status = 429
             invalid = path == "/invalid" and counts[path] == 1
             self.send_response_only(status)
             date = time.time()
@@ -67,7 +75,9 @@ def run_browser_checks(root: Path) -> None:
             self.send_header("Age", str(age))
             self.send_header("Access-Control-Allow-Origin", "*")
             if not hidden_timing:
-                self.send_header("Access-Control-Expose-Headers", "Date, Age")
+                self.send_header("Access-Control-Expose-Headers", "Date, Age, Retry-After")
+            if status == 429 and (retry_after := rate_limits[path]) is not None:
+                self.send_header("Retry-After", retry_after)
             self.send_header("Content-Type", "application/json" if invalid else "image/png")
             control = {
                 "/old": "max-age=0",
@@ -151,6 +161,9 @@ def run_browser_checks(root: Path) -> None:
         color = load("/flaky")
         assert color.endswith(",120") and counts["/flaky"] == 2
         assert load("/invalid") == color and counts["/invalid"] == 2
+        for path in ("/limited-no-header", "/hidden-rate-limit", "/limited-long-wait"):
+            assert load(path) == "failed" and counts[path] == 1
+        assert load("/limited-retry") == color and counts["/limited-retry"] == 2
         for path in ("/old", "/strict", "/private", "/aged", "/hidden", "/hidden-strict", "/hidden-stale"):
             assert load(path) == color
         freshness = evaluate_async("""new Promise(resolve => {

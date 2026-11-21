@@ -102,6 +102,9 @@ IMAGERY_TILE_JAVASCRIPT = r"""
           const delay = /^\d+$/.test(after) ? Number(after) * 1000 : Date.parse(after) - Date.now();
           if (Number.isFinite(delay)) return delay <= 3000 ? Math.max(0, delay) : null;
         }
+        // CORS may hide the provider's Retry-After. Don't turn a rate limit
+        // into a burst of retries unless the provider permits a short wait.
+        if (response?.status === 429) return null;
         return attempt === 0 ? 300 : 900;
       }
 
