@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import errno
 import hashlib
 import json
 import os
@@ -53,6 +54,79 @@ def _fingerprint(path: Path) -> str | None:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _retire_archived_source(source: Path, target: Path, expected: str) -> None:
+    # Claim whichever file currently owns the public name. A radio sync or
+    # cloud client can safely create a new recording there at any later point.
+    descriptor, name = tempfile.mkstemp(prefix=f"{source.name[:100]}.", suffix=".archive-recovery", dir=source.parent)
+    os.close(descriptor)
+    held = Path(name)
+    try:
+        os.replace(source, held)
+    except OSError:
+        held.unlink()
+        raise
+    try:
+        if _fingerprint(held) != expected:
+            raise ValueError("source changed during archiving")
+        if _fingerprint(target) != expected:
+            raise ValueError("archive copy changed before retiring the original")
+        held.unlink()
+    except (OSError, ValueError) as exc:
+        try:
+            if os.name == "nt":
+                # On Windows rename fails if a concurrent writer has reclaimed the name.
+                held.rename(source)
+            else:
+                # POSIX rename would overwrite a replacement. Link first to restore
+                # exclusively or retain the recovery file if the filesystem refuses.
+                os.link(held, source)
+                held.unlink()
+        except OSError as restore_error:
+            raise OSError(f"{exc}. Recover the recording from {held}; {restore_error}") from exc
+        raise
+
+
+def _publish_archive_copy(source: Path, target: Path, expected: str) -> None:
+    if target.exists():
+        raise FileExistsError(f"archive entry already exists: {target}")
+    # A stopped copy can leave a .part file. The source stays in place and a
+    # subsequent review can retry without colliding with a partial final file.
+    staging = tempfile.NamedTemporaryFile(dir=target.parent, prefix=".archive-", suffix=".part", delete=False)
+    staged = Path(staging.name)
+    try:
+        with staging, source.open("rb") as original:
+            shutil.copyfileobj(original, staging, 1024 * 1024)
+            staging.flush()
+            os.fsync(staging.fileno())
+        shutil.copystat(source, staged)
+        if _fingerprint(staged) != expected:
+            raise ValueError("source changed since review or archive verification failed")
+        if os.name == "nt":
+            staged.rename(target)  # same-directory atomic publication without overwriting
+        else:
+            try:
+                os.link(staged, target)
+            except OSError as exc:
+                if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.ENOSYS):
+                    raise
+                # Some mounted filesystems do not support hard links. Preserve
+                # exclusive creation there, too, and verify before retiring.
+                destination = target.open("xb")
+                try:
+                    with destination, staged.open("rb") as original:
+                        shutil.copyfileobj(original, destination, 1024 * 1024)
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    shutil.copystat(staged, target)
+                    if _fingerprint(target) != expected:
+                        raise ValueError("archive verification failed")
+                except (OSError, ValueError):
+                    target.unlink()
+                    raise
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def _validate_aircraft(name: str) -> str:
@@ -480,26 +554,15 @@ class FlightLogService:
                 if expected is None:
                     raise ValueError("missing source fingerprint")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # Exclusive creation also handles races with another archiver. Keep the
-                # original until the closed archive copy and the source both verify.
-                before = source.stat()
-                saved = target.open("xb")
+                _publish_archive_copy(source, target, expected)
+                # The verified archive may now be the only copy of the reviewed
+                # bytes. Retain it if the source or maintained table has changed.
                 try:
-                    with saved, source.open("rb") as original:
-                        shutil.copyfileobj(original, saved, 1024 * 1024)
-                        saved.flush()
-                        os.fsync(saved.fileno())
-                    shutil.copystat(source, target)
-                    if (_fingerprint(target) != expected or not self._same_source(before, source.stat())
-                            or _fingerprint(source) != expected):
-                        raise ValueError("source changed since review or archive verification failed")
                     if _fingerprint(output) != preview._output_fingerprints[output]:
                         raise ValueError("the maintained flight log changed during archiving")
-                    source.unlink()
-                except (OSError, ValueError):
-                    if source.exists():
-                        target.unlink()
-                    raise
+                    _retire_archived_source(source, target, expected)
+                except (OSError, ValueError) as exc:
+                    raise ValueError(f"{exc}. Check the archive copy at {target}") from exc
                 moved[source] = target
             except (OSError, ValueError) as exc:
                 errors.append(f"{relative}: {exc}")

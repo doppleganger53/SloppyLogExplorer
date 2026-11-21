@@ -11,6 +11,7 @@ import pytest
 from sloppy_log_explorer.flight_logs import FlightLogService, effective_policy, infer_aircraft
 from sloppy_log_explorer._flight_log_engine import servo_current_headers
 from sloppy_log_explorer import _flight_log_engine as engine
+from sloppy_log_explorer import flight_logs
 from sloppy_log_explorer.library import NONFLIGHT_ARCHIVE, scan_library
 from sloppy_log_explorer.sync import discover_sync_candidates
 
@@ -694,3 +695,54 @@ def test_archive_preserves_uncertain_failed_incomplete_overlapping_stale_and_col
     assert not discover_sync_candidates(radio, root)
     (radio / "Falcon" / "good.csv").write_bytes(b"A replacement recording")
     assert len(discover_sync_candidates(radio, root)) == 1
+
+
+@pytest.mark.parametrize("reoccupied", [False, True])
+def test_archive_preserves_sync_replacements_during_source_retirement(tmp_path: Path, monkeypatch, reoccupied) -> None:
+    source = tmp_path / "bench.csv"
+    telemetry(source, ground=True)
+    original = source.read_bytes()
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    output = preview._output_paths["Falcon"]
+    target = tmp_path / NONFLIGHT_ARCHIVE / source.name
+    fingerprint = flight_logs._fingerprint
+    def concurrent_sync(path):
+        digest = fingerprint(path)
+        if path == output and target.exists():
+            # A sync between checking the archive bytes and retiring the source.
+            source.write_bytes(b"new recording")
+        elif path.suffix == ".archive-recovery" and reoccupied:
+            # Another recording recreates the public name during rollback.
+            source.write_bytes(b"third recording")
+        return digest
+    monkeypatch.setattr(flight_logs, "_fingerprint", concurrent_sync)
+    moved, errors = logs.archive_nonflights(preview, tmp_path, [source])
+    assert not moved and len(errors) == 1 and "source changed" in errors[0]
+    assert target.read_bytes() == original
+    held = list(tmp_path.glob("*.archive-recovery"))
+    if reoccupied:
+        assert source.read_bytes() == b"third recording"
+        assert len(held) == 1 and held[0].read_bytes() == b"new recording"
+        assert str(held[0]) in errors[0]
+    else:
+        assert source.read_bytes() == b"new recording" and not held
+
+
+def test_archive_failed_copy_leaves_original_and_can_retry(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "bench.csv"
+    telemetry(source, ground=True)
+    original = source.read_bytes()
+    logs = service(tmp_path)
+    preview = logs.preview({source: "Falcon"})
+    target = tmp_path / NONFLIGHT_ARCHIVE / source.name
+    def interrupted(reader, writer, _length):
+        writer.write(reader.read(64))
+        raise OSError("interrupted copy")
+    with monkeypatch.context() as changes:
+        changes.setattr(shutil, "copyfileobj", interrupted)
+        moved, errors = logs.archive_nonflights(preview, tmp_path, [source])
+    assert not moved and len(errors) == 1 and "interrupted copy" in errors[0]
+    assert source.read_bytes() == original and not target.exists()
+    assert logs.archive_nonflights(preview, tmp_path, [source]) == ({source: target}, [])
+    assert target.read_bytes() == original and not source.exists()
