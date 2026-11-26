@@ -320,12 +320,12 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from sloppy_log_explorer.main_window import MainWindow
 
-    starts: list[tuple[Path | None, list[str]]] = []
+    starts: list[tuple[Path | None, list[str], bool]] = []
     monkeypatch.setattr(
         MainWindow,
         "start_reception_scan",
-        lambda self, *_args: starts.append(
-            (self.library_root, [log.name for log in self.library_logs])
+        lambda self, *, retry_io_errors=False: starts.append(
+            (self.library_root, [log.name for log in self.library_logs], retry_io_errors)
         ),
     )
     app = QApplication.instance() or QApplication([])
@@ -337,14 +337,14 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     window.load_library(root)
 
     assert len(window.library_logs) == 1
-    assert starts == [(root, ["flight.csv"])]
+    assert starts == [(root, ["flight.csv"], False)]
     assert window.reception_scan_refresh_button.isEnabled()
 
     (root / "new-flight.log").write_text("also metadata only", encoding="utf-8")
     window.reception_scan_refresh_button.click()
 
     assert [log.name for log in window.library_logs] == ["flight.csv", "new-flight.log"]
-    assert starts[-1] == (root, ["flight.csv", "new-flight.log"])
+    assert starts[-1] == (root, ["flight.csv", "new-flight.log"], True)
     assert window._reception_view_loaded is False
     window.tabs.setCurrentWidget(window.reception_tab)
     assert window._reception_view_loaded is True

@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en" data-theme="__THEME__">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reception history</title>
+<link rel="stylesheet" href="__MAP_CSS__">
+<style>
+:root{color-scheme:light;--bg:#fafbfc;--surface:#fff;--fg:#182d38;--muted:#4e6270;--line:#bdc9d0;--accent:#196893}
+[data-theme=dark]{color-scheme:dark;--bg:#20262c;--surface:#2b3239;--fg:#ecf1f4;--muted:#bccbd4;--line:#56636d;--accent:#84c8ed}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 "Segoe UI",sans-serif}
+main{min-height:100vh;display:grid;grid-template-rows:auto minmax(200px,1fr) auto auto;gap:6px;padding:6px 9px}
+.controls,.transport,.legend,.chart-head,.series{display:flex;align-items:center;flex-wrap:wrap;gap:5px 12px}
+label{display:inline-flex;align-items:center;gap:5px}button,select,input{font:inherit;accent-color:var(--accent)}
+select,button{padding:3px 6px;color:inherit;background:var(--surface);border:1px solid var(--line);border-radius:4px}
+select{max-width:230px}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}[hidden]{display:none!important}
+#mapbox{position:relative;overflow:hidden;min-height:200px;background-color:#25343c;color:white;border-radius:4px}
+#tiles,#map{position:absolute;inset:0;width:100%;height:100%}#map{touch-action:none;cursor:crosshair}
+#mapbox.grid{background-image:linear-gradient(to right,#697c873e 1px,transparent 1px),linear-gradient(to bottom,#697c873e 1px,transparent 1px)}
+.map-actions{position:absolute;right:7px;top:7px;display:flex;gap:3px}.map-actions button{background:#fff;color:#20323d}
+#scale,#attribution,#maptip,#charttip,#map-message{position:absolute;background:#19252dea;padding:3px 7px;color:#fff;border-radius:3px;pointer-events:none}
+#scale{left:7px;bottom:7px;font-size:11px;text-align:center;border-bottom:2px solid white;white-space:nowrap}
+#attribution{right:1px;bottom:1px;font-size:10px;pointer-events:auto}#attribution a{color:#c4e7ff}
+#map-message{left:50%;top:50%;transform:translate(-50%,-50%)}
+#maptip,#charttip{font-size:12px;white-space:pre-line;max-width:100%;z-index:2}
+.legend{font-size:12px;color:var(--muted)}.ramp{display:inline-block;width:72px;height:8px;background:linear-gradient(90deg,#dc4444,#edc549,#36ae81);border-radius:2px}
+#coverage{margin-left:auto}.timeline{display:grid;gap:5px}.transport{gap:5px}#scrub{min-width:80px;flex:1;cursor:ew-resize;touch-action:none}
+#frame-label{font-weight:600;font-variant-numeric:tabular-nums}.trend{border-top:1px solid var(--line);padding-top:5px}
+.chart-head{justify-content:space-between}.chartbox{position:relative}#chart{display:block;width:100%;height:clamp(82px,16vh,160px);touch-action:none;cursor:ew-resize}
+.series button{display:flex;align-items:center;gap:5px;border:0;background:transparent;font-size:12px}.series [aria-pressed=true]{font-weight:650;text-decoration:underline}
+.swatch{width:12px;height:4px}#audit{font-size:12px;color:var(--muted);margin:3px 0 0;overflow-wrap:anywhere}
+</style></head>
+<body><main>
+<div class="controls" aria-label="Reception filters">
+<label>Aircraft <select id="aircraft"></select></label>
+<label>Recorded link <select id="link"></select></label>
+<label>Channel <select id="channel"></select></label>
+<label>Grid <select id="grid"><option value="5">5 m</option><option value="2">2 m</option></select></label>
+<label>Interval <select id="granularity"><option value="day">Daily</option><option value="month">Monthly</option></select></label>
+<label><input type="checkbox" id="history">Keep historical cells</label>
+<label id="decay" hidden>Half-life <select id="half-life"><option>7</option><option>30</option><option selected>90</option><option>365</option></select>days</label>
+</div>
+<div id="mapbox" class="grid"><div id="tiles" hidden></div>
+<canvas id="map" tabindex="0" aria-label="Reception map. Drag to pan, scroll to zoom, click a cell to pin its trend."></canvas>
+<div class="map-actions"><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="fit">Fit site</button></div>
+<span id="scale"></span><span id="attribution" hidden></span><span id="maptip" hidden></span><span id="map-message" hidden></span></div>
+<section class="timeline" aria-label="Timeline">
+<div class="legend"><span id="low"></span><i class="ramp"></i><span id="high"></span><span id="carried-key" hidden>Dimmed cells were last measured earlier</span><span id="coverage"></span></div>
+<div class="transport"><button id="play">Play</button><button id="prev" aria-label="Previous observation">◀</button>
+<input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-labelledby="frame-label">
+<button id="next" aria-label="Next observation">▶</button><select id="date" aria-label="Jump to date"></select></div>
+<output id="frame-label" for="scrub"></output></section>
+<section class="trend" aria-label="Reception trends"><div class="chart-head"><strong id="trend-title">Field-wide trend</strong><button id="clear-pin" hidden>Show whole field</button></div>
+<div class="chartbox"><canvas id="chart" aria-label="Drag the trend chart to scrub by calendar date"></canvas><span id="charttip" hidden></span></div>
+<div id="series" class="series"></div><details id="audit" hidden><summary id="audit-title"></summary><span id="audit-dates"></span></details></section>
+</main>
+<script>__MODEL__</script>
+<script>
+"use strict";
+const dataset = __HISTORY__;
+const model = new ReceptionHistoryModel(dataset);
+const $ = id => document.getElementById(id);
+const format = new Intl.NumberFormat(undefined, {maximumFractionDigits:2}).format;
+const quantity = (value, noun) => format(value) + " " + noun + (value === 1 ? "" : "s");
+const seriesColors = document.documentElement.dataset.theme === "dark"
+    ? ["#8bcdf7","#f6b875","#bbabff","#77ddba","#f5a7c6","#ccda7a"]
+    : ["#2376a5","#a95e0c","#7852ad","#10775c","#a6426b","#657c10"];
+const framesPerStep = 100;
+const mapCanvas = $("map"), chartCanvas = $("chart");
+const overlays = new Map();
+let selection, prepared, series, pin = null, hover = null, drag = null, playback = null;
+let position = 0, opacity = dataset.opacity ?? .72;
+let scale = 1, centerX = 0, centerY = 0, viewportChanged = true;
+let chartBase = null, chartXs = [], frameXs = [], xTimes = [];
+let siteBounds = null, syncTiles = () => {}, setTiles = () => {}, applyImageryOpacity = () => {};
+let requestedImageryOpacity = dataset.imagery_opacity ?? 1;
+let tileState = () => null;
+
+function setOptions(element, values, allLabel = null) {
+    const previous = element.value;
+    const items = values.map(value => new Option(value, value));
+    if (allLabel) items.unshift(new Option(allLabel, ""));
+    element.replaceChildren(...items);
+    if (values.includes(previous)) element.value = previous;
+}
+function selectedCell() {
+    if (!pin) return null;
+    return {x: Math.floor(pin.x / selection.cellSize + .5), y: Math.floor(pin.y / selection.cellSize + .5)};
+}
+function rebuild() {
+    stopPlayback();
+    const oldPeriod = prepared?.periods[Math.round(position)];
+    const aircraft = $("aircraft").value;
+    setOptions($("link"), model.links(aircraft), "All links");
+    const link = $("link").value;
+    setOptions($("channel"), model.channels(aircraft, link));
+    selection = {
+        aircraft, link, channel: $("channel").value, cellSize: Number($("grid").value),
+        granularity: $("granularity").value, history: $("history").checked, halfLife: Number($("half-life").value)
+    };
+    $("decay").hidden = !selection.history;
+    $("carried-key").hidden = !selection.history;
+    prepared = model.prepare(selection);
+    overlays.clear();
+    const dates = prepared.periods;
+    $("date").replaceChildren(new Option("Jump to date", ""), ...dates.map(date => new Option(date,date)));
+    $("date").options[0].disabled = true;
+    $("date").disabled = !dates.length;
+    $("scrub").max = String(Math.max(0,dates.length - 1) * framesPerStep);
+    $("play").disabled = $("scrub").disabled = dates.length < 2;
+    const [low, high] = prepared.range;
+    $("low").textContent = format(low) + " " + prepared.unit;
+    $("high").textContent = format(high) + " " + prepared.unit;
+    document.querySelector(".ramp").style.transform = prepared.loss ? "scaleX(-1)" : "";
+    xTimes = prepared.chartPeriods.map(d => Date.parse(d.length === 7 ? d + "-01" : d));
+    const fallbackDates = model.matching(aircraft, link)
+        .filter(record => record.names.includes(selection.channel) && (record.inferred || record.dateSource === "filename"));
+    const labels = [...new Set(fallbackDates.map(record => record.date + " (" +
+        (record.dateSource === "filename" ? "filename" : "file modification time") + ")"))];
+    $("audit").hidden = labels.length === 0;
+    $("audit-title").textContent = "Dates from file information (" + quantity(fallbackDates.length,"recording") + ")";
+    $("audit-dates").textContent = labels.join(", ");
+    rebuildTrend();
+    let index = oldPeriod ? dates.findIndex(d => d.startsWith(oldPeriod) || oldPeriod.startsWith(d)) : -1;
+    if (index < 0 && oldPeriod) index = dates.findLastIndex(d => d <= oldPeriod);
+    showPosition(index < 0 ? dates.length - 1 : index);
+}
+function rebuildTrend() {
+    series = prepared.series(selectedCell());
+    chartBase = null;
+    $("clear-pin").hidden = !pin;
+    const metric = prepared.loss ? "90th" : "10th";
+    const selected = selectedCell();
+    $("trend-title").textContent = pin
+        ? "Pinned cell · " + offsetText(selected) + " · " + selection.cellSize + " m grid"
+        : "Field-wide trend · " + metric + " percentile of cell values";
+    $("series").replaceChildren(...series.map(({name}, i) => {
+        const button = document.createElement("button"), swatch = document.createElement("i");
+        swatch.className = "swatch";
+        swatch.style.backgroundColor = seriesColors[i % seriesColors.length];
+        button.append(swatch, name);
+        button.setAttribute("aria-pressed", String(name === selection.channel));
+        button.onclick = () => { $("channel").value = name; rebuild(); };
+        return button;
+    }));
+}
+function showPosition(value) {
+    const dates = prepared.periods, last = dates.length - 1;
+    position = Math.max(0, Math.min(last, Math.round(value * framesPerStep) / framesPerStep));
+    const left = Math.floor(position), right = Math.ceil(position);
+    const fraction = position - left, nearest = Math.round(position);
+    const label = dates.length === 0 ? "No matching observations" : left === right ? dates[left]
+        : dates[left] + " → " + dates[right] + " · " + Math.round(fraction * 100) + "% blend";
+    $("frame-label").textContent = label;
+    $("scrub").setAttribute("aria-valuetext", label);
+    $("scrub").value = String(Math.round(position * framesPerStep));
+    $("prev").disabled = position <= 0;
+    $("next").disabled = position >= last;
+    $("date").value = left === right && dates.length ? dates[left] : "";
+    const coverage = quantity(dates.length ? prepared.frameAt(nearest).size : 0,"cell") + " · "
+        + quantity(prepared.recordingCounts[nearest] ?? 0,"recording");
+    $("coverage").textContent = (left === right ? "" : dates[nearest] + " · ") + coverage;
+    $("map-message").hidden = Boolean(dates.length && (prepared.frameAt(left).size || prepared.frameAt(right).size));
+    $("map-message").textContent = "No paired readings in this period";
+    drawMap(); drawChart(); updateHover();
+}
+function stopPlayback() {
+    if (playback !== null) cancelAnimationFrame(playback);
+    playback = null;
+    $("play").textContent = "Play";
+    $("play").setAttribute("aria-pressed", "false");
+}
+function togglePlayback() {
+    if (playback !== null) { stopPlayback(); return; }
+    const last = prepared.periods.length - 1;
+    if (last <= 0) return;
+    if (position >= last) showPosition(0);
+    const start = performance.now(), first = position;
+    $("play").textContent = "Pause";
+    $("play").setAttribute("aria-pressed", "true");
+    function tick(now) {
+        const next = Math.min(last, (first + (now - start) / 1150) % (last + .6));
+        if (Math.round(next * framesPerStep) !== Math.round(position * framesPerStep)) showPosition(next);
+        playback = requestAnimationFrame(tick);
+    }
+    playback = requestAnimationFrame(tick);
+}
+
+function sizeCanvas(canvas) {
+    const width = canvas.clientWidth, height = canvas.clientHeight, dpr = devicePixelRatio;
+    if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,width,height);
+    return {ctx,width,height};
+}
+function cellColor(value) {
+    const [min, max] = prepared.range;
+    let t = Math.min(1,Math.max(0,(value-min)/(max-min || 1)));
+    if (prepared.loss) t = 1 - t;
+    const colors = [[220,68,68],[237,197,73],[54,174,129]];
+    const i = t < .5 ? 0 : 1, blend = t * 2 - i;
+    return "rgb(" + colors[i].map((v,k) => Math.round(v + (colors[i+1][k]-v)*blend)).join(",") + ")";
+}
+function frameOverlay(index, width, height) {
+    if (overlays.has(index)) return overlays.get(index);
+    const surface = document.createElement("canvas");
+    surface.width = mapCanvas.width; surface.height = mapCanvas.height;
+    const ctx = surface.getContext("2d");
+    ctx.scale(devicePixelRatio,devicePixelRatio);
+    const size = selection.cellSize * scale;
+    const ox = width / 2 - centerX * scale, oy = height / 2 + centerY * scale;
+    for (const cell of prepared.frameAt(index).values()) {
+        const x = ox + (cell.x - .5) * size, y = oy - (cell.y + .5) * size;
+        if (x + size < 0 || y + size < 0 || x > width || y > height) continue;
+        ctx.globalAlpha = cell.carried ? .48 : 1;
+        ctx.fillStyle = cellColor(cell.value);
+        ctx.fillRect(x,y,size,size);
+    }
+    if (overlays.size >= 3) overlays.delete(overlays.keys().next().value);
+    overlays.set(index,surface);
+    return surface;
+}
+function drawMap() {
+    const {ctx,width,height} = sizeCanvas(mapCanvas);
+    if (!prepared || !width || !height) return;
+    if (viewportChanged) {
+        overlays.clear();
+        const ox = width / 2 - centerX * scale, oy = height / 2 + centerY * scale;
+        const interval = 10 ** Math.floor(Math.log10(120 / scale));
+        const meters = [1,2,5,10].map(f => interval*f).filter(m => m*scale <= 120).at(-1) || interval;
+        $("mapbox").style.backgroundSize = (meters*scale)+"px "+(meters*scale)+"px";
+        $("mapbox").style.backgroundPosition = ox+"px "+oy+"px";
+        $("scale").style.width = (meters*scale)+"px";
+        $("scale").textContent = meters >= 1000 ? format(meters/1000)+" km" : format(meters)+" m";
+        syncTiles();
+        viewportChanged = false;
+    }
+    const left = Math.floor(position), right = Math.ceil(position), fraction = position - left;
+    if (prepared.periods.length) {
+        ctx.globalAlpha = opacity * (1 - fraction);
+        ctx.drawImage(frameOverlay(left,width,height),0,0,width,height);
+        if (fraction) {
+            // Add premultiplied endpoint pixels so a cell visited twice keeps its opacity.
+            ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = opacity * fraction;
+            ctx.drawImage(frameOverlay(right,width,height),0,0,width,height);
+            ctx.globalCompositeOperation = "source-over";
+        }
+        ctx.globalAlpha = 1;
+    }
+    const cell = selectedCell();
+    if (cell) {
+        const size = selection.cellSize * scale;
+        const x = width/2 + (cell.x*selection.cellSize-centerX)*scale;
+        const y = height/2 - (cell.y*selection.cellSize-centerY)*scale;
+        const radius = Math.max(5,size/2+1);
+        for (const [color,lineWidth] of [["#17232d",4],["white",2]]) {
+            ctx.lineWidth = lineWidth; ctx.strokeStyle = color;
+            ctx.strokeRect(x-radius,y-radius,radius*2,radius*2);
+        }
+    }
+}
+function fitSite() {
+    if (!siteBounds) {
+        let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
+        for (const log of dataset.logs) for (const rows of Object.values(log.grids["5"])) {
+            for (const [x,y] of rows) {
+                xmin = Math.min(xmin,x*5); xmax = Math.max(xmax,x*5);
+                ymin = Math.min(ymin,y*5); ymax = Math.max(ymax,y*5);
+            }
+        }
+        siteBounds = Number.isFinite(xmin) ? [xmin,xmax,ymin,ymax] : [0,0,0,0];
+    }
+    const [xmin,xmax,ymin,ymax] = siteBounds;
+    centerX = (xmin+xmax)/2; centerY = (ymin+ymax)/2;
+    scale = Math.min(mapCanvas.clientWidth / Math.max(60,(xmax-xmin+5)*1.16),
+        mapCanvas.clientHeight / Math.max(60,(ymax-ymin+5)*1.16));
+    viewportChanged = true; drawMap();
+}
+function zoom(factor, x = mapCanvas.clientWidth/2, y = mapCanvas.clientHeight/2) {
+    const next = Math.min(16,Math.max(.005,scale*factor));
+    centerX += (x-mapCanvas.clientWidth/2) * (1/scale-1/next);
+    centerY -= (y-mapCanvas.clientHeight/2) * (1/scale-1/next);
+    scale = next; viewportChanged = true; drawMap(); updateHover();
+}
+function offsetText(cell) {
+    const x = cell.x*selection.cellSize, y = cell.y*selection.cellSize;
+    return format(Math.abs(x)) + (x < 0 ? " m W" : " m E") + ", "
+        + format(Math.abs(y)) + (y < 0 ? " m S" : " m N");
+}
+function mapLocation(point) {
+    const rect = mapCanvas.getBoundingClientRect();
+    const x = centerX + (point.clientX-rect.left-rect.width/2)/scale;
+    const y = centerY - (point.clientY-rect.top-rect.height/2)/scale;
+    return {x,y};
+}
+function cellAt(point) {
+    const meters = mapLocation(point);
+    return {x:Math.floor(meters.x/selection.cellSize+.5), y:Math.floor(meters.y/selection.cellSize+.5)};
+}
+function tip(box, event, message) {
+    box.textContent = message; box.hidden = false;
+    const bounds = box.parentElement.getBoundingClientRect();
+    box.style.left = Math.max(0,Math.min(bounds.width-box.offsetWidth,event.clientX-bounds.left+12))+"px";
+    box.style.top = Math.max(0,Math.min(bounds.height-box.offsetHeight,event.clientY-bounds.top+12))+"px";
+}
+function endpointCell(key, i) { return prepared.periods.length ? prepared.frameAt(i).get(key) : undefined; }
+function updateHover() {
+    const tipBox = $("maptip");
+    if (!hover || drag) { tipBox.hidden = true; return; }
+    const cell = cellAt(hover), key = cell.x + "," + cell.y;
+    const left = Math.floor(position), right = Math.ceil(position);
+    if (!endpointCell(key,left) && !endpointCell(key,right)) { tipBox.hidden = true; return; }
+    const lines = [selection.cellSize + " m cell · " + offsetText(cell)];
+    for (const i of new Set([left,right])) {
+        const data = endpointCell(key,i);
+        let details = "No reading";
+        if (data) {
+            details = format(data.value)+" "+prepared.unit+" · "+quantity(data.samples,"sample")+" · "+quantity(data.logs,"recording");
+            if (selection.history) details += " · Last measured "+data.lastSeen;
+        }
+        lines.push(prepared.periods[i]+" · "+details);
+    }
+    tip(tipBox,hover,lines.join("\n"));
+}
+
+function buildChart(width,height) {
+    chartBase = document.createElement("canvas");
+    chartBase.width = chartCanvas.width; chartBase.height = chartCanvas.height;
+    const ctx = chartBase.getContext("2d");
+    ctx.scale(devicePixelRatio,devicePixelRatio);
+    ctx.font = "11px Segoe UI, sans-serif";
+    const left = 46, right = Math.max(left+1,width-30), top = 9, bottom = height-20;
+    const first = xTimes[0], last = xTimes.at(-1);
+    const axisX = t => last === first ? (left+right)/2 : left+(right-left)*(t-first)/(last-first);
+    chartXs = xTimes.map(axisX);
+    frameXs = prepared.periods.map(d => axisX(Date.parse(d.length === 7 ? d + "-01" : d)));
+    let min = Infinity, max = -Infinity;
+    for (const s of series) for (const value of s.points) if (value !== null) {
+        min = Math.min(min,value); max = Math.max(max,value);
+    }
+    if (min === max) { min--; max++; }
+    const muted = getComputedStyle(document.body).getPropertyValue("--muted");
+    if (Number.isFinite(min)) {
+        const y = value => bottom - (bottom-top)*(value-min)/(max-min);
+        ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue("--line");
+        ctx.fillStyle = muted; ctx.textAlign = "right";
+        for (let n=0; n<3; n++) {
+            const v = min+(max-min)*n/2;
+            ctx.fillText(format(v),left-4,y(v)+3); ctx.beginPath();
+            ctx.moveTo(left,y(v)); ctx.lineTo(right,y(v)); ctx.stroke();
+        }
+        series.forEach(({name,points},i) => {
+            const selected = name === selection.channel;
+            ctx.fillStyle = ctx.strokeStyle = seriesColors[i%seriesColors.length];
+            ctx.lineWidth = selected ? 2 : 1;
+            const limit = (selection.granularity === "day" ? 1 : 31)*86400000;
+            points.forEach((v,k) => {
+                if (v === null) return;
+                if (k > 0 && points[k-1] !== null && xTimes[k]-xTimes[k-1] <= limit) {
+                    ctx.beginPath(); ctx.moveTo(chartXs[k-1],y(points[k-1]));
+                    ctx.lineTo(chartXs[k],y(v)); ctx.stroke();
+                }
+                ctx.beginPath(); ctx.arc(chartXs[k],y(v),selected ? 3 : 2,0,2*Math.PI); ctx.fill();
+            });
+        });
+    } else {
+        ctx.fillStyle = muted; ctx.fillText("No readings at this location",left,height/2);
+    }
+    ctx.fillStyle = muted; ctx.textAlign = "left";
+    let lastLabel = -Infinity;
+    prepared.chartPeriods.forEach((date,i) => {
+        const textWidth = ctx.measureText(date).width;
+        const x = Math.min(width-textWidth,Math.max(0,chartXs[i]-textWidth/2));
+        if (x > lastLabel+8) { ctx.fillText(date,x,height-3); lastLabel=x+textWidth; }
+    });
+}
+function drawChart() {
+    const {ctx,width,height} = sizeCanvas(chartCanvas);
+    if (!prepared || !width || !height) return;
+    if (!chartBase || chartBase.width !== chartCanvas.width || chartBase.height !== chartCanvas.height) {
+        buildChart(width,height);
+    }
+    ctx.drawImage(chartBase,0,0,width,height);
+    if (!frameXs.length) return;
+    const left = Math.floor(position), fraction = position-left;
+    const cursor = frameXs[left] + (frameXs[Math.ceil(position)]-frameXs[left])*fraction;
+    ctx.fillStyle = getComputedStyle(document.body).getPropertyValue("--accent");
+    ctx.fillRect(cursor-.75,2,1.5,height-21);
+}
+function chartPosition(event, positions) {
+    const x = event.clientX-chartCanvas.getBoundingClientRect().left;
+    const upper = positions.findIndex(t => t >= x);
+    if (upper < 0) return positions.length-1;
+    if (upper === 0) return 0;
+    return upper-1+(x-positions[upper-1])/(positions[upper]-positions[upper-1]);
+}
+function bindControls() {
+    for (const id of ["aircraft","link","channel","grid","granularity","history","half-life"]) $(id).onchange = rebuild;
+    $("date").onchange = () => { stopPlayback(); showPosition(prepared.periods.indexOf($("date").value)); };
+    $("play").onclick = togglePlayback;
+    $("prev").onclick = () => { stopPlayback(); showPosition(Math.ceil(position)-1); };
+    $("next").onclick = () => { stopPlayback(); showPosition(Math.floor(position)+1); };
+    $("scrub").onpointerdown = stopPlayback;
+    $("scrub").oninput = () => { stopPlayback(); showPosition(Number($("scrub").value)/framesPerStep); };
+    $("scrub").onkeydown = event => {
+        if (["ArrowLeft","ArrowRight"].includes(event.key)) {
+            event.preventDefault(); stopPlayback();
+            showPosition(event.key === "ArrowLeft" ? Math.ceil(position)-1 : Math.floor(position)+1);
+        }
+    };
+    document.addEventListener("visibilitychange", () => { if (document.hidden) stopPlayback(); });
+    $("zoom-in").onclick = () => zoom(1.5);
+    $("zoom-out").onclick = () => zoom(1/1.5);
+    $("fit").onclick = fitSite;
+    $("clear-pin").onclick = () => { pin=null; rebuildTrend(); drawMap(); drawChart(); };
+    mapCanvas.onwheel = event => {
+        event.preventDefault();
+        const rect = mapCanvas.getBoundingClientRect();
+        zoom(event.deltaY < 0 ? 1.2 : 1/1.2,event.clientX-rect.left,event.clientY-rect.top);
+    };
+    mapCanvas.onpointerdown = event => {
+        if (event.button !== 0 || !event.isPrimary) return;
+        drag = {x:event.clientX,y:event.clientY,cx:centerX,cy:centerY,moved:false};
+        mapCanvas.setPointerCapture(event.pointerId); $("maptip").hidden = true;
+    };
+    mapCanvas.onpointermove = event => {
+        hover = event;
+        if (drag) {
+            const dx = event.clientX-drag.x, dy = event.clientY-drag.y;
+            drag.moved ||= Math.hypot(dx,dy) > 3;
+            if (drag.moved) {
+                centerX = drag.cx-dx/scale; centerY = drag.cy+dy/scale;
+                viewportChanged = true; drawMap();
+            }
+        }
+        updateHover();
+    };
+    mapCanvas.onpointerup = event => {
+        if (drag && !drag.moved) {
+            const cell = cellAt(event), key = cell.x+","+cell.y;
+            if (endpointCell(key,Math.floor(position)) || endpointCell(key,Math.ceil(position))) {
+                stopPlayback(); pin = mapLocation(event); rebuildTrend(); drawMap(); drawChart();
+            }
+        }
+        drag = null; updateHover();
+    };
+    mapCanvas.onpointercancel = () => { drag=null; };
+    mapCanvas.onpointerleave = () => { hover=null; updateHover(); };
+    chartCanvas.onpointerdown = event => {
+        if (event.button !== 0 || !event.isPrimary) return;
+        stopPlayback(); chartCanvas.setPointerCapture(event.pointerId);
+        $("charttip").hidden = true; showPosition(chartPosition(event,frameXs));
+    };
+    chartCanvas.onpointermove = event => {
+        if (chartCanvas.hasPointerCapture(event.pointerId)) { showPosition(chartPosition(event,frameXs)); return; }
+        const i = Math.round(chartPosition(event,chartXs));
+        if (i < 0 || !prepared.chartPeriods.length) return;
+        const lines = series.map(s => s.name+" · "+(s.points[i] === null ? "No reading" : format(s.points[i])));
+        tip($("charttip"),event,[prepared.chartPeriods[i],...lines].join("\n"));
+    };
+    chartCanvas.onpointerleave = () => { $("charttip").hidden = true; };
+    new ResizeObserver(() => { viewportChanged=true; drawMap(); drawChart(); }).observe($("mapbox"));
+}
+function getState() {
+    return {state:"ready",ready:true,position,periods:prepared.periods,range:prepared.range,
+        cellCount:prepared.periods.length ? prepared.frameAt(Math.round(position)).size : 0,
+        pin:selectedCell(), camera:{x:centerX,y:centerY,scale}, playing:playback !== null,
+        basemap:basemapChoice,tiles:tileState()};
+}
+let basemapChoice = dataset.basemap || "offline";
+let fitted = false;
+window.sloppyReceptionMap = {
+    getState, fit: fitSite,
+    refresh(options) {
+        // Qt also requests fit on resize. Preserve a user's camera after the initial fit.
+        if (options?.fit && !fitted) { fitSite(); fitted=true; }
+        else { viewportChanged=true; drawMap(); drawChart(); }
+        return true;
+    },
+    setOpacity(value) { opacity=Math.min(1,Math.max(0,value)); drawMap(); return true; },
+    setBasemap(value) { basemapChoice=value; setTiles(value); return true; },
+    setImageryOpacity(value) {
+        requestedImageryOpacity = Math.min(1,Math.max(0,Number(value)));
+        applyImageryOpacity(requestedImageryOpacity);
+        return true;
+    }
+};
+try {
+    setOptions($("aircraft"),model.aircraft,"All aircraft");
+    bindControls(); rebuild(); fitSite();
+} catch (error) {
+    $("map-message").hidden=false; $("map-message").textContent="Could not open reception history. "+error.message;
+    window.sloppyReceptionMap.getState = () => ({state:"error",ready:false,message:error.message});
+    console.error(error);
+}
+</script>
+<script type="module">
+import * as maplibregl from __MAP_MODULE__;
+const basemapConfig = __BASEMAP_CONFIG__;
+const basemapAttributionElement = $("attribution");
+maplibregl.setWorkerUrl(__MAP_WORKER__);
+let map = null;
+__BASEMAP_RUNTIME__
+function syncCamera() {
+    if (!map || basemapChoice === "offline") return;
+    const [lat,lon] = dataset.center, rad = Math.PI/180, radius = 6371008.8;
+    const cosine = Math.max(1e-9,Math.cos(lat*rad));
+    const zoom = Math.log2(scale*2*Math.PI*radius*cosine/512);
+    map.resize();
+    map.jumpTo({center:[lon+centerX/(rad*radius*cosine),lat+centerY/(rad*radius)],zoom});
+}
+syncTiles = syncCamera;
+applyImageryOpacity = setImageryOpacity;
+applyImageryOpacity(requestedImageryOpacity);
+tileState = basemapDebugState;
+function applyTiles(value) {
+    const offline = value === "offline";
+    $("tiles").hidden = offline;
+    $("attribution").hidden = offline;
+    $("mapbox").classList.toggle("grid",offline);
+    if (offline) {
+        if (map) { map.remove(); map = null; window.__sloppyReceptionDebugMap = null; }
+        return;
+    }
+    if (!map) {
+        activeBasemap = value;
+        try {
+            map = new maplibregl.Map({
+                container:"tiles",interactive:false,attributionControl:false,
+                minZoom:0,maxZoom:24,style:{version:8,sources:basemapConfig.sources,layers:basemapRasterLayers()},
+                center:[dataset.center[1],dataset.center[0]],zoom:15
+            });
+            window.__sloppyReceptionDebugMap = map;
+            map.on("style.load",reapplyBasemapState);
+            map.on("moveend",updateBasemapAttribution);
+            map.on("error",handleBasemapError);
+        } catch (error) {
+            $("mapbox").classList.add("grid"); $("attribution").textContent="Basemap unavailable";
+            return;
+        }
+    }
+    setBasemap(value); syncCamera();
+}
+installImageryTileLoader();
+setTiles = applyTiles;
+applyTiles(basemapChoice);
+</script>
+</body></html>

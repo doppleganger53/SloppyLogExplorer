@@ -7,15 +7,18 @@ import math
 import os
 import re
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile
 
 import pandas as pd
 
+from .history_sources import READ_ERRORS, RecordingReader, RecordingSource, ScanCancelled, SourceUnavailable
 from .models import (
     DetectedSiteCluster,
     GpsColumns,
@@ -110,10 +113,6 @@ def telemetry_group_columns(channels: Iterable[str], logical_name: str) -> tuple
     return tuple(dict.fromkeys(resolved))
 
 
-class _ReceptionScanCancelled(RuntimeError):
-    """Stop an in-progress file scan without caching a partial record."""
-
-
 def _canonical_path(path: str | Path) -> str:
     return os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
 
@@ -206,7 +205,7 @@ def _sampled_csv(
         resolved_position_index = 0
         for row in reader:
             if is_cancelled is not None and is_cancelled():
-                raise _ReceptionScanCancelled
+                raise ScanCancelled
             if not row:
                 continue
             if record_limit is not None and data_index >= record_limit:
@@ -521,7 +520,7 @@ def _file_metadata(path: Path) -> tuple[int, int, float]:
     return stat.st_size, stat.st_mtime_ns, stat.st_mtime
 
 
-def index_log(
+def _index_csv(
     path: str | Path,
     library_root: str | Path,
     sample_stride: int = SAMPLE_STRIDE,
@@ -664,7 +663,7 @@ def index_log(
             center_longitude,
             channels,
         )
-    except _ReceptionScanCancelled:
+    except ScanCancelled:
         raise
     except OSError as exc:
         status = "io_error"
@@ -688,6 +687,50 @@ def index_log(
         (),
         message,
     )
+
+
+def _skipped_source(root: Path, source: RecordingSource, status: str, error: str = "") -> ReceptionLogRecord:
+    return ReceptionLogRecord(
+        root, source.path, source.size, source.mtime_ns, status,
+        datetime.fromtimestamp(source.modified).date(), True, None, None, (), error,
+    )
+
+
+def _index_source(
+    reader: RecordingReader, source: RecordingSource,
+    sample_stride: int, gps_probe_records: int = GPS_PROBE_RECORDS,
+) -> ReceptionLogRecord:
+    if source.error:
+        return _skipped_source(reader.root, source, "io_error", source.error)
+    try:
+        with reader.csv(source) as (csv_path, _, date_source):
+            record = _index_csv(csv_path, reader.root, sample_stride, gps_probe_records, reader.is_cancelled)
+        return replace(
+            record, file_path=source.path, file_size=source.size, mtime_ns=source.mtime_ns,
+            date_inferred=bool(date_source) or record.date_inferred,
+        )
+    except SourceUnavailable as exc:
+        return _skipped_source(reader.root, source, exc.status)
+    except READ_ERRORS as exc:
+        return _skipped_source(reader.root, source, "io_error", str(exc))
+
+
+def index_log(
+    path: str | Path, library_root: str | Path, sample_stride: int = SAMPLE_STRIDE,
+    gps_probe_records: int = GPS_PROBE_RECORDS, is_cancelled: CancellationCheck | None = None,
+) -> ReceptionLogRecord:
+    file_path = Path(path).resolve(strict=False)
+    root = Path(library_root).resolve(strict=False)
+    if file_path.suffix.lower() != ".tlm" and file_path.parent.suffix.lower() != ".zip":
+        return _index_csv(file_path, root, sample_stride, gps_probe_records, is_cancelled)
+    with closing(RecordingReader(root, is_cancelled)) as reader:
+        try:
+            source = reader.lookup(file_path)
+        except (OSError, ValueError, BadZipFile) as exc:
+            return ReceptionLogRecord(
+                root, file_path, 0, 0, "io_error", datetime.now().date(), True, None, None, (), str(exc),
+            )
+        return _index_source(reader, source, sample_stride, gps_probe_records)
 
 
 def _coerce_record(value: ReceptionLogRecord | Mapping[str, Any]) -> ReceptionLogRecord:
@@ -722,6 +765,7 @@ def _coerce_record(value: ReceptionLogRecord | Mapping[str, Any]) -> ReceptionLo
         str(value.get("error") or value.get("error_message") or ""),
         int(value["site_id"]) if value.get("site_id") is not None else None,
         int(value.get("index_version") or 0),
+        str(value.get("content_hash") or ""),
     )
 
 
@@ -859,6 +903,7 @@ def refresh_reception_index(
     sample_stride: int = SAMPLE_STRIDE,
     progress: ProgressCallback | None = None,
     is_cancelled: CancellationCheck | None = None,
+    retry_io_errors: bool = False,
 ) -> ReceptionScanResult:
     root = Path(library_root).resolve(strict=False)
     root_key = _canonical_path(root)
@@ -868,71 +913,52 @@ def refresh_reception_index(
         for record in [_coerce_record(raw_record)]
         if _canonical_path(record.library_root) == root_key
     }
-    log_items = sorted(list(logs), key=lambda item: _canonical_path(item.path))
     records: list[ReceptionLogRecord] = []
-    scanned_count = 0
-    cached_count = 0
-    total = len(log_items)
-    for completed, item in enumerate(log_items, start=1):
-        if is_cancelled is not None and is_cancelled():
-            return ReceptionScanResult(
-                tuple(records),
-                tuple(cluster_reception_records(records)),
-                scanned_count,
-                cached_count,
-                sum(record.status in {"malformed", "io_error"} for record in records),
-                True,
-            )
-        path = Path(item.path)
-        metadata_from_library = False
+    scanned_count = cached_count = 0
+    cancelled = False
+    with closing(RecordingReader(root, is_cancelled)) as reader:
         try:
-            size, mtime_ns, _ = _file_metadata(path)
-        except OSError:
-            size, mtime_ns = int(item.size), int(float(item.modified) * 1_000_000_000)
-            metadata_from_library = True
-        existing = cached.get(_canonical_path(path))
-        if (
-            existing is not None
-            and existing.file_size == size
-            and existing.mtime_ns == mtime_ns
-            and (
-                existing.index_version == RECEPTION_INDEX_VERSION
-                or existing.status in {"malformed", "io_error"}
-            )
-        ):
-            record = existing
-            cached_count += 1
-        else:
-            try:
-                record = index_log(
-                    path,
-                    root,
-                    sample_stride=sample_stride,
-                    is_cancelled=is_cancelled,
+            sources = reader.inventory(logs)
+            sizes = Counter(source.size for source in sources)
+            seen_hashes: set[str] = set()
+            for index, source in enumerate(sources, 1):
+                reader.check_cancelled()
+                existing = cached.get(_canonical_path(source.path))
+                unchanged = (
+                    existing is not None
+                    and existing.file_size == source.size and existing.mtime_ns == source.mtime_ns
+                    and not (retry_io_errors and existing.status == "io_error")
+                    and (existing.index_version == RECEPTION_INDEX_VERSION
+                         or existing.status in {"malformed", "io_error"})
                 )
-            except _ReceptionScanCancelled:
-                return ReceptionScanResult(
-                    tuple(records),
-                    tuple(cluster_reception_records(records)),
-                    scanned_count,
-                    cached_count,
-                    sum(record.status in {"malformed", "io_error"} for record in records),
-                    True,
-                )
-            if metadata_from_library and record.status == "io_error":
-                # Preserve the last metadata fingerprint supplied by the
-                # library scan. Otherwise an inaccessible cloud placeholder
-                # would be stored as 0/0 and retried on every refresh despite
-                # remaining unchanged.
-                record = replace(record, file_size=size, mtime_ns=mtime_ns)
-            scanned_count += 1
-        records.append(record)
-        if progress is not None:
-            progress(completed, total, path.name)
+                digest = existing.content_hash if unchanged and existing is not None else ""
+                if sizes[source.size] > 1 and not source.error and not digest:
+                    try:
+                        digest = reader.digest(source)
+                    except READ_ERRORS:
+                        # Indexing below records a precise read failure.
+                        pass
+                duplicate = bool(digest and digest in seen_hashes)
+                if unchanged and existing is not None and (existing.status == "duplicate") == duplicate:
+                    record = existing
+                    cached_count += 1
+                elif duplicate:
+                    record = _skipped_source(root, source, "duplicate")
+                    scanned_count += 1
+                else:
+                    record = _index_source(reader, source, sample_stride)
+                    scanned_count += 1
+                if digest and record.status != "io_error":
+                    seen_hashes.add(digest)
+                records.append(replace(record, content_hash=digest))
+                if progress is not None:
+                    progress(index, len(sources), source.name)
+        except ScanCancelled:
+            cancelled = True
     clusters = cluster_reception_records(records, tolerance_km=SITE_TOLERANCE_KM)
     error_count = sum(record.status in {"malformed", "io_error"} for record in records)
     return ReceptionScanResult(
-        tuple(records), tuple(clusters), scanned_count, cached_count, error_count, False
+        tuple(records), tuple(clusters), scanned_count, cached_count, error_count, cancelled
     )
 
 
@@ -954,6 +980,13 @@ def _local_lon_lat(x: float, y: float, center: tuple[float, float]) -> tuple[flo
     longitude_scale = max(1e-9, math.cos(math.radians(center_latitude)))
     longitude = center_longitude + math.degrees(x / (EARTH_RADIUS_METERS * longitude_scale))
     return longitude, latitude
+
+
+def reception_cell_key(latitude: float, longitude: float, center: tuple[float, float],
+                       cell_size: float) -> tuple[int, int]:
+    """Anchor the grid on the site, with its origin in the middle of a cell."""
+    x, y = _local_xy(latitude, longitude, center)
+    return math.floor((x + cell_size / 2) / cell_size), math.floor((y + cell_size / 2) / cell_size)
 
 
 def _telemetry_unit(column: str) -> str:
@@ -1236,7 +1269,12 @@ def build_reception_heatmap(
                 progress(completed, total, record.file_path.name)
             continue
         try:
-            log = load_log(record.file_path, record.library_root)
+            with closing(RecordingReader(record.library_root, is_cancelled)) as reader:
+                source = reader.lookup(record.file_path)
+                if source.member is not None:
+                    source.verify_fingerprint(record)
+                with reader.csv(source) as (csv_path, _, _):
+                    log = load_log(csv_path, record.library_root)
             gps = log.gps_columns
             source_columns = telemetry_group_columns(log.dataframe.columns, telemetry_column)
             if gps is None or not source_columns:
@@ -1331,13 +1369,7 @@ def build_reception_heatmap(
                 value = point.get("value")
                 if value is None or not math.isfinite(float(value)):
                     continue
-                x, y = _local_xy(float(point["lat"]), float(point["lon"]), site_center)
-                # Anchor the local grid on the flying-site center so (0, 0)
-                # lies at the center of a cell rather than on four boundaries.
-                key = (
-                    math.floor((x + cell_size / 2.0) / cell_size),
-                    math.floor((y + cell_size / 2.0) / cell_size),
-                )
+                key = reception_cell_key(float(point["lat"]), float(point["lon"]), site_center, cell_size)
                 values_by_cell[key].append(float(value))
             if values_by_cell:
                 logs_used += 1

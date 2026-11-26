@@ -207,9 +207,12 @@ BASEMAP_RUNTIME_JAVASCRIPT = r"""
 """
 
 
-def normalize_basemap(value: object) -> str:
+def normalize_basemap(value: object, *, allow_offline: bool = False) -> str:
     """Return a supported basemap identifier, defaulting to OpenStreetMap."""
-    return BASEMAP_IMAGERY if str(value or "").strip().lower() == BASEMAP_IMAGERY else BASEMAP_OPENSTREETMAP
+    key = str(value or "").strip().lower()
+    if allow_offline and key == "offline":
+        return key
+    return BASEMAP_IMAGERY if key == BASEMAP_IMAGERY else BASEMAP_OPENSTREETMAP
 
 
 def clamp_imagery_opacity(value: object) -> float:
