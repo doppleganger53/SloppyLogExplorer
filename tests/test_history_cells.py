@@ -66,6 +66,34 @@ def _model_result(script: str) -> dict:
     return json.loads(result.toString())
 
 
+@pytest.mark.parametrize(("values", "expected"), [
+    ([25.2 + n for n in range(24)] + [900], [26, 48]),
+    ([40] * 25, [39, 41]),
+])
+def test_history_and_combined_use_the_same_auto_gradient(tmp_path, values, expected):
+    path = tmp_path / "flight.csv"
+    path.write_text(
+        "Date,Time,GPS Lat,GPS Lon,VFR(%),Offset\n"
+        + "".join(f"2025-01-01,10:00:{i:02d},{40+i*.0001:.6f},-75,{value},10\n"
+                  for i, value in enumerate(values)),
+        encoding="utf-8",
+    )
+    center = (40, -75)
+    records = [index_log(path, tmp_path)]
+    combined = build_reception_heatmap(records, "VFR(%)", center)
+    grids = bin_history_recording(load_log(path), center)
+    history_range = _model_result(
+        "const history = new ReceptionHistoryModel({logs:[recording('2025-01-01','A',"
+        + json.dumps(grids["5"]) + ")]}); JSON.stringify(history.prepare({channel:'VFR(%)'}).range);"
+    )
+    assert list(combined["auto_color_range"]) == history_range == expected
+    assert max(cell["value"] for cell in combined["cells"]) == max(values)
+    normalized = build_reception_heatmap(
+        records, "VFR(%)", center, reference_column="Offset", normalization_mode="difference"
+    )
+    assert list(normalized["auto_color_range"]) == [bound - 10 for bound in expected]
+
+
 def test_current_period_equal_recording_weight_comparable_trends_and_missing_cells() -> None:
     result = _model_result("""
         const view = model.prepare({channel: signal});

@@ -39,7 +39,7 @@ The Flight Map and HeatMap use MapLibre GL JS 6.4.1, bundled in `sloppy_log_expl
 - NASA Global Imagery Browse Services (GIBS): https://nasa-gibs.github.io/gibs-api-docs/
 - NASA acknowledgment: Imagery is provided by NASA GIBS, part of NASA's Earth Science Data and Information System (ESDIS)
 
-The application does not use Google Maps, Mapbox, paid subscriptions, account signups, or API keys for map visualization. The Flight Map and combined HeatMap open with OpenStreetMap. Reception history opens on a local grid. Imagery mode places NASA GIBS beneath transparent NAIP ArcGIS image-export tiles, so the active view may request tiles from all three providers.
+The application does not use Google Maps, Mapbox, paid subscriptions, account signups, or API keys for map visualization. The Flight Map and HeatMap default to OpenStreetMap. Reception history also offers an offline grid. Imagery mode places NASA GIBS beneath transparent NAIP ArcGIS image-export tiles, so the active view may request tiles from all three providers.
 
 ## Spektrum Telemetry
 

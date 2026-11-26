@@ -55,8 +55,9 @@ def test_history_refreshes_on_library_change_and_rejects_old_site_results(tmp_pa
         window.refresh_reception_index()
         wait_for_workers()
         assert window.reception_static_controls.isHidden()
-        assert window.reception_basemap_combo.currentData() == "offline"
+        assert window.reception_basemap_combo.currentData() == "osm"
         first_payload = window._reception_map_payload
+        assert first_payload["basemap"] == "osm"
         assert [log["date"] for log in first_payload["logs"]] == ["2026-01-01"]
 
         generation = window._reception_heatmap_generation
@@ -79,5 +80,35 @@ def test_history_refreshes_on_library_change_and_rejects_old_site_results(tmp_pa
         window.reception_mode_combo.setCurrentIndex(window.reception_mode_combo.findData("combined"))
         assert window.reception_basemap_combo.findData("offline") < 0
         assert window.reception_date_from.date().toPyDate() == date(2026, 6, 1)
+    finally:
+        window.close()
+
+
+def test_switching_heatmap_views_keeps_last_shared_basemap(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path / "settings"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    modes = window.reception_mode_combo
+    basemaps = window.reception_basemap_combo
+    try:
+        basemaps.setCurrentIndex(basemaps.findData("imagery"))
+        modes.setCurrentIndex(modes.findData("history"))
+        assert basemaps.currentData() == "imagery"
+        assert window.reception_imagery_opacity_slider.isEnabled()
+        basemaps.setCurrentIndex(basemaps.findData("osm"))
+        modes.setCurrentIndex(modes.findData("combined"))
+        assert basemaps.currentData() == "osm"
+
+        modes.setCurrentIndex(modes.findData("history"))
+        basemaps.setCurrentIndex(basemaps.findData("imagery"))
+        basemaps.setCurrentIndex(basemaps.findData("offline"))
+        assert not window.reception_imagery_opacity_slider.isEnabled()
+        modes.setCurrentIndex(modes.findData("combined"))
+        assert basemaps.findData("offline") < 0
+        assert basemaps.currentData() == "imagery"
+        assert window.reception_imagery_opacity_slider.isEnabled()
     finally:
         window.close()

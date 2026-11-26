@@ -18,7 +18,8 @@ def test_history_viewer(tmp_path: Path) -> None:
 
 def run_viewer(tmp_path: Path) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from PyQt6.QtCore import QPoint, Qt, QUrl
+    from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QUrl
+    from PyQt6.QtGui import QMouseEvent
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
@@ -83,21 +84,34 @@ def run_viewer(tmp_path: Path) -> None:
         return QPoint(round(rect[0] + rect[2] * fraction), round(rect[1]))
 
     surface = view.focusProxy()
+    def move_pointer(point, buttons):
+        # Target the offscreen browser surface directly. OS cursor moves can
+        # land in another window while this test runs in the desktop suite.
+        event = QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(point), QPointF(surface.mapToGlobal(point)),
+            Qt.MouseButton.NoButton, buttons, Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(surface, event)
+
+    def wait_for_position(low, high):
+        for _ in range(50):
+            _run_event_loop(40)
+            position = js("position")
+            if low < position < high:
+                return position
+        raise AssertionError(f"Expected position between {low} and {high}, got {position}")
+
     QTest.mousePress(surface, Qt.MouseButton.LeftButton, pos=control_point("scrub", .15))
-    QTest.mouseMove(surface, control_point("scrub", .7))
-    _run_event_loop(80)
-    forward = js("position")
-    assert 1 < forward < 2
-    QTest.mouseMove(surface, control_point("scrub", .25))
-    _run_event_loop(80)
-    assert 0 < js("position") < forward
+    move_pointer(control_point("scrub", .7), Qt.MouseButton.LeftButton)
+    forward = wait_for_position(1, 2)
+    move_pointer(control_point("scrub", .25), Qt.MouseButton.LeftButton)
+    wait_for_position(0, forward)
     QTest.mouseRelease(surface, Qt.MouseButton.LeftButton, pos=control_point("scrub", .25))
 
     # The earlier two dates are weeks apart; September is eight months away.
     QTest.mousePress(surface, Qt.MouseButton.LeftButton, pos=control_point("chart", .08))
-    QTest.mouseMove(surface, control_point("chart", .35))
-    _run_event_loop(80)
-    assert 1 < js("position") < 2
+    move_pointer(control_point("chart", .35), Qt.MouseButton.LeftButton)
+    wait_for_position(1, 2)
     QTest.mouseRelease(surface, Qt.MouseButton.LeftButton, pos=control_point("chart", .35))
 
     js("$('scrub').value=150; $('scrub').dispatchEvent(new Event('input'))")
@@ -109,7 +123,7 @@ def run_viewer(tmp_path: Path) -> None:
         return [r.x+r.width/2-centerX*scale, r.y+r.height/2+centerY*scale];
     })()""")
     point = QPoint(round(coords[0]), round(coords[1]))
-    QTest.mouseMove(view.focusProxy(), point)
+    move_pointer(point, Qt.MouseButton.NoButton)
     for _ in range(20):
         _run_event_loop(40)
         tooltip = js("$('maptip').textContent")
@@ -124,15 +138,29 @@ def run_viewer(tmp_path: Path) -> None:
     assert js("$('clear-pin').hidden") is False
     assert js("window.sloppyReceptionMap.getState().pin") == {"x": 0, "y": 0}
     assert js("series[0].points") == [40, 100, None, None]
+    automatic = js("getState().range")
+    painted = js("mapCanvas.toDataURL()")
+    js("$('auto-range').click(); $('range-min').value = 0; $('range-min').oninput();"
+       "$('range-max').value = 200; $('range-max').oninput()")
+    assert js("getState().range") == [0, 200]
+    assert js("mapCanvas.toDataURL()") != painted
+    assert js("[$('low').textContent,$('high').textContent]") == ["0 %", "200 %"]
+    assert js("series[0].points") == [40, 100, None, None]
+    js("$('range-max').value = -10; $('range-max').oninput()")
+    assert js("!$('range-error').hidden && getState().range[1] === 200")
+    js("$('range-max').value = 200; $('range-max').oninput()")
     js("$('play').click()")
     _run_event_loop(150)
     assert js("position > 1.5 && window.sloppyReceptionMap.getState().playing")
     js("$('play').click()")
     js("$('prev').click(); $('history').click(); $('half-life').value='30'; $('half-life').onchange()")
+    assert js("getState().range") == [0, 200]
     assert js("series[0].points") == [40, 80, 80, 80]
     assert js("position") == 1
     js("$('date').value='2024-01-01'; $('date').onchange()")
     assert js("prepared.frameAt(0).get('0,0').value") == 40
+    js("$('auto-range').click()")
+    assert js("getState().range") == automatic
     js("$('history').click(); $('aircraft').value='B'; $('aircraft').onchange()")
     assert js("$('scrub').disabled && $('play').disabled")
     assert js("prepared.chartPeriods.length") == 2

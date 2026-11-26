@@ -24,6 +24,7 @@ select{max-width:230px}button{cursor:pointer}button:disabled{opacity:.45;cursor:
 #map-message{left:50%;top:50%;transform:translate(-50%,-50%)}
 #maptip,#charttip{font-size:12px;white-space:pre-line;max-width:100%;z-index:2}
 .legend{font-size:12px;color:var(--muted)}.ramp{display:inline-block;width:72px;height:8px;background:linear-gradient(90deg,#dc4444,#edc549,#36ae81);border-radius:2px}
+.legend input[type=number]{width:7em}
 #coverage{margin-left:auto}.timeline{display:grid;gap:5px}.transport{gap:5px}#scrub{min-width:80px;flex:1;cursor:ew-resize;touch-action:none}
 #frame-label{font-weight:600;font-variant-numeric:tabular-nums}.trend{border-top:1px solid var(--line);padding-top:5px}
 .chart-head{justify-content:space-between}.chartbox{position:relative}#chart{display:block;width:100%;height:clamp(82px,16vh,160px);touch-action:none;cursor:ew-resize}
@@ -45,7 +46,12 @@ select{max-width:230px}button{cursor:pointer}button:disabled{opacity:.45;cursor:
 <div class="map-actions"><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button><button id="fit">Fit site</button></div>
 <span id="scale"></span><span id="attribution" hidden></span><span id="maptip" hidden></span><span id="map-message" hidden></span></div>
 <section class="timeline" aria-label="Timeline">
-<div class="legend"><span id="low"></span><i class="ramp"></i><span id="high"></span><span id="carried-key" hidden>Dimmed cells were last measured earlier</span><span id="coverage"></span></div>
+<div class="legend"><span id="low"></span><i class="ramp"></i><span id="high"></span>
+<label><input type="checkbox" id="auto-range" checked>Auto range</label>
+<label id="min-control" hidden>Min <input id="range-min" type="number" step="any"></label>
+<label id="max-control" hidden>Max <input id="range-max" type="number" step="any"></label>
+<span id="range-error" role="status" hidden>Enter a minimum below the maximum.</span>
+<span id="carried-key" hidden>Dimmed cells were last measured earlier</span><span id="coverage"></span></div>
 <div class="transport"><button id="play">Play</button><button id="prev" aria-label="Previous observation">◀</button>
 <input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-labelledby="frame-label">
 <button id="next" aria-label="Next observation">▶</button><select id="date" aria-label="Jump to date"></select></div>
@@ -68,6 +74,7 @@ const seriesColors = document.documentElement.dataset.theme === "dark"
 const framesPerStep = 100;
 const mapCanvas = $("map"), chartCanvas = $("chart");
 const overlays = new Map();
+let colorRange = [0, 1];
 let selection, prepared, series, pin = null, hover = null, drag = null, playback = null;
 let position = 0, opacity = dataset.opacity ?? .72;
 let scale = 1, centerX = 0, centerY = 0, viewportChanged = true;
@@ -90,6 +97,7 @@ function selectedCell() {
 function rebuild() {
     stopPlayback();
     const oldPeriod = prepared?.periods[Math.round(position)];
+    const previousFamily = model.metadata.get(selection?.channel)?.family;
     const aircraft = $("aircraft").value;
     setOptions($("link"), model.links(aircraft), "All links");
     const link = $("link").value;
@@ -108,9 +116,8 @@ function rebuild() {
     $("date").disabled = !dates.length;
     $("scrub").max = String(Math.max(0,dates.length - 1) * framesPerStep);
     $("play").disabled = $("scrub").disabled = dates.length < 2;
-    const [low, high] = prepared.range;
-    $("low").textContent = format(low) + " " + prepared.unit;
-    $("high").textContent = format(high) + " " + prepared.unit;
+    if (previousFamily !== model.metadata.get(selection.channel)?.family) $("auto-range").checked = true;
+    syncColorRange();
     document.querySelector(".ramp").style.transform = prepared.loss ? "scaleX(-1)" : "";
     xTimes = prepared.chartPeriods.map(d => Date.parse(d.length === 7 ? d + "-01" : d));
     const fallbackDates = model.matching(aircraft, link)
@@ -197,8 +204,32 @@ function sizeCanvas(canvas) {
     ctx.clearRect(0,0,width,height);
     return {ctx,width,height};
 }
+function syncColorRange() {
+    const auto = $("auto-range").checked;
+    if (auto) colorRange = prepared.range;
+    $("min-control").hidden = $("max-control").hidden = auto;
+    $("range-error").hidden = true;
+    const [low, high] = colorRange;
+    $("range-min").value = String(low);
+    $("range-max").value = String(high);
+    $("low").textContent = low + " " + prepared.unit;
+    $("high").textContent = high + " " + prepared.unit;
+}
+
+function editColorRange() {
+    const low = $("range-min").valueAsNumber, high = $("range-max").valueAsNumber;
+    const valid = Number.isFinite(low) && Number.isFinite(high) && low < high;
+    $("range-error").hidden = valid;
+    if (!valid) return;
+    colorRange = [low, high];
+    $("low").textContent = low + " " + prepared.unit;
+    $("high").textContent = high + " " + prepared.unit;
+    overlays.clear();
+    drawMap();
+}
+
 function cellColor(value) {
-    const [min, max] = prepared.range;
+    const [min, max] = colorRange;
     let t = Math.min(1,Math.max(0,(value-min)/(max-min || 1)));
     if (prepared.loss) t = 1 - t;
     const colors = [[220,68,68],[237,197,73],[54,174,129]];
@@ -399,6 +430,8 @@ function chartPosition(event, positions) {
     return upper-1+(x-positions[upper-1])/(positions[upper]-positions[upper-1]);
 }
 function bindControls() {
+    $("auto-range").onchange = () => { syncColorRange(); overlays.clear(); drawMap(); };
+    $("range-min").oninput = $("range-max").oninput = editColorRange;
     for (const id of ["aircraft","link","channel","grid","granularity","history","half-life"]) $(id).onchange = rebuild;
     $("date").onchange = () => { stopPlayback(); showPosition(prepared.periods.indexOf($("date").value)); };
     $("play").onclick = togglePlayback;
@@ -466,12 +499,12 @@ function bindControls() {
     new ResizeObserver(() => { viewportChanged=true; drawMap(); drawChart(); }).observe($("mapbox"));
 }
 function getState() {
-    return {state:"ready",ready:true,position,periods:prepared.periods,range:prepared.range,
+    return {state:"ready",ready:true,position,periods:prepared.periods,range:colorRange,
         cellCount:prepared.periods.length ? prepared.frameAt(Math.round(position)).size : 0,
         pin:selectedCell(), camera:{x:centerX,y:centerY,scale}, playing:playback !== null,
         basemap:basemapChoice,tiles:tileState()};
 }
-let basemapChoice = dataset.basemap || "offline";
+let basemapChoice = dataset.basemap || "osm";
 let fitted = false;
 window.sloppyReceptionMap = {
     getState, fit: fitSite,

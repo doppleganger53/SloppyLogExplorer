@@ -202,7 +202,7 @@ class MainWindow(QMainWindow):
         self._reception_map_payload: dict[str, object] | None = None
         self._reception_view_loaded = False
         self._history_site_signature: tuple[object, ...] | None = None
-        self._static_basemap = BASEMAP_OPENSTREETMAP
+        self._shared_reception_basemap = BASEMAP_OPENSTREETMAP
         self._reception_tasks: set[ReceptionTask] = set()
         self._reception_pool = QThreadPool(self)
         # Library scans and heatmap builds both perform sustained file I/O. Keep
@@ -632,7 +632,17 @@ class MainWindow(QMainWindow):
 
         self.reception_channel_combo = QComboBox()
         self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
-        selection.addRow("Telemetry item", self.reception_channel_combo)
+        channel_row = QHBoxLayout()
+        channel_row.addWidget(self.reception_channel_combo, 1)
+        channel_row.addWidget(QLabel("Grid"))
+        self.reception_grid_combo = QComboBox()
+        for size in (5, 2):
+            self.reception_grid_combo.addItem(f"{size} m", size)
+        self.reception_grid_combo.currentIndexChanged.connect(
+            lambda: self._invalidate_reception_heatmap("Grid size changed. Generate the heatmap to refresh the map.")
+        )
+        channel_row.addWidget(self.reception_grid_combo)
+        selection.addRow("Telemetry item", channel_row)
 
         self.reception_normalize_check = QCheckBox("Normalize")
         self.reception_normalize_check.toggled.connect(self.reception_normalization_changed)
@@ -812,7 +822,10 @@ class MainWindow(QMainWindow):
             self.reception_reference_min_spin.value(),
             self.reception_reference_max_spin.value(),
         ) if mode == "ratio" and not reference_auto else None
-        return root, site_id, start, end, channel, normalize, reference, mode, reference_range
+        return (
+            root, site_id, start, end, channel, normalize, reference, mode,
+            reference_range, self.reception_grid_combo.currentData(),
+        )
 
     def _set_reception_map_payload(self, payload: dict[str, object] | None, force: bool = False) -> None:
         self._reception_map_payload = dict(payload) if payload is not None else None
@@ -894,12 +907,10 @@ class MainWindow(QMainWindow):
         combo = self.reception_basemap_combo
         combo.blockSignals(True)
         if history:
-            self._static_basemap = combo.currentData()
             combo.addItem("Offline grid", "offline")
-            combo.setCurrentIndex(combo.findData("offline"))
         else:
             combo.removeItem(combo.findData("offline"))
-            combo.setCurrentIndex(combo.findData(self._static_basemap))
+            combo.setCurrentIndex(combo.findData(self._shared_reception_basemap))
         combo.blockSignals(False)
         self._update_reception_basemap_controls()
         self.reception_site_changed()
@@ -991,6 +1002,8 @@ class MainWindow(QMainWindow):
         basemap = str(
             self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
         )
+        if basemap != "offline":
+            self._shared_reception_basemap = basemap
         if self._reception_map_payload is not None:
             self._reception_map_payload["basemap"] = basemap
         self.reception_view.set_basemap(basemap)
@@ -1014,6 +1027,8 @@ class MainWindow(QMainWindow):
         if payload is None:
             return
         auto_range = self.reception_auto_range_check.isChecked()
+        if auto_range:
+            self._show_reception_auto_range(payload)
         minimum = self.reception_min_spin.value()
         maximum = self.reception_max_spin.value()
         reverse = self.reception_reverse_check.isChecked()
@@ -1027,6 +1042,15 @@ class MainWindow(QMainWindow):
             payload["range_max"] = maximum
         if self._reception_view_loaded:
             self.reception_view.set_color_scale(auto_range, minimum, maximum, reverse)
+
+    def _show_reception_auto_range(self, payload: dict[str, Any]) -> None:
+        bounds = payload.get("auto_color_range")
+        if bounds is None:
+            return
+        for spin, value in zip((self.reception_min_spin, self.reception_max_spin), bounds):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _invalidate_reception_heatmap(self, message: str) -> None:
         self.cancel_reception_heatmap(silent=True)
@@ -1348,6 +1372,7 @@ class MainWindow(QMainWindow):
             self.reception_result_status.setText("The selected flying site has no valid center coordinate.")
             return
         center = (float(raw_latitude), float(raw_longitude))
+        cell_size = self.reception_grid_combo.currentData()
         telemetry_column = str(channel)
         normalize = self.reception_normalize_check.isChecked()
         reference_column = (
@@ -1377,7 +1402,7 @@ class MainWindow(QMainWindow):
                 records,
                 telemetry_column,
                 center,
-                cell_size_m=5.0,
+                cell_size_m=cell_size,
                 progress=progress,
                 is_cancelled=is_cancelled,
                 reference_column=reference_column,
@@ -1385,7 +1410,7 @@ class MainWindow(QMainWindow):
                 reference_range=reference_range,
             )
 
-        self._start_reception_build(work, len(records), "Generating 5 m heatmap")
+        self._start_reception_build(work, len(records), f"Generating {cell_size} m heatmap")
 
     def _start_reception_build(self, work: TaskFunction, count: int, description: str) -> None:
         generation = self._reception_heatmap_generation
@@ -1468,16 +1493,7 @@ class MainWindow(QMainWindow):
         payload["auto_range"] = auto_range
         payload["reverse"] = self.reception_reverse_check.isChecked()
         if auto_range:
-            minimum = payload.get("value_min")
-            maximum = payload.get("value_max")
-            self.reception_min_spin.blockSignals(True)
-            self.reception_max_spin.blockSignals(True)
-            if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
-                self.reception_min_spin.setValue(float(minimum))
-            if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
-                self.reception_max_spin.setValue(float(maximum))
-            self.reception_min_spin.blockSignals(False)
-            self.reception_max_spin.blockSignals(False)
+            self._show_reception_auto_range(payload)
         else:
             payload["range_min"] = self.reception_min_spin.value()
             payload["range_max"] = self.reception_max_spin.value()
@@ -1501,6 +1517,7 @@ class MainWindow(QMainWindow):
         status = str(payload.get("status") or "empty")
         if status == "ok":
             cells = len(payload.get("cells") or []) if isinstance(payload.get("cells"), list) else 0
+            cell_size = payload.get("cell_size_m", self.reception_grid_combo.currentData())
             used = int(payload.get("logs_used") or 0)
             considered = int(payload.get("logs_considered") or 0)
             missing = int(payload.get("missing_channel_count") or 0)
@@ -1511,7 +1528,7 @@ class MainWindow(QMainWindow):
             inferred = int(payload.get("date_inferred_count") or 0)
             off_site = int(payload.get("off_site_sample_count") or 0)
             self.reception_result_status.setText(
-                f"Rendered {cells} observed 5 m cells from {used}/{considered} logs "
+                f"Rendered {cells} observed {cell_size:g} m cells from {used}/{considered} logs "
                 f"({missing} missing channel, {missing_reference} missing reference, "
                 f"{invalid_reference} invalid reference samples, {clamped_reference} clamped, "
                 f"{errors} read errors, {inferred} inferred dates, "

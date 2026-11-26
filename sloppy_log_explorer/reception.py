@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from zipfile import BadZipFile
 
+import numpy as np
 import pandas as pd
 
 from .history_sources import READ_ERRORS, RecordingReader, RecordingSource, ScanCancelled, SourceUnavailable
@@ -1192,6 +1193,15 @@ def _reception_viewport_focus(
     }
 
 
+def reception_color_range(values: Sequence[float]) -> tuple[int, int]:
+    """Match the history gradient's rounded 5th and 95th percentiles."""
+    if not values:
+        return 0, 1
+    low, high = np.percentile(values, (5, 95))
+    minimum, maximum = math.floor(low), math.ceil(high)
+    return (minimum - 1, maximum + 1) if minimum == maximum else (minimum, maximum)
+
+
 def build_reception_heatmap(
     records: Iterable[ReceptionLogRecord | Mapping[str, Any]],
     telemetry_column: str,
@@ -1455,6 +1465,7 @@ def build_reception_heatmap(
         "reference_range_min": effective_reference_range[0] if effective_reference_range is not None else None,
         "reference_range_max": effective_reference_range[1] if effective_reference_range is not None else None,
         "cells": cell_payload,
+        "auto_color_range": reception_color_range(values),
         "value_min": min(values) if values else None,
         "value_max": max(values) if values else None,
         "cell_size_m": cell_size,
