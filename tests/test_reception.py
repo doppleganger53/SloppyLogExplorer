@@ -12,6 +12,7 @@ import pytest
 import sloppy_log_explorer.reception as reception
 from sloppy_log_explorer.library import scan_library
 from sloppy_log_explorer.models import LibraryLogInfo, ReceptionLogRecord
+from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.reception import (
     build_reception_heatmap,
     cluster_reception_records,
@@ -951,3 +952,100 @@ def test_heatmap_removes_repeated_gps_dropouts_far_from_selected_site(tmp_path: 
     assert sum(cell["sample_count"] for cell in cells) == 2
     assert payload["off_site_sample_count"] == 2
     assert all(float(cell["latitude"]) > 39.0 for cell in cells)
+
+
+@pytest.mark.parametrize("size", [2, 5])
+def test_heatmap_radius_uses_unbinned_distance_and_retains_exact_boundary(tmp_path: Path, size: int):
+    center = (41.37, -74.59)
+    path = tmp_path / "edge.csv"
+
+    def latitude(metres):
+        return center[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)
+
+    # Both positions would round into the same cell. They have enough time
+    # between them for either position to be plausible at this speed.
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n"
+                    f"0,{latitude(10_000)},{center[1]},35\n"
+                    f"90,{latitude(10_000.01)},{center[1]},99\n")
+    payload = build_reception_heatmap([index_log(path, tmp_path)], "VFR(%)", center, size)
+    assert payload["off_site_sample_count"] == 1
+    assert [(cell["value"], cell["sample_count"]) for cell in payload["cells"]] == [(35, 1)]
+
+
+@pytest.mark.parametrize("size", [2, 5])
+def test_rejected_fixes_do_not_change_combined_normalization_or_colors(tmp_path: Path, size: int):
+    center = (39.75, -75.25)
+    path = tmp_path / "power.csv"
+    header = "Time,GPS Lat,GPS Lon,VFR(%),Power(mW)\n"
+    local = ["0,39.75,-75.25,80,0", "0,39.75005,-75.25,90,0",
+             "2,39.75000,-75.25,70,20", "3,39.75005,-75.25,90,20"]
+
+    def render(lines):
+        path.write_text(header + "\n".join(lines))
+        return build_reception_heatmap([index_log(path, tmp_path)], "VFR(%)", center, size,
+                                       reference_column="Power(mW)", normalization_mode="db_power")
+
+    baseline = render(local)
+    assert sum(cell["sample_count"] for cell in baseline["cells"]) == 4
+    assert baseline["reference_observed_max"] == 20
+    # A tiny power at either rejected position would alter zero-power normalization.
+    # The off-site fractional timestamp must not change the local clock precision.
+    dirty = render([*local[:2], "0.5,40.0,-75.25,10,1", "1.5,39.78,-75.25,5,2", *local[2:]])
+    assert dirty["off_site_sample_count"] == 1
+    for key in ("cells", "auto_color_range", "value_min", "value_max", "viewport_focus",
+                "reference_observed_min", "reference_observed_max", "invalid_reference_sample_count"):
+        assert dirty[key] == baseline[key]
+
+
+def test_speed_uses_logged_times_and_an_inclusive_300_mph_limit(tmp_path: Path):
+    site = (41.37, -74.59)
+    metres_per_second = 300.0 * 1609.344 / 3600.0
+
+    def latitude(metres):
+        return site[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)
+
+    path = tmp_path / "track.csv"
+    # Includes bad leading/trailing fixes, a two-fix dropout, a missing time,
+    # an exactly 300-mph segment, a 300+ segment, a gap and a clock reset.
+    samples = [(0, 3_000), (1, 0), (2, 0), (3, 1_900), (4, 1_901), (5, 0),
+               (6, metres_per_second), ("", 140), (7, 2 * metres_per_second + 0.01),
+               (80, 4_000), (0, -4_000), (1, -4_000), (2, 2_000)]
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{time},{latitude(metres)},{site[1]},90" for time, metres in samples))
+    rows, off_site = reception.heatmap_gps_rows(load_log(path), site)
+    assert [index for index, _lat, _lon in rows] == [1, 2, 5, 6, 7, 9, 10, 11]
+    assert off_site == 0
+
+
+def test_duplicate_times_have_one_travel_budget_and_date_only_has_none(tmp_path: Path):
+    site = (39.75, -75.25)
+    path = tmp_path / "ties.csv"
+    latitudes = [39.75, 39.75, 39.7509, 39.7518, 39.7509]
+    coordinates = [f"{latitude},-75.25,80" for latitude in latitudes]
+    for clock, stamp, expected in [
+        ("Time", "00:00:00", [0, 1, 2, 4]),
+        ("Time", "00:00:00.000", [0, 1]),
+        ("Time", "0", [0, 1, 2, 4]),
+        ("Date", "2026-04-01", list(range(5))),
+        ("Timestamp", "2026-04-01", list(range(5))),
+        ("DateTime", "2026-04-01", list(range(5))),
+    ]:
+        path.write_text(f"{clock},GPS Lat,GPS Lon,VFR(%)\n" +
+                        "\n".join(f"{stamp},{fix}" for fix in coordinates))
+        rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+        assert [index for index, _lat, _lon in rows] == expected
+
+
+def test_repeated_timestamps_cannot_claim_an_extra_second_at_each_transition(tmp_path: Path):
+    site = (41.37, -74.59)
+    path = tmp_path / "coarse.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{i // 2},{site[0] + math.degrees(i * 120 / reception.EARTH_RADIUS_METERS)},{site[1]},80"
+        for i in range(8)))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    # No start/end placement inside the four clock ticks allows all 840 m.
+    # Each retained stretch must fit even when a tick straddles two legs.
+    assert len(rows) >= 2
+    for i, (start, _lat, _lon) in enumerate(rows):
+        for end, _lat, _lon in rows[i + 1:]:
+            assert 120 * (end - start) <= (end // 2 - start // 2 + 1) * 134.112

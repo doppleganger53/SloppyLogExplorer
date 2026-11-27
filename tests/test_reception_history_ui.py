@@ -21,7 +21,11 @@ def test_history_refreshes_on_library_change_and_rejects_old_site_results(tmp_pa
         )
 
     first = library / "Glider-2026-01-01.csv"
-    first.write_text(recording("2026-01-01", 40), encoding="utf-8")
+    # The last fix is about four meters inside the original site's southern limit.
+    first.write_text(
+        recording("2026-01-01", 40) + "2026-01-01,12:05:00,39.91010,-75.0,15\n",
+        encoding="utf-8",
+    )
     with ZipFile(library / "recordings.zip", "w") as archive:
         archive.write(first, "backup/renamed.csv")
         archive.writestr("Trainer/remote.log", recording("2026-06-01", 41))
@@ -59,6 +63,9 @@ def test_history_refreshes_on_library_change_and_rejects_old_site_results(tmp_pa
         first_payload = window._reception_map_payload
         assert first_payload["basemap"] == "osm"
         assert [log["date"] for log in first_payload["logs"]] == ["2026-01-01"]
+        channel = "VFR 900M(%)"
+        for grid in first_payload["logs"][0]["grids"].values():
+            assert sorted(row[3] for row in grid[channel]) == [1, 25]
 
         generation = window._reception_heatmap_generation
         token = window._reception_selection_token()
@@ -66,6 +73,14 @@ def test_history_refreshes_on_library_change_and_rejects_old_site_results(tmp_pa
         wait_for_workers()
         assert window._reception_heatmap_generation == generation
         assert window._reception_map_payload is first_payload
+
+        # A revised site center alone must invalidate the prepared coverage.
+        window._selected_reception_site()["center_latitude"] += 0.0001
+        window.reception_site_changed()
+        wait_for_workers()
+        assert window._reception_map_payload["center"] == first_payload["center"]
+        for grid in window._reception_map_payload["logs"][0]["grids"].values():
+            assert grid[channel] == [[0, 0, 80, 25]]
 
         (library / "Glider-2026-05-01.csv").write_text(recording("2026-05-01", 40.0002))
         window.refresh_reception_index()

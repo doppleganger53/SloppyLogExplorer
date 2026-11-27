@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any
 from zipfile import BadZipFile
@@ -24,6 +25,7 @@ from .models import (
     DetectedSiteCluster,
     GpsColumns,
     LibraryLogInfo,
+    LoadedLog,
     RECEPTION_INDEX_VERSION,
     ReceptionCell,
     ReceptionLogRecord,
@@ -40,13 +42,13 @@ from .parser import (
     _detect_time,
     _has_coordinate_name_hint,
     _has_date_header,
+    _has_time_header,
     _has_position_header_hint,
     _numeric_columns,
     _parse_coordinate_text,
     _validate_table_structure,
     detect_gps_columns,
     load_log,
-    relative_seconds,
 )
 from .plotting import (
     GpsCandidate,
@@ -64,6 +66,9 @@ GPS_PROBE_RECORDS = 200
 SITE_TOLERANCE_KM = 2.0
 DEFAULT_CELL_SIZE_METERS = 5.0
 HEATMAP_SITE_RADIUS_KM = 10.0
+_MAX_GROUND_SPEED_KM_S = 300.0 * 1.609344 / 3600.0
+# Allow floating-point roundoff at the inclusive distance and speed boundaries.
+_DISTANCE_ROUNDOFF_KM = 1e-11
 EARTH_RADIUS_METERS = 6_371_008.8
 VIEWPORT_MAX_RADIUS_METERS = 2_000.0
 _VIEWPORT_BUCKET_METERS = 250.0
@@ -378,50 +383,38 @@ def _trustworthy_flight_date(
     return datetime.fromtimestamp(modified).date(), True
 
 
+GpsRow = tuple[int, float, float]  # dataframe position, latitude, longitude
+
+
+def _gps_rows(
+    dataframe: pd.DataFrame,
+    latitude_column: str,
+    longitude_column: str,
+) -> Iterable[GpsRow]:
+    latitudes = _coerce_numeric_series(dataframe[latitude_column]).to_numpy(dtype=float, na_value=np.nan)
+    longitudes = _coerce_numeric_series(dataframe[longitude_column]).to_numpy(dtype=float, na_value=np.nan)
+    for index in np.flatnonzero((np.abs(latitudes) <= 90.0) & (np.abs(longitudes) <= 180.0)):
+        lat, lon = float(latitudes[index]), float(longitudes[index])
+        if not _is_origin_placeholder(lat, lon):
+            yield int(index), lat, lon
+
+
 def _valid_gps_candidates(
     dataframe: pd.DataFrame,
     latitude_column: str,
     longitude_column: str,
     *,
     time_values: Sequence[object] | None = None,
-    elapsed_values: Sequence[float] | None = None,
-    value_column: str | None = None,
-    value_values: Sequence[object] | pd.Series | None = None,
 ) -> list[GpsCandidate]:
-    if value_column is not None and value_values is not None:
-        raise ValueError("provide value_column or value_values, not both")
-    latitude = _coerce_numeric_series(dataframe[latitude_column])
-    longitude = _coerce_numeric_series(dataframe[longitude_column])
-    if value_column is not None:
-        values = _coerce_numeric_series(dataframe[value_column])
-    elif value_values is not None:
-        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(list(value_values))
-        values = _coerce_numeric_series(raw_values).reset_index(drop=True)
-    else:
-        values = None
-    # Iterate positional arrays once instead of constructing several pandas
-    # scalar indexers for every GPS sample in full-length flight logs.
-    latitude_values = latitude.to_numpy()
-    longitude_values = longitude.to_numpy()
-    numeric_values = values.to_numpy() if values is not None else None
     candidates: list[GpsCandidate] = []
-    for index in range(len(dataframe)):
-        lat = _coerce_float(latitude_values[index])
-        lon = _coerce_float(longitude_values[index])
-        if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            continue
-        if _is_origin_placeholder(lat, lon):
-            continue
-        value = _coerce_float(numeric_values[index]) if numeric_values is not None else None
+    for index, lat, lon in _gps_rows(dataframe, latitude_column, longitude_column):
         point: GpsPoint = {
             "lat": lat,
             "lon": lon,
             "alt": 0.0,
             "row": index + 1,
-            "elapsedSeconds": (
-                float(elapsed_values[index]) if elapsed_values is not None and index < len(elapsed_values) else float(index)
-            ),
-            "value": value,
+            "elapsedSeconds": float(index),
+            "value": None,
         }
         point_time: object = time_values[index] if time_values is not None and index < len(time_values) else None
         candidates.append((point, point_time))
@@ -452,6 +445,155 @@ def _haversine_km(left_lat: float, left_lon: float, right_lat: float, right_lon:
     delta_lambda = math.radians(right_lon - left_lon)
     value = math.sin(delta_phi / 2.0) ** 2 + math.cos(left_phi) * math.cos(right_phi) * math.sin(delta_lambda / 2.0) ** 2
     return (2.0 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(value)))) / 1000.0
+
+
+def _speed_checked_rows(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
+    """Follow a plausible track within one uninterrupted recording clock."""
+    if len(rows) < 2:
+        return rows
+
+    def advance(left: GpsRow, right: GpsRow, used_km: float) -> float | None:
+        elapsed = abs(seconds[right[0]] - seconds[left[0]])
+        distance = _haversine_km(left[1], left[2], right[1], right[2])
+        allowance = elapsed * _MAX_GROUND_SPEED_KM_S
+        if elapsed > 0 and distance > allowance + _DISTANCE_ROUNDOFF_KM:
+            return None
+        # Several fixes can share a whole-second timestamp. Travel within that
+        # tick consumes time that cannot be granted again on the next leg.
+        outstanding = max(0.0, used_km + distance - allowance)
+        if outstanding <= tick_seconds[right[0]] * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+            return outstanding
+        return None
+
+    # Anchor on the longest continuous plausible run. A bad first or last
+    # fix should not cause us to discard the genuine track beside it.
+    start = best_start = best_length = 0
+    used_km = 0.0
+    for index in range(1, len(rows)):
+        used = advance(rows[index - 1], rows[index], used_km)
+        if used is None:
+            start, used_km = index, 0.0
+        else:
+            used_km = used
+            if index - start > best_length:
+                best_start, best_length = start, index - start
+    if best_length == len(rows) - 1:
+        return rows
+
+    previous = rows[best_start]
+    prefix: list[GpsRow] = []
+    used_km = 0.0
+    for index in range(best_start - 1, -1, -1):
+        candidate = rows[index]
+        used = advance(previous, candidate, used_km)
+        if used is not None:
+            prefix.append(candidate)
+            previous, used_km = candidate, used
+
+    track = chain(reversed(prefix), rows[best_start:])
+    retained = [next(track)]
+    used_km = 0.0
+    for candidate in track:
+        used = advance(retained[-1], candidate, used_km)
+        if used is not None:
+            retained.append(candidate)
+            used_km = used
+    return retained
+
+
+def _filter_clock_segment(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
+    timed = [row for row in rows if math.isfinite(seconds[row[0]])]
+    track = _speed_checked_rows(timed, seconds, tick_seconds)
+    if len(timed) == len(rows):
+        return track
+
+    # Without a timestamp, a fix can still be ruled out when the shortest trip
+    # through it cannot fit between its two surviving, time-stamped neighbors.
+    anchors = iter(track)
+    left, right = None, next(anchors, None)
+    retained = []
+    for row in rows:
+        if row == right:
+            retained.append(row)
+            left, right = right, next(anchors, None)
+        elif not math.isfinite(seconds[row[0]]):
+            if left is not None and right is not None:
+                elapsed = seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]]
+                detour = _haversine_km(*left[1:], *row[1:]) + _haversine_km(*row[1:], *right[1:])
+                if detour > elapsed * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+                    continue
+            retained.append(row)
+    return retained
+
+
+def _clock_tick_seconds(log: LoadedLog) -> np.ndarray:
+    """Recover each displayed timestamp's precision independently of other fixes."""
+    assert log.time is not None
+    # A numeric elapsed-time column loses trailing zeroes in CSV parsing.
+    # Start from the decimal places in each actual parsed timestamp.
+    fraction_ns = (log.time.dt.microsecond.fillna(0).to_numpy(dtype=np.int64) * 1000
+                   + log.time.dt.nanosecond.fillna(0).to_numpy(dtype=np.int64))
+    precision = np.ones(len(log.time))
+    for places in range(1, 10):
+        precision[fraction_ns % (10 ** (10 - places)) != 0] = 10.0 ** -places
+    for column in log.timeline_columns:
+        raw = log.dataframe[column]
+        if pd.api.types.is_numeric_dtype(raw):
+            continue
+        if len(log.timeline_columns) > 1 and not _has_time_header(column):
+            continue
+        # A written clock such as 12:00:00.000 explicitly records milliseconds.
+        fraction = raw.astype("string").str.extract(r":\d{2}[.,](\d+)", expand=False).str.len()
+        written = fraction.notna().to_numpy(dtype=bool)
+        precision[written] = 10.0 ** -fraction[written].to_numpy(dtype=float)
+    return precision
+
+
+def heatmap_gps_rows(log: LoadedLog, site_center: tuple[float, float]) -> tuple[list[GpsRow], int]:
+    """Return site-local, speed-checked fixes and the count outside the site radius."""
+    gps = log.gps_columns
+    if gps is None:
+        return [], 0
+    local: list[GpsRow] = []
+    off_site_count = 0
+    for row in _gps_rows(log.dataframe, gps.latitude, gps.longitude):
+        if _haversine_km(*site_center, row[1], row[2]) <= HEATMAP_SITE_RADIUS_KM + _DISTANCE_ROUNDOFF_KM:
+            local.append(row)
+        else:
+            off_site_count += 1
+    if len(local) < 2 or log.time is None:
+        return local, off_site_count
+    local_indexes = [index for index, _lat, _lon in local]
+    timestamps = log.time.iloc[local_indexes].dropna()
+    if timestamps.empty:
+        return local, off_site_count
+    if log.timeline_columns and (timestamps == timestamps.dt.normalize()).all():
+        # "Timestamp" and "DateTime" can hold just a date. Distinguish an
+        # actual midnight clock (or numeric elapsed time) from a parsed date.
+        for column in log.timeline_columns:
+            raw = log.dataframe[column].iloc[local_indexes].dropna()
+            if raw.astype(str).str.contains(r"\d:\d{2}").any() or pd.to_numeric(raw, errors="coerce").notna().any():
+                break
+        else:
+            return local, off_site_count
+
+    seconds = (log.time - timestamps.iloc[0]).dt.total_seconds().to_numpy()
+    tick_seconds = np.zeros(len(seconds))
+    if timestamps.duplicated().any() or len(timestamps) < len(local):
+        tick_seconds = _clock_tick_seconds(log)
+    start = 0
+    previous_time = -math.inf
+    retained: list[GpsRow] = []
+    for position, row in enumerate(local):
+        time = seconds[row[0]]
+        if not math.isfinite(time):
+            continue
+        if time < previous_time:
+            retained.extend(_filter_clock_segment(local[start:position], seconds, tick_seconds))
+            start = position
+        previous_time = time
+    retained.extend(_filter_clock_segment(local[start:], seconds, tick_seconds))
+    return retained, off_site_count
 
 
 def _site_local_gps_candidates(
@@ -1299,12 +1441,18 @@ def build_reception_heatmap(
                 if not reference_columns:
                     missing_reference_count += 1
                     continue
-            source_values = _row_median(log.dataframe, source_columns)
-            transformed_values = source_values.copy()
+            site_rows, off_site = heatmap_gps_rows(log, site_center)
+            off_site_sample_count += off_site
+            if not site_rows:
+                continue
+            row_indexes = [row for row, _lat, _lon in site_rows]
+            paired = log.dataframe.loc[:, [*source_columns, *reference_columns]].iloc[row_indexes]
+            source_values = _row_median(paired, source_columns)
+            transformed_values = source_values
             reference_values: pd.Series | None = None
-            clamped_mask = pd.Series(False, index=log.dataframe.index)
+            clamped_mask = pd.Series(False, index=paired.index)
             if reference_columns:
-                reference_values = _row_median(log.dataframe, reference_columns)
+                reference_values = _row_median(paired, reference_columns)
                 if normalization_mode == "ratio":
                     denominator = reference_values.copy()
                     if applied_reference_range is not None:
@@ -1332,55 +1480,19 @@ def build_reception_heatmap(
                             lambda value: math.log10(float(value)) if pd.notna(value) and float(value) > 0.0 else math.nan
                         )
                     ).where(valid)
-            candidates = _valid_gps_candidates(
-                log.dataframe,
-                gps.latitude,
-                gps.longitude,
-                time_values=list(log.time) if log.time is not None else None,
-                elapsed_values=relative_seconds(log),
-                value_values=transformed_values,
-            )
-            site_candidates = [
-                candidate
-                for candidate in candidates
-                if _haversine_km(
-                    site_center[0],
-                    site_center[1],
-                    float(candidate[0]["lat"]),
-                    float(candidate[0]["lon"]),
-                )
-                <= HEATMAP_SITE_RADIUS_KM
-            ]
-            off_site_sample_count += len(candidates) - len(site_candidates)
             if reference_values is not None:
-                for point, _ in site_candidates:
-                    row_index = int(point["row"]) - 1
-                    source_value = _coerce_float(source_values.iloc[row_index])
-                    if source_value is None:
-                        continue
-                    reference_value = _coerce_float(reference_values.iloc[row_index])
-                    if reference_value is not None:
-                        observed_reference_min = (
-                            reference_value
-                            if observed_reference_min is None
-                            else min(observed_reference_min, reference_value)
-                        )
-                        observed_reference_max = (
-                            reference_value
-                            if observed_reference_max is None
-                            else max(observed_reference_max, reference_value)
-                        )
-                    if _coerce_float(transformed_values.iloc[row_index]) is None:
-                        invalid_reference_sample_count += 1
-                    if bool(clamped_mask.iloc[row_index]):
-                        clamped_reference_sample_count += 1
+                observed = reference_values[source_values.notna()].dropna()
+                if not observed.empty:
+                    low, high = float(observed.min()), float(observed.max())
+                    observed_reference_min = low if observed_reference_min is None else min(low, observed_reference_min)
+                    observed_reference_max = high if observed_reference_max is None else max(high, observed_reference_max)
+                invalid_reference_sample_count += int((source_values.notna() & ~np.isfinite(transformed_values)).sum())
+                clamped_reference_sample_count += int((source_values.notna() & clamped_mask).sum())
             values_by_cell: dict[tuple[int, int], list[float]] = defaultdict(list)
-            for point, _ in site_candidates:
-                value = point.get("value")
-                if value is None or not math.isfinite(float(value)):
-                    continue
-                key = reception_cell_key(float(point["lat"]), float(point["lon"]), site_center, cell_size)
-                values_by_cell[key].append(float(value))
+            for (_, lat, lon), value in zip(site_rows, transformed_values.to_numpy(dtype=float, na_value=np.nan)):
+                if math.isfinite(value):
+                    key = reception_cell_key(lat, lon, site_center, cell_size)
+                    values_by_cell[key].append(float(value))
             if values_by_cell:
                 logs_used += 1
                 for key, values in values_by_cell.items():

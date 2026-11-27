@@ -196,6 +196,7 @@ def build_site_history(
     site_center: tuple[float, float],
     progress: Callable[[int, int, str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    *, grid_origin: tuple[float, float] | None = None,
 ) -> dict:
     from .history_cells import bin_history_recording
     from .reception import _coerce_record
@@ -217,7 +218,7 @@ def build_site_history(
                     source.verify_fingerprint(record)
                     with reader.csv(source) as (path, model, date_source):
                         log = load_log(path, reader.root)
-                        grids = bin_history_recording(log, site_center)
+                        grids = bin_history_recording(log, site_center, grid_origin=grid_origin)
                     if not grids["5"]:
                         raise SourceUnavailable("no_paired_reception")
                     logs.append({

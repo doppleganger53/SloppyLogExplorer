@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,14 @@ from PyQt6.QtQml import QJSEngine
 from PyQt6.QtWidgets import QApplication
 
 from sloppy_log_explorer.history_cells import bin_history_recording
+from sloppy_log_explorer.history_sources import build_site_history
 from sloppy_log_explorer.parser import load_log
-from sloppy_log_explorer.reception import build_reception_heatmap, index_log
+from sloppy_log_explorer.reception import (
+    EARTH_RADIUS_METERS,
+    build_reception_heatmap,
+    index_log,
+    reception_cell_key,
+)
 
 
 def test_both_grids_bin_original_paired_rows_like_the_heatmap(tmp_path: Path) -> None:
@@ -37,7 +44,45 @@ def test_both_grids_bin_original_paired_rows_like_the_heatmap(tmp_path: Path) ->
             ]
 
 
-def _model_result(script: str) -> dict:
+def test_history_filters_the_ten_kilometer_boundary_before_binning(tmp_path: Path) -> None:
+    center = (40.0, -75.0)
+    origin = (40.001, -75.0)
+    edge = center[0] + math.degrees(10_000 / EARTH_RADIUS_METERS)
+    outside = edge + math.degrees(0.01 / EARTH_RADIUS_METERS)
+    path = tmp_path / "edge.csv"
+    path.write_text(
+        "Date,Time,GPS Lat,GPS Lon,VFR(%)\n"
+        f"2025-01-01,10:00:00,{edge},-75,20\n"
+        f"2025-01-01,10:00:01,{outside},-75,80\n"
+    )
+    grids = bin_history_recording(load_log(path), center, grid_origin=origin)
+    for size in (2, 5):
+        key = reception_cell_key(edge, -75, origin, size)
+        assert key == reception_cell_key(outside, -75, origin, size)
+        assert grids[str(size)]["VFR(%)"] == [[*key, 20, 1]]
+
+
+def test_untimed_fixes_require_conclusive_speed_evidence_to_exclude(tmp_path: Path) -> None:
+    site = (40.0, -75.0)
+    path = tmp_path / "sparse-clock.csv"
+    # Local fixes at 0 and 1 s rule out a 10 km detour. A short detour fits
+    # between them. No elapsed-time bound exists at the ends or across a reset.
+    samples = [("", 40.03), (0, 40.0), ("", 40.045), ("", 40.0001), (1, 40.0),
+               ("", 40.02), (0, 40.0), (1, 40.0), ("", 40.01)]
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "".join(
+        f"{time},{latitude},-75,80\n" for time, latitude in samples
+    ))
+    grids = bin_history_recording(load_log(path), site)
+    for size in (2, 5):
+        cells = grids[str(size)]["VFR(%)"]
+        counts = {(x, y): count for x, y, _, count in cells}
+        assert counts == {
+            reception_cell_key(latitude, -75.0, site, size): n
+            for latitude, n in [(40.03, 1), (40.0, 4), (40.0001, 1), (40.02, 1), (40.01, 1)]
+        }
+
+
+def _model_result(script: str) -> dict | list:
     app = QApplication.instance() or QApplication([])
     engine = QJSEngine()
     model = Path(__file__).resolve().parents[1] / "sloppy_log_explorer/assets/history-model.js"
@@ -64,6 +109,45 @@ def _model_result(script: str) -> dict:
     assert not result.isError(), (result.toString(), result.property("lineNumber").toInt())
     assert app is not None
     return json.loads(result.toString())
+
+
+def test_rejected_fixes_leave_history_cells_colors_and_trends_unchanged(tmp_path: Path) -> None:
+    center = (40.0, -75.0)
+    origin = (40.001, -75.0)
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    header = "Date,Time,GPS Lat,GPS Lon,VFR(%)\n"
+    start = "2025-01-01,10:00:00,40,-75,20\n"
+    end = "2025-01-01,10:00:02,40,-75,60\n"
+    first.write_text(header + start + end)
+    second.write_text(header + "2025-01-02,10:00:00,40.0002,-75,80\n"
+                               "2025-01-02,10:00:01,40.0002,-75,80\n")
+
+    def views():
+        records = [index_log(path, tmp_path) for path in (first, second)]
+        payload = build_site_history(records, center, grid_origin=origin)
+        assert payload["counts"] == {"included": 2}
+        return _model_result("const actual = new ReceptionHistoryModel(" + json.dumps(payload) + """);
+            JSON.stringify([2, 5].map(cellSize => {
+                const view = actual.prepare({channel: "VFR(%)", cellSize, history: true});
+                return {range: view.range, trend: view.series(), cells: Array.from(view.frameAt(1).values())};
+            }));
+        """)
+
+    baseline = views()
+    for size, view in zip((2, 5), baseline):
+        carried, current = sorted(view["cells"], key=lambda cell: cell["lastSeen"])
+        assert carried["carried"] and (carried["value"], carried["samples"]) == (40, 2)
+        assert (carried["x"], carried["y"]) == reception_cell_key(*center, origin, size)
+        assert not current["carried"] and (current["value"], current["samples"]) == (80, 2)
+        assert view["range"] == [42, 78]
+        assert view["trend"] == [{"name": "VFR(%)", "points": [40, 44]}]
+
+    # The first stray implies >300 mph. The second is reachable in two minutes
+    # and inside the origin's radius, but beyond 10 km from the current site.
+    first.write_text(header + start + "2025-01-01,10:00:01,40.003,-75,99\n" + end
+                     + "2025-01-01,10:02:00,40.0903,-75,1\n")
+    assert views() == baseline
 
 
 @pytest.mark.parametrize(("values", "expected"), [

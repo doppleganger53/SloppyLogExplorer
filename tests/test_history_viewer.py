@@ -18,8 +18,7 @@ def test_history_viewer(tmp_path: Path) -> None:
 
 def run_viewer(tmp_path: Path) -> None:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QUrl
-    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtCore import QPoint, Qt
     from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
@@ -34,6 +33,7 @@ def run_viewer(tmp_path: Path) -> None:
     view.setPage(page)
     view.resize(900, 560)
     view.show()
+    check_fit_site(view, tmp_path)
     channel = "VFR 2.4G(%)"
     comparison = "VFR 900M(%)"
     aircraft = "</script> & aircraft"
@@ -55,18 +55,11 @@ def run_viewer(tmp_path: Path) -> None:
     with patch("sloppy_log_explorer.reception_history_renderer.build_basemap_config", return_value=config):
         html = build_reception_history_html({"logs": logs, "center": [39, -75], "basemap": "offline"})
     assert aircraft not in html
-    path = tmp_path / "view.html"
-    path.write_text(html, encoding="utf-8")
-    page.load(QUrl.fromLocalFile(str(path.resolve())))
+    open_document(view, tmp_path / "view.html", html)
 
     def js(expression):
         return _run_js(page, expression)
 
-    for _ in range(100):
-        _run_event_loop(50)
-        if js("window.sloppyReceptionMap?.getState().ready"):
-            break
-    assert js("window.sloppyReceptionMap?.getState().ready")
     check_basemaps(js, _run_event_loop, app.platformName() != "offscreen")
     if app.platformName() != "offscreen":
         return
@@ -84,15 +77,6 @@ def run_viewer(tmp_path: Path) -> None:
         return QPoint(round(rect[0] + rect[2] * fraction), round(rect[1]))
 
     surface = view.focusProxy()
-    def move_pointer(point, buttons):
-        # Target the offscreen browser surface directly. OS cursor moves can
-        # land in another window while this test runs in the desktop suite.
-        event = QMouseEvent(
-            QEvent.Type.MouseMove, QPointF(point), QPointF(surface.mapToGlobal(point)),
-            Qt.MouseButton.NoButton, buttons, Qt.KeyboardModifier.NoModifier,
-        )
-        QApplication.sendEvent(surface, event)
-
     def wait_for_position(low, high):
         for _ in range(50):
             _run_event_loop(40)
@@ -102,15 +86,15 @@ def run_viewer(tmp_path: Path) -> None:
         raise AssertionError(f"Expected position between {low} and {high}, got {position}")
 
     QTest.mousePress(surface, Qt.MouseButton.LeftButton, pos=control_point("scrub", .15))
-    move_pointer(control_point("scrub", .7), Qt.MouseButton.LeftButton)
+    move_pointer(surface, control_point("scrub", .7), Qt.MouseButton.LeftButton)
     forward = wait_for_position(1, 2)
-    move_pointer(control_point("scrub", .25), Qt.MouseButton.LeftButton)
+    move_pointer(surface, control_point("scrub", .25), Qt.MouseButton.LeftButton)
     wait_for_position(0, forward)
     QTest.mouseRelease(surface, Qt.MouseButton.LeftButton, pos=control_point("scrub", .25))
 
     # The earlier two dates are weeks apart; September is eight months away.
     QTest.mousePress(surface, Qt.MouseButton.LeftButton, pos=control_point("chart", .08))
-    move_pointer(control_point("chart", .35), Qt.MouseButton.LeftButton)
+    move_pointer(surface, control_point("chart", .35), Qt.MouseButton.LeftButton)
     wait_for_position(1, 2)
     QTest.mouseRelease(surface, Qt.MouseButton.LeftButton, pos=control_point("chart", .35))
 
@@ -123,7 +107,7 @@ def run_viewer(tmp_path: Path) -> None:
         return [r.x+r.width/2-centerX*scale, r.y+r.height/2+centerY*scale];
     })()""")
     point = QPoint(round(coords[0]), round(coords[1]))
-    move_pointer(point, Qt.MouseButton.NoButton)
+    move_pointer(surface, point, Qt.MouseButton.NoButton)
     for _ in range(20):
         _run_event_loop(40)
         tooltip = js("$('maptip').textContent")
@@ -166,6 +150,96 @@ def run_viewer(tmp_path: Path) -> None:
     assert js("prepared.chartPeriods.length") == 2
     assert js("prepared.frameAt(0).has('0,0')") is False
     assert js("$('frame-label').textContent") == "2024-09-01"
+
+
+def open_document(view, path: Path, html: str) -> None:
+    from PyQt6.QtCore import QUrl
+    from PyQt6.QtTest import QSignalSpy, QTest
+    from tools.validate_gps_map_runtime import _run_js
+
+    path.write_text(html, encoding="utf-8")
+    loaded = QSignalSpy(view.loadFinished)
+    view.load(QUrl.fromLocalFile(str(path.resolve())))
+    assert loaded.wait(10_000) and loaded[0][0]
+    for _ in range(100):
+        if _run_js(view.page(), "window.sloppyReceptionMap?.getState().ready"):
+            return
+        QTest.qWait(50)
+    raise AssertionError(f"History viewer did not become ready for {path.name}")
+
+
+def move_pointer(surface, point, buttons) -> None:
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+    from PyQt6.QtWidgets import QApplication
+
+    # Target the browser surface directly. OS cursor moves can land in
+    # another window while this test runs in the desktop suite.
+    event = QMouseEvent(
+        QEvent.Type.MouseMove, QPointF(point), QPointF(surface.mapToGlobal(point)),
+        Qt.MouseButton.NoButton, buttons, Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(surface, event)
+
+
+def check_fit_site(view, tmp_path: Path) -> None:
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from sloppy_log_explorer.history_sources import build_site_history
+    from sloppy_log_explorer.reception import index_log
+    from sloppy_log_explorer.reception_history_renderer import build_reception_history_html
+    from tools.validate_gps_map_runtime import _run_js
+
+    center, origin = (40, -75), (40.009, -75)
+    local = ["12:00:00,40,-75,70", "12:00:01,40.0002,-74.9998,74",
+             "12:00:02,40.0004,-74.9996,78", "12:00:04,40.0006,-74.9994,82"]
+    # The first stray requires an impossible jump. The second is reachable
+    # at the recorded time but is over 10 km from the current site center.
+    strays = ["12:00:03,40.01,-75,0", "12:04:00,40.0915,-75,0"]
+
+    def js(code):
+        return _run_js(view.page(), code)
+
+    def midpoint(element):
+        x, y = js(f"(() => {{ const r = $('{element}').getBoundingClientRect(); "
+                  "return [r.x + r.width / 2, r.y + r.height / 2]; })()")
+        return QPoint(round(x), round(y))
+
+    def wait_for_camera(matches):
+        for _ in range(60):
+            camera = js("sloppyReceptionMap.getState().camera")
+            if matches(camera):
+                return
+            QTest.qWait(20)
+        raise AssertionError(f"Camera did not reach the expected position: {camera}")
+
+    cameras = []
+    for name, rows in (("local", local), ("with-strays", sorted(local + strays))):
+        path = tmp_path / f"{name}.csv"
+        path.write_text("Date,Time,GPS Lat,GPS Lon,VFR(%)\n" +
+                        "".join(f"2025-01-01,{row}\n" for row in rows), encoding="utf-8")
+        payload = build_site_history([index_log(path, tmp_path)], center, grid_origin=origin)
+        html = build_reception_history_html({**payload, "center": origin, "basemap": "offline"})
+        open_document(view, tmp_path / f"{name}.html", html)
+        state = js("sloppyReceptionMap.getState()")
+        assert state["cellCount"] == len(local)
+        opening = state["camera"]
+        assert 0 < js("mapCanvas.clientHeight") / opening["scale"] < 200
+        cameras.append(opening)
+
+        start = midpoint("map")
+        end = start + QPoint(65, 35)
+        surface = view.focusProxy()
+        QTest.mousePress(surface, Qt.MouseButton.LeftButton, pos=start)
+        move_pointer(surface, end, Qt.MouseButton.LeftButton)
+        QTest.mouseRelease(surface, Qt.MouseButton.LeftButton, pos=end)
+        wait_for_camera(lambda p: p["x"] != opening["x"] and p["y"] != opening["y"])
+        QTest.mouseClick(surface, Qt.MouseButton.LeftButton, pos=midpoint("zoom-out"))
+        wait_for_camera(lambda p: p["scale"] < opening["scale"])
+        QTest.mouseClick(surface, Qt.MouseButton.LeftButton, pos=midpoint("fit"))
+        wait_for_camera(lambda p: p == opening)
+    assert cameras[0] == cameras[1]
+
 
 def check_basemaps(js, run_event_loop, native: bool) -> None:
     # The native controls can change opacity before the first online basemap opens.

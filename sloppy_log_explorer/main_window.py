@@ -956,11 +956,12 @@ class MainWindow(QMainWindow):
             self._invalidate_reception_heatmap("No indexed flying sites are available.")
             return
         records = site["records"]
-        center = (site["grid_latitude"], site["grid_longitude"])
+        site_center = (site["center_latitude"], site["center_longitude"])
+        grid_origin = (site["grid_latitude"], site["grid_longitude"])
         # A completed index refresh also fires site_changed when nothing changed.
         # Leave the live timeline, camera and pinned cell in place in that case.
         signature = (
-            self.library_root, site["id"], center,
+            self.library_root, site["id"], site_center, grid_origin,
             tuple((r["file_path"], r["file_size"], r["mtime_ns"], r["content_hash"]) for r in records),
         )
         if signature == self._history_site_signature:
@@ -972,8 +973,10 @@ class MainWindow(QMainWindow):
         def work(progress, is_cancelled):
             from .history_sources import build_site_history
 
-            result = build_site_history(records, center, progress=progress, is_cancelled=is_cancelled)
-            return {**result, "kind": "history", "center": center}
+            result = build_site_history(
+                records, site_center, grid_origin=grid_origin, progress=progress, is_cancelled=is_cancelled,
+            )
+            return {**result, "kind": "history", "center": grid_origin}
 
         self._start_reception_build(work, len(records), "Preparing reception history")
 
