@@ -6,6 +6,7 @@ All notable changes to Sloppy Log Explorer are documented in this file.
 
 ### Added
 
+- Add daily and monthly reception history with a scrubbable map and pinned cell trends (#51). Both HeatMap views share the selected basemap, support automatic or manual gradient limits, and offer 5 m and 2 m grids (#53–55).
 - Archive reviewed non-flight recordings in bulk and open a flight's source telemetry from its maintained log row (#45, #46).
 - Share a bounded local imagery tile cache between Flight Map and HeatMap (#48).
 - Add a Flight Logs workspace for selecting aircraft, reviewing detected flights, maintaining chronological Markdown logs, editing pilot notes, and exporting CSV tables (#42).

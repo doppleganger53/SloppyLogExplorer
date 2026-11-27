@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import monotonic
 
 from PyQt6.QtCore import QDate
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 
@@ -259,6 +261,7 @@ def test_reception_tab_groups_indexed_channels_and_configures_normalization(
             "cells": [],
             "value_min": 0.1,
             "value_max": 10.0,
+            "auto_color_range": (1.0, 8.0),
             "normalization_mode": "ratio",
             "reference_range_min": 5.0,
             "reference_range_max": 1_000.0,
@@ -267,6 +270,7 @@ def test_reception_tab_groups_indexed_channels_and_configures_normalization(
         },
     )
     assert window.reception_reference_min_spin.value() == 5.0
+    assert (window.reception_min_spin.value(), window.reception_max_spin.value()) == (1.0, 8.0)
     assert window.reception_reference_max_spin.value() == 1_000.0
     assert window._reception_heatmap_generation == generation
 
@@ -308,6 +312,9 @@ def test_reception_tab_groups_indexed_channels_and_configures_normalization(
     assert window._reception_map_payload["range_min"] == 2.0
     assert window._reception_map_payload["range_max"] == 85.0
     assert window._reception_map_payload["reverse"] is True
+    window._reception_map_payload["auto_color_range"] = (1, 8)
+    window.reception_auto_range_check.setChecked(True)
+    assert color_updates[-1] == (True, 1.0, 8.0, True)
     assert window._reception_heatmap_generation == heatmap_generation
     window.close()
     app.quit()
@@ -320,12 +327,12 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from sloppy_log_explorer.main_window import MainWindow
 
-    starts: list[tuple[Path | None, list[str]]] = []
+    starts: list[tuple[Path | None, list[str], bool]] = []
     monkeypatch.setattr(
         MainWindow,
         "start_reception_scan",
-        lambda self, *_args: starts.append(
-            (self.library_root, [log.name for log in self.library_logs])
+        lambda self, *, retry_io_errors=False: starts.append(
+            (self.library_root, [log.name for log in self.library_logs], retry_io_errors)
         ),
     )
     app = QApplication.instance() or QApplication([])
@@ -337,14 +344,14 @@ def test_opening_library_starts_reception_scan_without_changing_metadata_scan(
     window.load_library(root)
 
     assert len(window.library_logs) == 1
-    assert starts == [(root, ["flight.csv"])]
+    assert starts == [(root, ["flight.csv"], False)]
     assert window.reception_scan_refresh_button.isEnabled()
 
     (root / "new-flight.log").write_text("also metadata only", encoding="utf-8")
     window.reception_scan_refresh_button.click()
 
     assert [log.name for log in window.library_logs] == ["flight.csv", "new-flight.log"]
-    assert starts[-1] == (root, ["flight.csv", "new-flight.log"])
+    assert starts[-1] == (root, ["flight.csv", "new-flight.log"], True)
     assert window._reception_view_loaded is False
     window.tabs.setCurrentWidget(window.reception_tab)
     assert window._reception_view_loaded is True
@@ -463,6 +470,58 @@ def test_reception_site_selector_sorts_display_names_case_insensitively(
     assert window.reception_site_combo.currentData() == renamed_site_id
     window.close()
     app.quit()
+
+
+def test_combined_heatmap_rebins_original_samples_with_selected_grid(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPDATA", str(tmp_path / "settings"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from sloppy_log_explorer.main_window import MainWindow
+
+    library = tmp_path / "library"
+    library.mkdir()
+    for day in ("2026-04-01", "2026-04-02"):
+        (library / f"Glider-{day}.csv").write_text(
+            "Date,Time,GPS Lat,GPS Lon,VFR(%)\n"
+            f"{day},12:00:00,39.999984,-75,40\n"
+            f"{day},12:00:01,40.000016,-75,80\n",
+            encoding="utf-8",
+        )
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+
+    def wait_for_workers():
+        deadline = monotonic() + 15
+        while window._reception_tasks:
+            assert monotonic() < deadline, window.reception_result_status.text()
+            QTest.qWait(10)
+
+    try:
+        window.load_library(library)
+        wait_for_workers()
+        window.tabs.setCurrentWidget(window.reception_tab)
+        grid = window.reception_grid_combo
+        assert grid.currentData() == 5
+        original = None
+        for size, expected_values in ((5, [60]), (2, [40, 80]), (5, [60])):
+            grid.setCurrentIndex(grid.findData(size))
+            assert window._reception_map_payload is None
+            window.reception_generate_button.click()
+            assert f"{size} m" in window.reception_result_status.text()
+            wait_for_workers()
+            payload = window._reception_map_payload
+            assert payload["cell_size_m"] == size
+            assert f"observed {size} m cells" in window.reception_result_status.text()
+            assert payload["logs_used"] == 2
+            cells = payload["cells"]
+            assert sum(cell["sample_count"] for cell in cells) == 4
+            assert all(cell["flight_count"] == 2 for cell in cells)
+            assert sorted(cell["value"] for cell in cells) == expected_values
+            if original is None:
+                original = cells
+            elif size == 5:
+                assert cells == original
+    finally:
+        window.close()
 
 
 def test_reception_filter_change_rejects_a_queued_stale_heatmap(

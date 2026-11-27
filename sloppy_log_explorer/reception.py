@@ -7,19 +7,25 @@ import math
 import os
 import re
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
+from itertools import chain, groupby
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+from zipfile import BadZipFile
 
+import numpy as np
 import pandas as pd
 
+from .history_sources import READ_ERRORS, RecordingReader, RecordingSource, ScanCancelled, SourceUnavailable
 from .models import (
     DetectedSiteCluster,
     GpsColumns,
     LibraryLogInfo,
+    LoadedLog,
     RECEPTION_INDEX_VERSION,
     ReceptionCell,
     ReceptionLogRecord,
@@ -36,13 +42,13 @@ from .parser import (
     _detect_time,
     _has_coordinate_name_hint,
     _has_date_header,
+    _has_time_header,
     _has_position_header_hint,
     _numeric_columns,
     _parse_coordinate_text,
     _validate_table_structure,
     detect_gps_columns,
     load_log,
-    relative_seconds,
 )
 from .plotting import (
     GpsCandidate,
@@ -60,6 +66,9 @@ GPS_PROBE_RECORDS = 200
 SITE_TOLERANCE_KM = 2.0
 DEFAULT_CELL_SIZE_METERS = 5.0
 HEATMAP_SITE_RADIUS_KM = 10.0
+_MAX_GROUND_SPEED_KM_S = 300.0 * 1.609344 / 3600.0
+# Allow floating-point roundoff at the inclusive distance and speed boundaries.
+_DISTANCE_ROUNDOFF_KM = 1e-11
 EARTH_RADIUS_METERS = 6_371_008.8
 VIEWPORT_MAX_RADIUS_METERS = 2_000.0
 _VIEWPORT_BUCKET_METERS = 250.0
@@ -108,10 +117,6 @@ def telemetry_group_columns(channels: Iterable[str], logical_name: str) -> tuple
         if channel == logical_name or (match is not None and match.group("base") == logical_name):
             resolved.append(channel)
     return tuple(dict.fromkeys(resolved))
-
-
-class _ReceptionScanCancelled(RuntimeError):
-    """Stop an in-progress file scan without caching a partial record."""
 
 
 def _canonical_path(path: str | Path) -> str:
@@ -206,7 +211,7 @@ def _sampled_csv(
         resolved_position_index = 0
         for row in reader:
             if is_cancelled is not None and is_cancelled():
-                raise _ReceptionScanCancelled
+                raise ScanCancelled
             if not row:
                 continue
             if record_limit is not None and data_index >= record_limit:
@@ -378,50 +383,38 @@ def _trustworthy_flight_date(
     return datetime.fromtimestamp(modified).date(), True
 
 
+GpsRow = tuple[int, float, float]  # dataframe position, latitude, longitude
+
+
+def _gps_rows(
+    dataframe: pd.DataFrame,
+    latitude_column: str,
+    longitude_column: str,
+) -> Iterable[GpsRow]:
+    latitudes = _coerce_numeric_series(dataframe[latitude_column]).to_numpy(dtype=float, na_value=np.nan)
+    longitudes = _coerce_numeric_series(dataframe[longitude_column]).to_numpy(dtype=float, na_value=np.nan)
+    for index in np.flatnonzero((np.abs(latitudes) <= 90.0) & (np.abs(longitudes) <= 180.0)):
+        lat, lon = float(latitudes[index]), float(longitudes[index])
+        if not _is_origin_placeholder(lat, lon):
+            yield int(index), lat, lon
+
+
 def _valid_gps_candidates(
     dataframe: pd.DataFrame,
     latitude_column: str,
     longitude_column: str,
     *,
     time_values: Sequence[object] | None = None,
-    elapsed_values: Sequence[float] | None = None,
-    value_column: str | None = None,
-    value_values: Sequence[object] | pd.Series | None = None,
 ) -> list[GpsCandidate]:
-    if value_column is not None and value_values is not None:
-        raise ValueError("provide value_column or value_values, not both")
-    latitude = _coerce_numeric_series(dataframe[latitude_column])
-    longitude = _coerce_numeric_series(dataframe[longitude_column])
-    if value_column is not None:
-        values = _coerce_numeric_series(dataframe[value_column])
-    elif value_values is not None:
-        raw_values = value_values if isinstance(value_values, pd.Series) else pd.Series(list(value_values))
-        values = _coerce_numeric_series(raw_values).reset_index(drop=True)
-    else:
-        values = None
-    # Iterate positional arrays once instead of constructing several pandas
-    # scalar indexers for every GPS sample in full-length flight logs.
-    latitude_values = latitude.to_numpy()
-    longitude_values = longitude.to_numpy()
-    numeric_values = values.to_numpy() if values is not None else None
     candidates: list[GpsCandidate] = []
-    for index in range(len(dataframe)):
-        lat = _coerce_float(latitude_values[index])
-        lon = _coerce_float(longitude_values[index])
-        if lat is None or lon is None or not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-            continue
-        if _is_origin_placeholder(lat, lon):
-            continue
-        value = _coerce_float(numeric_values[index]) if numeric_values is not None else None
+    for index, lat, lon in _gps_rows(dataframe, latitude_column, longitude_column):
         point: GpsPoint = {
             "lat": lat,
             "lon": lon,
             "alt": 0.0,
             "row": index + 1,
-            "elapsedSeconds": (
-                float(elapsed_values[index]) if elapsed_values is not None and index < len(elapsed_values) else float(index)
-            ),
-            "value": value,
+            "elapsedSeconds": float(index),
+            "value": None,
         }
         point_time: object = time_values[index] if time_values is not None and index < len(time_values) else None
         candidates.append((point, point_time))
@@ -452,6 +445,337 @@ def _haversine_km(left_lat: float, left_lon: float, right_lat: float, right_lon:
     delta_lambda = math.radians(right_lon - left_lon)
     value = math.sin(delta_phi / 2.0) ** 2 + math.cos(left_phi) * math.cos(right_phi) * math.sin(delta_lambda / 2.0) ** 2
     return (2.0 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(value)))) / 1000.0
+
+
+def _remove_unreachable_holds(
+    groups: list[list[GpsRow]], accepted: set[int], seconds: np.ndarray, tick_seconds: np.ndarray,
+) -> set[int]:
+    """Reject a held position when only the time spent repeating it made it reachable."""
+    rejected: set[int] = set()
+    for i, group in enumerate(groups):
+        if len(group) < 2:
+            continue
+        kept = [row[0] for row in group if row[0] in accepted]
+        if not kept or len(kept) == len(group):
+            continue
+
+        # A logger can repeat the previous GPS update while awaiting the next.
+        # Give each neighboring position its entire reporting interval. If even
+        # one side supports the movement, the held position remains ambiguous.
+        before_group = groups[i - 1] if i else []
+        after_group = groups[i + 1] if i + 1 < len(groups) else []
+        if any(side and not any(row[0] in accepted for row in side) for side in (before_group, after_group)):
+            continue
+        legs = []
+        if before_group:
+            legs.append((before_group[0], group[0]))
+        if after_group:
+            legs.append((group[-1], after_group[-1]))
+        # Silence between reports may indicate a genuine GPS reacquisition.
+        # Treat such a gap as available travel time, unlike uninterrupted
+        # repeats of an already rejected fix.
+        longest_gap = max(seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]]
+                          for left, right in zip(group, group[1:]))
+        detour = 0.0
+        for left, right in legs:
+            travel_time = max(longest_gap, seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]])
+            distance = _haversine_km(*left[1:], *right[1:])
+            if distance <= travel_time * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+                break
+            detour += distance
+        else:
+            if len(legs) == 2:
+                # Even if both transitions jumped too quickly, the plane
+                # might have visited the held position during the interval.
+                # Exclude it only when the neighbors support a continuous
+                # flight and the shortest route via this fix cannot fit.
+                before, after = legs[0][0], legs[1][1]
+                elapsed = seconds[after[0]] - seconds[before[0]] + tick_seconds[after[0]]
+                available = elapsed * _MAX_GROUND_SPEED_KM_S
+                direct = _haversine_km(*before[1:], *after[1:])
+                if direct > available + _DISTANCE_ROUNDOFF_KM or detour <= available + _DISTANCE_ROUNDOFF_KM:
+                    continue
+            rejected.update(kept)
+    return rejected
+
+
+def _check_gps_updates(
+    rows: list[GpsRow], retained: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray,
+) -> list[GpsRow]:
+    """Distinguish a fresh receiver position from the telemetry rows repeating it."""
+    groups = [list(group) for _, group in groupby(rows, key=lambda row: row[1:])]
+    accepted = {row[0] for row in retained}
+    rejected_holds = _remove_unreachable_holds(groups, accepted, seconds, tick_seconds)
+    accepted -= rejected_holds
+
+    # Each run uses the time when the receiver actually supplied a different
+    # position. Intermediate telemetry rows may simply repeat the last fix.
+    firsts = [group[0] for group in groups]
+    anchored = [any(row[0] in accepted for row in group) for group in groups]
+
+    def travel_margin(left: GpsRow, right: GpsRow) -> float:
+        elapsed = seconds[right[0]] - seconds[left[0]]
+        distance = _haversine_km(*left[1:], *right[1:])
+        return elapsed * _MAX_GROUND_SPEED_KM_S - distance
+
+    # A tied timestamp can spend part of the following clock tick. Keep the
+    # row-level result there until the later movement leaves that time free.
+    starts = [0]
+    clock_debt = 0.0
+    fresh_moves = []
+    protected = {i for i, group in enumerate(groups) if any(row[0] in rejected_holds for row in group)}
+    for i, (left, right) in enumerate(zip(firsts, firsts[1:]), 1):
+        margin = travel_margin(left, right)
+        fresh_moves.append(margin >= -_DISTANCE_ROUNDOFF_KM and seconds[left[0]] < seconds[right[0]])
+        if margin >= 0 and len(groups[i - 1]) > 1:
+            # A held position is not proof the aircraft moved throughout a
+            # prolonged pause in GPS updates. Credit the gap in observations
+            # or the neighboring update periods, whichever is longer.
+            prior_period = seconds[left[0]] - seconds[firsts[i - 2][0]] if i > 1 else 0.0
+            next_period = seconds[firsts[i + 1][0]] - seconds[right[0]] if i + 1 < len(groups) else 0.0
+            gap = seconds[right[0]] - seconds[groups[i - 1][-1][0]]
+            excess = seconds[right[0]] - seconds[left[0]] - max(gap, prior_period + next_period)
+            margin -= max(0.0, excess) * _MAX_GROUND_SPEED_KM_S
+        if seconds[left[0]] == seconds[right[0]]:
+            clock_debt = max(tick_seconds[left[0]], tick_seconds[right[0]]) * _MAX_GROUND_SPEED_KM_S
+            protected.update((i - 1, i))
+            starts.append(i)
+        elif margin + _DISTANCE_ROUNDOFF_KM < clock_debt:
+            if clock_debt > 0:
+                protected.add(i)
+            clock_debt = max(0.0, clock_debt - max(0.0, margin))
+            starts.append(i)
+        else:
+            clock_debt = 0.0
+
+    anchors = iter(i for i, present in enumerate(anchored) if present)
+    following = next(anchors, None)
+    previous = None
+    restore = set()
+    for start, stop in zip(starts, [*starts[1:], len(groups)]):
+        prior = previous
+        while following is not None and following < stop:
+            previous = following
+            following = next(anchors, None)
+        if stop - start < 3:
+            continue
+        # Require evidence beyond the two movements around a suspect fix:
+        # the run contains an already trusted movement, or it reconnects at
+        # one end to a trusted fix outside the run. Either direction matters
+        # when a bad preceding observation would otherwise hide real flight.
+        # A long outage can make even a receiver drifting kilometres away
+        # appear reachable. A bridge cannot corroborate a new track when it
+        # covers more time than the observed track itself.
+        duration = seconds[firsts[stop - 1][0]] - seconds[firsts[start][0]]
+        joins_before = (prior is not None
+                        and seconds[firsts[start][0]] - seconds[firsts[prior][0]] <= duration
+                        and travel_margin(firsts[prior], firsts[start]) >= -_DISTANCE_ROUNDOFF_KM)
+        joins_after = (following is not None
+                       and seconds[firsts[following][0]] - seconds[firsts[stop - 1][0]] <= duration
+                       and travel_margin(firsts[stop - 1], firsts[following]) >= -_DISTANCE_ROUNDOFF_KM)
+        supported = [i for i in range(start, stop) if anchored[i]]
+        if joins_before or joins_after:
+            restore.update(range(start, stop))
+        elif len(supported) >= 3 and any(b == a + 1 for a, b in zip(supported, supported[1:])):
+            # A handful of trusted fixes at the beginning of acquisition
+            # confirms the portion between them, not an extrapolated tail.
+            if len(supported) > (stop - start) / 2:
+                restore.update(range(start, stop))
+            else:
+                restore.update(range(supported[0], supported[-1] + 1))
+
+    # A disputed endpoint should not veto an interior update with two
+    # physically plausible fresh movements on either side. Include it as a
+    # candidate when there is a retained anchor on both sides.
+    def splice(*, allow_endpoints: bool) -> None:
+        mandatory = [next((row for row in group if row[0] in accepted), None) for group in groups]
+        anchors = iter(i for i, row in enumerate(mandatory) if row is not None)
+        following = next(anchors, None)
+        previous = None
+        clock_debt = 0.0
+        for i, group in enumerate(groups):
+            known = mandatory[i]
+            right = mandatory[following] if following is not None else None
+            bracketed = (previous is not None and right is not None and 2 <= i < len(groups) - 2
+                         and all(fresh_moves[i - 2:i + 2]))
+            arrival = known
+            # Splice into one feasible trajectory. The previous fix may itself
+            # have been restored. Keep enough time to reach the next mandatory
+            # fix at its original first accepted report, even when nearby runs
+            # disagree. Earlier duplicate reports must satisfy the same bounds.
+            two_sided = 0 < i < len(groups) - 1 and fresh_moves[i - 1] and fresh_moves[i]
+            if ((two_sided or allow_endpoints) and (i in restore or bracketed)
+                    and i not in protected and clock_debt <= _DISTANCE_ROUNDOFF_KM):
+                for j, candidate in enumerate(group):
+                    if known is None and j:
+                        break  # Repeats alone cannot make a rejected arrival real.
+                    if previous is not None and travel_margin(previous, candidate) < -_DISTANCE_ROUNDOFF_KM:
+                        continue
+                    if right is not None and travel_margin(candidate, right) < -_DISTANCE_ROUNDOFF_KM:
+                        continue
+                    arrival = candidate
+                    accepted.update(row[0] for row in group[j:])
+                    break
+            if arrival is not None:
+                if previous is not None:
+                    clock_debt = max(0.0, clock_debt - travel_margin(previous, arrival))
+                previous = arrival
+            if known is not None:
+                following = next(anchors, None)
+
+    # An endpoint followed by an impossible jump is weaker evidence than an
+    # interior position supported on both sides. Only insert those endpoints
+    # after the better-supported path is fixed, under the same travel budget.
+    splice(allow_endpoints=False)
+    splice(allow_endpoints=True)
+    return [row for row in rows if row[0] in accepted]
+
+
+def _speed_checked_rows(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
+    """Follow a plausible track within one uninterrupted recording clock."""
+    if len(rows) < 2:
+        return rows
+
+    def advance(left: GpsRow, right: GpsRow, used_km: float) -> float | None:
+        elapsed = abs(seconds[right[0]] - seconds[left[0]])
+        distance = _haversine_km(left[1], left[2], right[1], right[2])
+        allowance = elapsed * _MAX_GROUND_SPEED_KM_S
+        if elapsed > 0 and distance > allowance + _DISTANCE_ROUNDOFF_KM:
+            return None
+        # Several fixes can share a whole-second timestamp. Travel within that
+        # tick consumes time that cannot be granted again on the next leg.
+        outstanding = max(0.0, used_km + distance - allowance)
+        if outstanding <= tick_seconds[right[0]] * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+            return outstanding
+        return None
+
+    # Anchor on the longest continuous plausible run. A bad first or last
+    # fix should not cause us to discard the genuine track beside it.
+    start = best_start = best_length = 0
+    used_km = 0.0
+    for index in range(1, len(rows)):
+        used = advance(rows[index - 1], rows[index], used_km)
+        if used is None:
+            start, used_km = index, 0.0
+        else:
+            used_km = used
+            if index - start > best_length:
+                best_start, best_length = start, index - start
+    if best_length == len(rows) - 1:
+        return rows
+
+    previous = rows[best_start]
+    prefix: list[GpsRow] = []
+    used_km = 0.0
+    for index in range(best_start - 1, -1, -1):
+        candidate = rows[index]
+        used = advance(previous, candidate, used_km)
+        if used is not None:
+            prefix.append(candidate)
+            previous, used_km = candidate, used
+
+    track = chain(reversed(prefix), rows[best_start:])
+    retained = [next(track)]
+    used_km = 0.0
+    for candidate in track:
+        used = advance(retained[-1], candidate, used_km)
+        if used is not None:
+            retained.append(candidate)
+            used_km = used
+    return _check_gps_updates(rows, retained, seconds, tick_seconds)
+
+
+def _filter_clock_segment(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
+    timed = [row for row in rows if math.isfinite(seconds[row[0]])]
+    track = _speed_checked_rows(timed, seconds, tick_seconds)
+    if len(timed) == len(rows):
+        return track
+
+    # Without a timestamp, a fix can still be ruled out when the shortest trip
+    # through it cannot fit between its two surviving, time-stamped neighbors.
+    anchors = iter(track)
+    left, right = None, next(anchors, None)
+    retained = []
+    for row in rows:
+        if row == right:
+            retained.append(row)
+            left, right = right, next(anchors, None)
+        elif not math.isfinite(seconds[row[0]]):
+            if left is not None and right is not None:
+                elapsed = seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]]
+                detour = _haversine_km(*left[1:], *row[1:]) + _haversine_km(*row[1:], *right[1:])
+                if detour > elapsed * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+                    continue
+            retained.append(row)
+    return retained
+
+
+def _clock_tick_seconds(log: LoadedLog) -> np.ndarray:
+    """Recover each displayed timestamp's precision independently of other fixes."""
+    assert log.time is not None
+    # A numeric elapsed-time column loses trailing zeroes in CSV parsing.
+    # Start from the decimal places in each actual parsed timestamp.
+    fraction_ns = (log.time.dt.microsecond.fillna(0).to_numpy(dtype=np.int64) * 1000
+                   + log.time.dt.nanosecond.fillna(0).to_numpy(dtype=np.int64))
+    precision = np.ones(len(log.time))
+    for places in range(1, 10):
+        precision[fraction_ns % (10 ** (10 - places)) != 0] = 10.0 ** -places
+    for column in log.timeline_columns:
+        raw = log.dataframe[column]
+        if pd.api.types.is_numeric_dtype(raw):
+            continue
+        if len(log.timeline_columns) > 1 and not _has_time_header(column):
+            continue
+        # A written clock such as 12:00:00.000 explicitly records milliseconds.
+        fraction = raw.astype("string").str.extract(r":\d{2}[.,](\d+)", expand=False).str.len()
+        written = fraction.notna().to_numpy(dtype=bool)
+        precision[written] = 10.0 ** -fraction[written].to_numpy(dtype=float)
+    return precision
+
+
+def heatmap_gps_rows(log: LoadedLog, site_center: tuple[float, float]) -> tuple[list[GpsRow], int]:
+    """Return site-local, speed-checked fixes and the count outside the site radius."""
+    gps = log.gps_columns
+    if gps is None:
+        return [], 0
+    local: list[GpsRow] = []
+    off_site_count = 0
+    for row in _gps_rows(log.dataframe, gps.latitude, gps.longitude):
+        if _haversine_km(*site_center, row[1], row[2]) <= HEATMAP_SITE_RADIUS_KM + _DISTANCE_ROUNDOFF_KM:
+            local.append(row)
+        else:
+            off_site_count += 1
+    if len(local) < 2 or log.time is None:
+        return local, off_site_count
+    local_indexes = [index for index, _lat, _lon in local]
+    timestamps = log.time.iloc[local_indexes].dropna()
+    if timestamps.empty:
+        return local, off_site_count
+    if log.timeline_columns and (timestamps == timestamps.dt.normalize()).all():
+        # "Timestamp" and "DateTime" can hold just a date. Distinguish an
+        # actual midnight clock (or numeric elapsed time) from a parsed date.
+        for column in log.timeline_columns:
+            raw = log.dataframe[column].iloc[local_indexes].dropna()
+            if raw.astype(str).str.contains(r"\d:\d{2}").any() or pd.to_numeric(raw, errors="coerce").notna().any():
+                break
+        else:
+            return local, off_site_count
+
+    seconds = (log.time - timestamps.iloc[0]).dt.total_seconds().to_numpy()
+    tick_seconds = _clock_tick_seconds(log)
+    start = 0
+    previous_time = -math.inf
+    retained: list[GpsRow] = []
+    for position, row in enumerate(local):
+        time = seconds[row[0]]
+        if not math.isfinite(time):
+            continue
+        if time < previous_time:
+            retained.extend(_filter_clock_segment(local[start:position], seconds, tick_seconds))
+            start = position
+        previous_time = time
+    retained.extend(_filter_clock_segment(local[start:], seconds, tick_seconds))
+    return retained, off_site_count
 
 
 def _site_local_gps_candidates(
@@ -521,7 +845,7 @@ def _file_metadata(path: Path) -> tuple[int, int, float]:
     return stat.st_size, stat.st_mtime_ns, stat.st_mtime
 
 
-def index_log(
+def _index_csv(
     path: str | Path,
     library_root: str | Path,
     sample_stride: int = SAMPLE_STRIDE,
@@ -664,7 +988,7 @@ def index_log(
             center_longitude,
             channels,
         )
-    except _ReceptionScanCancelled:
+    except ScanCancelled:
         raise
     except OSError as exc:
         status = "io_error"
@@ -688,6 +1012,50 @@ def index_log(
         (),
         message,
     )
+
+
+def _skipped_source(root: Path, source: RecordingSource, status: str, error: str = "") -> ReceptionLogRecord:
+    return ReceptionLogRecord(
+        root, source.path, source.size, source.mtime_ns, status,
+        datetime.fromtimestamp(source.modified).date(), True, None, None, (), error,
+    )
+
+
+def _index_source(
+    reader: RecordingReader, source: RecordingSource,
+    sample_stride: int, gps_probe_records: int = GPS_PROBE_RECORDS,
+) -> ReceptionLogRecord:
+    if source.error:
+        return _skipped_source(reader.root, source, "io_error", source.error)
+    try:
+        with reader.csv(source) as (csv_path, _, date_source):
+            record = _index_csv(csv_path, reader.root, sample_stride, gps_probe_records, reader.is_cancelled)
+        return replace(
+            record, file_path=source.path, file_size=source.size, mtime_ns=source.mtime_ns,
+            date_inferred=bool(date_source) or record.date_inferred,
+        )
+    except SourceUnavailable as exc:
+        return _skipped_source(reader.root, source, exc.status)
+    except READ_ERRORS as exc:
+        return _skipped_source(reader.root, source, "io_error", str(exc))
+
+
+def index_log(
+    path: str | Path, library_root: str | Path, sample_stride: int = SAMPLE_STRIDE,
+    gps_probe_records: int = GPS_PROBE_RECORDS, is_cancelled: CancellationCheck | None = None,
+) -> ReceptionLogRecord:
+    file_path = Path(path).resolve(strict=False)
+    root = Path(library_root).resolve(strict=False)
+    if file_path.suffix.lower() != ".tlm" and file_path.parent.suffix.lower() != ".zip":
+        return _index_csv(file_path, root, sample_stride, gps_probe_records, is_cancelled)
+    with closing(RecordingReader(root, is_cancelled)) as reader:
+        try:
+            source = reader.lookup(file_path)
+        except (OSError, ValueError, BadZipFile) as exc:
+            return ReceptionLogRecord(
+                root, file_path, 0, 0, "io_error", datetime.now().date(), True, None, None, (), str(exc),
+            )
+        return _index_source(reader, source, sample_stride, gps_probe_records)
 
 
 def _coerce_record(value: ReceptionLogRecord | Mapping[str, Any]) -> ReceptionLogRecord:
@@ -722,6 +1090,7 @@ def _coerce_record(value: ReceptionLogRecord | Mapping[str, Any]) -> ReceptionLo
         str(value.get("error") or value.get("error_message") or ""),
         int(value["site_id"]) if value.get("site_id") is not None else None,
         int(value.get("index_version") or 0),
+        str(value.get("content_hash") or ""),
     )
 
 
@@ -859,6 +1228,7 @@ def refresh_reception_index(
     sample_stride: int = SAMPLE_STRIDE,
     progress: ProgressCallback | None = None,
     is_cancelled: CancellationCheck | None = None,
+    retry_io_errors: bool = False,
 ) -> ReceptionScanResult:
     root = Path(library_root).resolve(strict=False)
     root_key = _canonical_path(root)
@@ -868,71 +1238,52 @@ def refresh_reception_index(
         for record in [_coerce_record(raw_record)]
         if _canonical_path(record.library_root) == root_key
     }
-    log_items = sorted(list(logs), key=lambda item: _canonical_path(item.path))
     records: list[ReceptionLogRecord] = []
-    scanned_count = 0
-    cached_count = 0
-    total = len(log_items)
-    for completed, item in enumerate(log_items, start=1):
-        if is_cancelled is not None and is_cancelled():
-            return ReceptionScanResult(
-                tuple(records),
-                tuple(cluster_reception_records(records)),
-                scanned_count,
-                cached_count,
-                sum(record.status in {"malformed", "io_error"} for record in records),
-                True,
-            )
-        path = Path(item.path)
-        metadata_from_library = False
+    scanned_count = cached_count = 0
+    cancelled = False
+    with closing(RecordingReader(root, is_cancelled)) as reader:
         try:
-            size, mtime_ns, _ = _file_metadata(path)
-        except OSError:
-            size, mtime_ns = int(item.size), int(float(item.modified) * 1_000_000_000)
-            metadata_from_library = True
-        existing = cached.get(_canonical_path(path))
-        if (
-            existing is not None
-            and existing.file_size == size
-            and existing.mtime_ns == mtime_ns
-            and (
-                existing.index_version == RECEPTION_INDEX_VERSION
-                or existing.status in {"malformed", "io_error"}
-            )
-        ):
-            record = existing
-            cached_count += 1
-        else:
-            try:
-                record = index_log(
-                    path,
-                    root,
-                    sample_stride=sample_stride,
-                    is_cancelled=is_cancelled,
+            sources = reader.inventory(logs)
+            sizes = Counter(source.size for source in sources)
+            seen_hashes: set[str] = set()
+            for index, source in enumerate(sources, 1):
+                reader.check_cancelled()
+                existing = cached.get(_canonical_path(source.path))
+                unchanged = (
+                    existing is not None
+                    and existing.file_size == source.size and existing.mtime_ns == source.mtime_ns
+                    and not (retry_io_errors and existing.status == "io_error")
+                    and (existing.index_version == RECEPTION_INDEX_VERSION
+                         or existing.status in {"malformed", "io_error"})
                 )
-            except _ReceptionScanCancelled:
-                return ReceptionScanResult(
-                    tuple(records),
-                    tuple(cluster_reception_records(records)),
-                    scanned_count,
-                    cached_count,
-                    sum(record.status in {"malformed", "io_error"} for record in records),
-                    True,
-                )
-            if metadata_from_library and record.status == "io_error":
-                # Preserve the last metadata fingerprint supplied by the
-                # library scan. Otherwise an inaccessible cloud placeholder
-                # would be stored as 0/0 and retried on every refresh despite
-                # remaining unchanged.
-                record = replace(record, file_size=size, mtime_ns=mtime_ns)
-            scanned_count += 1
-        records.append(record)
-        if progress is not None:
-            progress(completed, total, path.name)
+                digest = existing.content_hash if unchanged and existing is not None else ""
+                if sizes[source.size] > 1 and not source.error and not digest:
+                    try:
+                        digest = reader.digest(source)
+                    except READ_ERRORS:
+                        # Indexing below records a precise read failure.
+                        pass
+                duplicate = bool(digest and digest in seen_hashes)
+                if unchanged and existing is not None and (existing.status == "duplicate") == duplicate:
+                    record = existing
+                    cached_count += 1
+                elif duplicate:
+                    record = _skipped_source(root, source, "duplicate")
+                    scanned_count += 1
+                else:
+                    record = _index_source(reader, source, sample_stride)
+                    scanned_count += 1
+                if digest and record.status != "io_error":
+                    seen_hashes.add(digest)
+                records.append(replace(record, content_hash=digest))
+                if progress is not None:
+                    progress(index, len(sources), source.name)
+        except ScanCancelled:
+            cancelled = True
     clusters = cluster_reception_records(records, tolerance_km=SITE_TOLERANCE_KM)
     error_count = sum(record.status in {"malformed", "io_error"} for record in records)
     return ReceptionScanResult(
-        tuple(records), tuple(clusters), scanned_count, cached_count, error_count, False
+        tuple(records), tuple(clusters), scanned_count, cached_count, error_count, cancelled
     )
 
 
@@ -954,6 +1305,13 @@ def _local_lon_lat(x: float, y: float, center: tuple[float, float]) -> tuple[flo
     longitude_scale = max(1e-9, math.cos(math.radians(center_latitude)))
     longitude = center_longitude + math.degrees(x / (EARTH_RADIUS_METERS * longitude_scale))
     return longitude, latitude
+
+
+def reception_cell_key(latitude: float, longitude: float, center: tuple[float, float],
+                       cell_size: float) -> tuple[int, int]:
+    """Anchor the grid on the site, with its origin in the middle of a cell."""
+    x, y = _local_xy(latitude, longitude, center)
+    return math.floor((x + cell_size / 2) / cell_size), math.floor((y + cell_size / 2) / cell_size)
 
 
 def _telemetry_unit(column: str) -> str:
@@ -1013,12 +1371,20 @@ def _normalized_unit(source: str, reference: str | None, mode: str | None) -> st
     return ""
 
 
-def _reception_viewport_focus(
-    cell_points: Sequence[tuple[float, float, int, int]],
-    site_center: tuple[float, float],
+_ViewportPoint = tuple[float, float, int, int]  # east, north, paired samples, recordings
+
+
+class ViewportNeighborhood(NamedTuple):
+    center: tuple[float, float]
+    radius_m: float
+    cells: list[_ViewportPoint]
+
+
+def reception_viewport_neighborhood(
+    cell_points: Sequence[_ViewportPoint],
     radius_m: float = VIEWPORT_MAX_RADIUS_METERS,
-) -> dict[str, object] | None:
-    """Locate the densest observed sample neighborhood for the map camera."""
+) -> ViewportNeighborhood | None:
+    """Find the densest observed neighborhood for the map camera, in grid-local metres."""
     requested_radius = float(radius_m)
     if not math.isfinite(requested_radius) or requested_radius <= 0.0:
         raise ValueError("radius_m must be a positive finite number")
@@ -1116,7 +1482,7 @@ def _reception_viewport_focus(
     # count is the primary observation weight; flight count is retained for
     # diagnostics and deterministic secondary scoring above.
     focus_x, focus_y = best_center
-    members: list[tuple[float, float, int, int]] = []
+    members: list[_ViewportPoint] = []
     for _ in range(8):
         members = [
             point
@@ -1138,6 +1504,18 @@ def _reception_viewport_focus(
         for point in points
         if math.hypot(point[0] - focus_x, point[1] - focus_y) <= radius + 1e-9
     ] or members
+    return ViewportNeighborhood((focus_x, focus_y), radius, members)
+
+
+def _reception_viewport_focus(
+    cell_points: Sequence[_ViewportPoint],
+    site_center: tuple[float, float],
+    radius_m: float = VIEWPORT_MAX_RADIUS_METERS,
+) -> dict[str, object] | None:
+    neighborhood = reception_viewport_neighborhood(cell_points, radius_m)
+    if neighborhood is None:
+        return None
+    (focus_x, focus_y), radius, members = neighborhood
     focus_longitude, focus_latitude = _local_lon_lat(focus_x, focus_y, site_center)
     focus_longitude = ((focus_longitude + 180.0) % 360.0) - 180.0
     member_samples = sum(point[2] for point in members)
@@ -1157,6 +1535,15 @@ def _reception_viewport_focus(
         "flight_count": sum(point[3] for point in members),
         "rms_distance_m": rms_distance,
     }
+
+
+def reception_color_range(values: Sequence[float]) -> tuple[int, int]:
+    """Match the history gradient's rounded 5th and 95th percentiles."""
+    if not values:
+        return 0, 1
+    low, high = np.percentile(values, (5, 95))
+    minimum, maximum = math.floor(low), math.ceil(high)
+    return (minimum - 1, maximum + 1) if minimum == maximum else (minimum, maximum)
 
 
 def build_reception_heatmap(
@@ -1236,7 +1623,12 @@ def build_reception_heatmap(
                 progress(completed, total, record.file_path.name)
             continue
         try:
-            log = load_log(record.file_path, record.library_root)
+            with closing(RecordingReader(record.library_root, is_cancelled)) as reader:
+                source = reader.lookup(record.file_path)
+                if source.member is not None:
+                    source.verify_fingerprint(record)
+                with reader.csv(source) as (csv_path, _, _):
+                    log = load_log(csv_path, record.library_root)
             gps = log.gps_columns
             source_columns = telemetry_group_columns(log.dataframe.columns, telemetry_column)
             if gps is None or not source_columns:
@@ -1251,12 +1643,18 @@ def build_reception_heatmap(
                 if not reference_columns:
                     missing_reference_count += 1
                     continue
-            source_values = _row_median(log.dataframe, source_columns)
-            transformed_values = source_values.copy()
+            site_rows, off_site = heatmap_gps_rows(log, site_center)
+            off_site_sample_count += off_site
+            if not site_rows:
+                continue
+            row_indexes = [row for row, _lat, _lon in site_rows]
+            paired = log.dataframe.loc[:, [*source_columns, *reference_columns]].iloc[row_indexes]
+            source_values = _row_median(paired, source_columns)
+            transformed_values = source_values
             reference_values: pd.Series | None = None
-            clamped_mask = pd.Series(False, index=log.dataframe.index)
+            clamped_mask = pd.Series(False, index=paired.index)
             if reference_columns:
-                reference_values = _row_median(log.dataframe, reference_columns)
+                reference_values = _row_median(paired, reference_columns)
                 if normalization_mode == "ratio":
                     denominator = reference_values.copy()
                     if applied_reference_range is not None:
@@ -1284,61 +1682,19 @@ def build_reception_heatmap(
                             lambda value: math.log10(float(value)) if pd.notna(value) and float(value) > 0.0 else math.nan
                         )
                     ).where(valid)
-            candidates = _valid_gps_candidates(
-                log.dataframe,
-                gps.latitude,
-                gps.longitude,
-                time_values=list(log.time) if log.time is not None else None,
-                elapsed_values=relative_seconds(log),
-                value_values=transformed_values,
-            )
-            site_candidates = [
-                candidate
-                for candidate in candidates
-                if _haversine_km(
-                    site_center[0],
-                    site_center[1],
-                    float(candidate[0]["lat"]),
-                    float(candidate[0]["lon"]),
-                )
-                <= HEATMAP_SITE_RADIUS_KM
-            ]
-            off_site_sample_count += len(candidates) - len(site_candidates)
             if reference_values is not None:
-                for point, _ in site_candidates:
-                    row_index = int(point["row"]) - 1
-                    source_value = _coerce_float(source_values.iloc[row_index])
-                    if source_value is None:
-                        continue
-                    reference_value = _coerce_float(reference_values.iloc[row_index])
-                    if reference_value is not None:
-                        observed_reference_min = (
-                            reference_value
-                            if observed_reference_min is None
-                            else min(observed_reference_min, reference_value)
-                        )
-                        observed_reference_max = (
-                            reference_value
-                            if observed_reference_max is None
-                            else max(observed_reference_max, reference_value)
-                        )
-                    if _coerce_float(transformed_values.iloc[row_index]) is None:
-                        invalid_reference_sample_count += 1
-                    if bool(clamped_mask.iloc[row_index]):
-                        clamped_reference_sample_count += 1
+                observed = reference_values[source_values.notna()].dropna()
+                if not observed.empty:
+                    low, high = float(observed.min()), float(observed.max())
+                    observed_reference_min = low if observed_reference_min is None else min(low, observed_reference_min)
+                    observed_reference_max = high if observed_reference_max is None else max(high, observed_reference_max)
+                invalid_reference_sample_count += int((source_values.notna() & ~np.isfinite(transformed_values)).sum())
+                clamped_reference_sample_count += int((source_values.notna() & clamped_mask).sum())
             values_by_cell: dict[tuple[int, int], list[float]] = defaultdict(list)
-            for point, _ in site_candidates:
-                value = point.get("value")
-                if value is None or not math.isfinite(float(value)):
-                    continue
-                x, y = _local_xy(float(point["lat"]), float(point["lon"]), site_center)
-                # Anchor the local grid on the flying-site center so (0, 0)
-                # lies at the center of a cell rather than on four boundaries.
-                key = (
-                    math.floor((x + cell_size / 2.0) / cell_size),
-                    math.floor((y + cell_size / 2.0) / cell_size),
-                )
-                values_by_cell[key].append(float(value))
+            for (_, lat, lon), value in zip(site_rows, transformed_values.to_numpy(dtype=float, na_value=np.nan)):
+                if math.isfinite(value):
+                    key = reception_cell_key(lat, lon, site_center, cell_size)
+                    values_by_cell[key].append(float(value))
             if values_by_cell:
                 logs_used += 1
                 for key, values in values_by_cell.items():
@@ -1423,6 +1779,7 @@ def build_reception_heatmap(
         "reference_range_min": effective_reference_range[0] if effective_reference_range is not None else None,
         "reference_range_max": effective_reference_range[1] if effective_reference_range is not None else None,
         "cells": cell_payload,
+        "auto_color_range": reception_color_range(values),
         "value_min": min(values) if values else None,
         "value_max": max(values) if values else None,
         "cell_size_m": cell_size,

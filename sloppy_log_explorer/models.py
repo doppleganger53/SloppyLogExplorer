@@ -61,6 +61,7 @@ class ReceptionLogRecord:
     error: str = ""
     site_id: int | None = None
     index_version: int = RECEPTION_INDEX_VERSION
+    content_hash: str = ""
 
     @property
     def path(self) -> Path:

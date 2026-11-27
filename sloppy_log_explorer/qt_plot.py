@@ -718,7 +718,8 @@ class ReceptionMapWidget(QWidget):
                 opacity = fallback_opacity
             self.opacity = max(0.0, min(1.0, opacity))
             self.basemap = normalize_basemap(
-                self.payload.get("basemap", getattr(self, "basemap", BASEMAP_OPENSTREETMAP))
+                self.payload.get("basemap", getattr(self, "basemap", BASEMAP_OPENSTREETMAP)),
+                allow_offline=self.payload.get("kind") == "history",
             )
             self.imagery_opacity = clamp_imagery_opacity(
                 self.payload.get(
@@ -738,7 +739,12 @@ class ReceptionMapWidget(QWidget):
         if render_payload is not None:
             render_payload["basemap"] = self.basemap
             render_payload["imagery_opacity"] = self.imagery_opacity
-        html_document = build_reception_map_html(render_payload, dark=dark)
+        if render_payload is not None and render_payload.get("kind") == "history":
+            from .reception_history_renderer import build_reception_history_html
+
+            html_document = build_reception_history_html(render_payload, dark=dark)
+        else:
+            html_document = build_reception_map_html(render_payload, dark=dark)
         if self._web_engine:
             marker = (
                 "<script>window.sloppyReceptionRenderGeneration = "
@@ -835,7 +841,7 @@ class ReceptionMapWidget(QWidget):
         )
         ReceptionMapWidget.set_opacity(self, self.opacity)
         payload = self.payload
-        if payload is None:
+        if payload is None or payload.get("kind") == "history":
             return
         auto_range = payload.get("auto_range", True) is not False
         minimum_key = "value_min" if auto_range else "range_min"
@@ -859,7 +865,9 @@ class ReceptionMapWidget(QWidget):
 
     def set_basemap(self, basemap: str) -> None:
         """Switch the live reception basemap without rebuilding the heatmap."""
-        self.basemap = normalize_basemap(basemap)
+        self.basemap = normalize_basemap(
+            basemap, allow_offline=self.payload is not None and self.payload.get("kind") == "history"
+        )
         if self.payload is not None:
             self.payload["basemap"] = self.basemap
         if (

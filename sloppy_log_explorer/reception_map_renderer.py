@@ -11,6 +11,8 @@ from typing import Any
 
 from .imagery_tiles import IMAGERY_TILE_JAVASCRIPT
 from .map_basemaps import BASEMAP_RUNTIME_JAVASCRIPT, build_basemap_config
+from .plotting import _coerce_float
+from .reception import reception_color_range
 
 MAP_MAX_ZOOM = 22
 MAP_FIT_MAX_ZOOM = 17
@@ -134,6 +136,18 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     css_uri = html.escape(_asset_uri("maplibre-gl.css"), quote=True)
     js_uri = json.dumps(_asset_uri("maplibre-gl.mjs"))
     worker_uri_json = _json_for_script(_asset_uri("maplibre-gl-worker.mjs"))
+    auto_color_range = payload.get("auto_color_range")
+    if auto_color_range is None:
+        # Direct renderer callers can supply just the cells, including aliased headers.
+        values = []
+        for cell in cells:
+            if isinstance(cell, dict):
+                raw = next((cell[k] for k in ("value", "median", "telemetry_value", "telemetryValue")
+                            if cell.get(k) is not None), None)
+                value = _coerce_float(raw)
+                if value is not None:
+                    values.append(value)
+        auto_color_range = reception_color_range(values)
     data_json = _json_for_script(payload)
     basemap_config_json = _json_for_script(build_basemap_config(payload))
 
@@ -245,6 +259,7 @@ def build_reception_map_html(payload: dict[str, object] | None, dark: bool = Tru
     window.maplibregl = maplibregl;
     maplibregl.setWorkerUrl(__MAPLIBRE_WORKER_URI__);
     const receptionData = __RECEPTION_DATA__;
+    const [automaticMin, automaticMax] = __AUTO_COLOR_RANGE__;
     const basemapConfig = __BASEMAP_CONFIG__;
     const mapMaxZoom = 22;
     const fitMaxZoom = 17;
@@ -484,17 +499,6 @@ __BASEMAP_RUNTIME__
     }
 
     function valueRange() {
-      const values = featureCollection.features.map((feature) => feature.properties.value).filter(Number.isFinite);
-      let automaticMin = 0;
-      let automaticMax = 1;
-      if (values.length) {
-        automaticMin = values[0];
-        automaticMax = values[0];
-        for (let index = 1; index < values.length; index += 1) {
-          automaticMin = Math.min(automaticMin, values[index]);
-          automaticMax = Math.max(automaticMax, values[index]);
-        }
-      }
       const rangeObject = receptionData.range && typeof receptionData.range === "object" ? receptionData.range : {};
       const autoRange = firstValue(receptionData, ["auto_range", "autoRange"], true) !== false;
       let minimum = automaticMin;
@@ -970,6 +974,7 @@ __BASEMAP_RUNTIME__
         "__MAPLIBRE_JS_URI__": js_uri,
         "__MAPLIBRE_WORKER_URI__": worker_uri_json,
         "__RECEPTION_DATA__": data_json,
+        "__AUTO_COLOR_RANGE__": _json_for_script(auto_color_range),
         "__BASEMAP_CONFIG__": basemap_config_json,
         "__BASEMAP_RUNTIME__": BASEMAP_RUNTIME_JAVASCRIPT + IMAGERY_TILE_JAVASCRIPT,
         "__BACKGROUND__": background,

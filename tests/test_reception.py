@@ -7,11 +7,13 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import sloppy_log_explorer.reception as reception
 from sloppy_log_explorer.library import scan_library
 from sloppy_log_explorer.models import LibraryLogInfo, ReceptionLogRecord
+from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.reception import (
     build_reception_heatmap,
     cluster_reception_records,
@@ -951,3 +953,197 @@ def test_heatmap_removes_repeated_gps_dropouts_far_from_selected_site(tmp_path: 
     assert sum(cell["sample_count"] for cell in cells) == 2
     assert payload["off_site_sample_count"] == 2
     assert all(float(cell["latitude"]) > 39.0 for cell in cells)
+
+
+@pytest.mark.parametrize("size", [2, 5])
+def test_heatmap_radius_uses_unbinned_distance_and_retains_exact_boundary(tmp_path: Path, size: int):
+    center = (41.37, -74.59)
+    path = tmp_path / "edge.csv"
+
+    def latitude(metres):
+        return center[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)
+
+    # Both positions would round into the same cell. They have enough time
+    # between them for either position to be plausible at this speed.
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n"
+                    f"0,{latitude(10_000)},{center[1]},35\n"
+                    f"90,{latitude(10_000.01)},{center[1]},99\n")
+    payload = build_reception_heatmap([index_log(path, tmp_path)], "VFR(%)", center, size)
+    assert payload["off_site_sample_count"] == 1
+    assert [(cell["value"], cell["sample_count"]) for cell in payload["cells"]] == [(35, 1)]
+
+
+@pytest.mark.parametrize("size", [2, 5])
+def test_rejected_fixes_do_not_change_combined_normalization_or_colors(tmp_path: Path, size: int):
+    center = (39.75, -75.25)
+    path = tmp_path / "power.csv"
+    header = "Time,GPS Lat,GPS Lon,VFR(%),Power(mW)\n"
+    local = ["0,39.75,-75.25,80,0", "0,39.75005,-75.25,90,0",
+             "2,39.75000,-75.25,70,20", "3,39.75005,-75.25,90,20"]
+
+    def render(lines):
+        path.write_text(header + "\n".join(lines))
+        return build_reception_heatmap([index_log(path, tmp_path)], "VFR(%)", center, size,
+                                       reference_column="Power(mW)", normalization_mode="db_power")
+
+    baseline = render(local)
+    assert sum(cell["sample_count"] for cell in baseline["cells"]) == 4
+    assert baseline["reference_observed_max"] == 20
+    # A tiny power at either rejected position would alter zero-power normalization.
+    # The off-site fractional timestamp must not change the local clock precision.
+    dirty = render([*local[:2], "0.5,40.0,-75.25,10,1", "1.5,39.78,-75.25,5,2", *local[2:]])
+    assert dirty["off_site_sample_count"] == 1
+    for key in ("cells", "auto_color_range", "value_min", "value_max", "viewport_focus",
+                "reference_observed_min", "reference_observed_max", "invalid_reference_sample_count"):
+        assert dirty[key] == baseline[key]
+
+
+def test_speed_uses_logged_times_and_an_inclusive_300_mph_limit(tmp_path: Path):
+    site = (41.37, -74.59)
+    metres_per_second = 300.0 * 1609.344 / 3600.0
+
+    def latitude(metres):
+        return site[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)
+
+    path = tmp_path / "track.csv"
+    # Includes bad leading/trailing fixes, a two-fix dropout, a missing time,
+    # an exactly 300-mph segment, a 300+ segment, a gap and a clock reset.
+    samples = [(0, 3_000), (1, 0), (2, 0), (3, 1_900), (4, 1_901), (5, 0),
+               (6, metres_per_second), ("", 140), (7, 2 * metres_per_second + 0.01),
+               (80, 4_000), (0, -4_000), (1, -4_000), (2, 2_000)]
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{time},{latitude(metres)},{site[1]},90" for time, metres in samples))
+    rows, off_site = reception.heatmap_gps_rows(load_log(path), site)
+    assert [index for index, _lat, _lon in rows] == [1, 2, 5, 6, 7, 9, 10, 11]
+    assert off_site == 0
+
+
+def test_duplicate_times_have_one_travel_budget_and_date_only_has_none(tmp_path: Path):
+    site = (39.75, -75.25)
+    path = tmp_path / "ties.csv"
+    latitudes = [39.75, 39.75, 39.7509, 39.7518, 39.7509]
+    coordinates = [f"{latitude},-75.25,80" for latitude in latitudes]
+    for clock, stamp, expected in [
+        ("Time", "00:00:00", [0, 1, 2, 4]),
+        ("Time", "00:00:00.000", [0, 1]),
+        ("Time", "0", [0, 1, 2, 4]),
+        ("Date", "2026-04-01", list(range(5))),
+        ("Timestamp", "2026-04-01", list(range(5))),
+        ("DateTime", "2026-04-01", list(range(5))),
+    ]:
+        path.write_text(f"{clock},GPS Lat,GPS Lon,VFR(%)\n" +
+                        "\n".join(f"{stamp},{fix}" for fix in coordinates))
+        rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+        assert [index for index, _lat, _lon in rows] == expected
+
+
+def test_repeated_timestamps_cannot_claim_an_extra_second_at_each_transition(tmp_path: Path):
+    site = (41.37, -74.59)
+    path = tmp_path / "coarse.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{i // 2},{site[0] + math.degrees(i * 120 / reception.EARTH_RADIUS_METERS)},{site[1]},80"
+        for i in range(8)))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    # No start/end placement inside the four clock ticks allows all 840 m.
+    # Each retained stretch must fit even when a tick straddles two legs.
+    assert len(rows) >= 2
+    for i, (start, _lat, _lon) in enumerate(rows):
+        for end, _lat, _lon in rows[i + 1:]:
+            assert 120 * (end - start) <= (end // 2 - start // 2 + 1) * 134.112
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_repeated_rejected_fix_cannot_age_into_the_track(tmp_path: Path, reverse: bool):
+    site = (41.0, -75.0)
+    # A valid moving track, followed by a 4 km jump in a quarter-second.
+    # The receiver holds the bad position for 40 seconds, long enough to
+    # appear reachable when measured only against the last accepted time.
+    samples = [(i / 4, i) for i in range(100)]
+    samples += [(25 + i, 4_000) for i in range(41)]
+    if reverse:
+        samples = [(65 - time, metres) for time, metres in reversed(samples)]
+    path = tmp_path / "held-position.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{time},{site[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)},{site[1]},80"
+        for time, metres in samples))
+    rows, off_site = reception.heatmap_gps_rows(load_log(path), site)
+    assert [row for row, _, _ in rows] == [i for i, (_, metres) in enumerate(samples) if metres != 4_000]
+    assert off_site == 0
+
+
+def test_held_position_can_be_reacquired_after_a_real_recording_gap(tmp_path: Path):
+    site = (41.0, -75.0)
+    samples = [(i / 4, i) for i in range(16)] + [(4, 4_000), (5, 4_000), (100, 4_000), (101, 4_000)]
+    path = tmp_path / "reacquired.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{time},{site[0] + math.degrees(metres / reception.EARTH_RADIUS_METERS)},{site[1]},80"
+        for time, metres in samples))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    assert [row for row, _, _ in rows] == [*range(16), 18, 19]
+
+
+@pytest.mark.parametrize(("after_m", "keep_hold"), [(0, False), (135, True), (250, True)])
+def test_interior_hold_requires_an_impossible_detour_between_consistent_neighbors(after_m, keep_hold):
+    # Logged positions on either side jump in under 20 ms. The one-second
+    # hold leaves time to pass through 100 m on a flight ending at 135 m.
+    # Ending at 250 m makes the flanking observations themselves inconsistent.
+    distances = [0, 0, 100, 100, 100, 100, 100, after_m, after_m]
+    times = np.array([0.0, .005, .02, .27, .52, .77, 1.02, 1.035, 1.04])
+    rows = [(i, 41 + math.degrees(m / reception.EARTH_RADIUS_METERS), -75) for i, m in enumerate(distances)]
+    retained = [rows[i] for i in (0, 1, 5, 7, 8)]
+    result = reception._check_gps_updates(rows, retained, times, np.full(len(rows), .001))
+    assert result == (retained if keep_hold else [rows[i] for i in (0, 1, 7, 8)])
+
+
+@pytest.mark.parametrize("tied_start", [False, True])
+def test_speed_uses_fresh_gps_updates_and_pairs_each_repeated_reading(tmp_path: Path, tied_start):
+    site = (41.0, -75.0)
+    path = tmp_path / "sample-and-hold.csv"
+    # GPS updates at 2 Hz while the logger records three different reception
+    # readings per fix. Each 30 m move takes 0.5 s, including the time the
+    # prior fix was being repeated. The final repeat precedes it by 0.01 s.
+    samples = [(step * .5 + delay, step * 30, level)
+               for step in range(9) for delay, level in [(0, 40), (.3, 60), (.49, 90)]]
+    if tied_start:
+        # An earlier burst of distinct fixes has one shared whole-second tick.
+        # It must not disable fresh GPS timing after normal timestamps resume.
+        samples = [(0, -150, 40), (0, -100, 60)] + [(t + 10, d, v) for t, d, v in samples]
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{time},{site[0]+math.degrees(metres/reception.EARTH_RADIUS_METERS)},{site[1]},{value}"
+        for time, metres, value in samples))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    assert [row for row, _, _ in rows] == list(range(len(samples)))
+    heatmap = build_reception_heatmap([index_log(path, tmp_path)], "VFR(%)", site)
+    flight_cells = [cell for cell in heatmap["cells"] if cell["sample_count"] == 3]
+    assert len(flight_cells) == 9 and all(cell["value"] == 60 for cell in flight_cells)
+
+
+def test_long_stationary_hold_does_not_corroborate_a_remote_acquisition(tmp_path: Path):
+    site = (41.0, -75.0)
+    samples = [(i / 4, i) for i in range(12)]
+    samples += [(3 + i / 4, 11) for i in range(82)]
+    # The old position was still being reported a fraction of a second ago.
+    # Three fresh distant fixes moving together do not explain the 2 km jump.
+    samples += [(23.50, 2011), (23.75, 2021), (24.00, 2031)]
+    path = tmp_path / "receiver-acquisition.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{t},{site[0]+math.degrees(d/reception.EARTH_RADIUS_METERS)},{site[1]},75" for t, d in samples))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    assert [row for row, _, _ in rows] == list(range(len(samples) - 3))
+
+
+def test_recovered_updates_cannot_introduce_an_impossible_join(tmp_path: Path):
+    site = (41., -75.)
+    samples = [(0, 105), (.9995, 105), (1.999, 105), (2, 111), (3.25, 108),
+               (5.25, 113), (5.75, 17), (6.05, 22), (6.1745, 22), (6.299, 22)]
+    path = tmp_path / "incompatible-tracks.csv"
+    path.write_text("Time,GPS Lat,GPS Lon,VFR(%)\n" + "\n".join(
+        f"{t},{site[0]+math.degrees(d/reception.EARTH_RADIUS_METERS)},{site[1]},75" for t, d in samples))
+    rows, _ = reception.heatmap_gps_rows(load_log(path), site)
+    kept = [i for i, _, _ in rows]
+    # Restoring the plausible 113 m fix would require the next retained fix
+    # to cover 96 m in half a second, well over 300 mph.
+    assert 6 in kept and 5 not in kept
+    events = [samples[i] for j, i in enumerate(kept) if j == 0 or samples[kept[j-1]][1] != samples[i][1]]
+    for (t0, x0), (t1, x1) in zip(events, events[1:]):
+        assert abs(x1 - x0) <= (t1 - t0) * 134.112

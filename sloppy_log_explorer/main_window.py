@@ -8,6 +8,7 @@ import sqlite3
 import time
 import traceback
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -67,7 +68,7 @@ from .models import GpsGradientOptions, LibraryLogInfo, LoadedLog, SyncCandidate
 from .parser import InvalidTelemetryLogError, load_log, relative_seconds
 from .qt_plot import GpsPathWidget, ReceptionMapWidget, TelemetryPlotWidget
 from .reception import logical_telemetry_groups
-from .reception_workers import ReceptionTask
+from .reception_workers import ReceptionTask, TaskFunction
 from .storage import AppStore
 from .sync import copy_candidates, discover_sync_candidates
 from .voice import VoiceItem, generate_voice_pack, load_voice_csv, save_voice_csv
@@ -200,6 +201,8 @@ class MainWindow(QMainWindow):
         self._reception_heatmap_task: ReceptionTask | None = None
         self._reception_map_payload: dict[str, object] | None = None
         self._reception_view_loaded = False
+        self._history_site_signature: tuple[object, ...] | None = None
+        self._shared_reception_basemap = BASEMAP_OPENSTREETMAP
         self._reception_tasks: set[ReceptionTask] = set()
         self._reception_pool = QThreadPool(self)
         # Library scans and heatmap builds both perform sustained file I/O. Keep
@@ -593,11 +596,23 @@ class MainWindow(QMainWindow):
         scan_row.addWidget(self.reception_scan_cancel_button)
         layout.addLayout(scan_row)
 
-        selection = QFormLayout()
-        self.reception_selection_layout = selection
+        site_row = QHBoxLayout()
+        site_row.addWidget(QLabel("Flying site"))
         self.reception_site_combo = QComboBox()
         self.reception_site_combo.currentIndexChanged.connect(self.reception_site_changed)
-        selection.addRow("Flying site", self.reception_site_combo)
+        site_row.addWidget(self.reception_site_combo, 1)
+        site_row.addWidget(QLabel("View"))
+        self.reception_mode_combo = QComboBox()
+        self.reception_mode_combo.addItem("Combined heatmap", "combined")
+        self.reception_mode_combo.addItem("Reception history", "history")
+        site_row.addWidget(self.reception_mode_combo)
+        layout.addLayout(site_row)
+
+        self.reception_static_controls = QWidget()
+        static_layout = QVBoxLayout(self.reception_static_controls)
+        static_layout.setContentsMargins(0, 0, 0, 0)
+        selection = QFormLayout()
+        self.reception_selection_layout = selection
 
         date_row = QHBoxLayout()
         self.reception_date_from = QDateEdit()
@@ -617,7 +632,17 @@ class MainWindow(QMainWindow):
 
         self.reception_channel_combo = QComboBox()
         self.reception_channel_combo.currentIndexChanged.connect(self.reception_channel_changed)
-        selection.addRow("Telemetry item", self.reception_channel_combo)
+        channel_row = QHBoxLayout()
+        channel_row.addWidget(self.reception_channel_combo, 1)
+        channel_row.addWidget(QLabel("Grid"))
+        self.reception_grid_combo = QComboBox()
+        for size in (5, 2):
+            self.reception_grid_combo.addItem(f"{size} m", size)
+        self.reception_grid_combo.currentIndexChanged.connect(
+            lambda: self._invalidate_reception_heatmap("Grid size changed. Generate the heatmap to refresh the map.")
+        )
+        channel_row.addWidget(self.reception_grid_combo)
+        selection.addRow("Telemetry item", channel_row)
 
         self.reception_normalize_check = QCheckBox("Normalize")
         self.reception_normalize_check.toggled.connect(self.reception_normalization_changed)
@@ -673,7 +698,7 @@ class MainWindow(QMainWindow):
         self.reception_site_notes.setPlaceholderText("Optional flying-site notes")
         self.reception_site_notes.setMaximumHeight(72)
         selection.addRow("Notes", self.reception_site_notes)
-        layout.addLayout(selection)
+        static_layout.addLayout(selection)
 
         range_row = QHBoxLayout()
         self.reception_auto_range_check = QCheckBox("Auto range")
@@ -695,7 +720,8 @@ class MainWindow(QMainWindow):
         self.reception_generate_button.clicked.connect(self.generate_reception_heatmap)
         range_row.addWidget(self.reception_generate_button)
         range_row.addStretch()
-        layout.addLayout(range_row)
+        static_layout.addLayout(range_row)
+        layout.addWidget(self.reception_static_controls)
 
         basemap_row = QHBoxLayout()
         basemap_row.addWidget(QLabel("Basemap"))
@@ -744,6 +770,7 @@ class MainWindow(QMainWindow):
             self.reception_imagery_opacity_changed
         )
         self.reception_tab = tab
+        self.reception_mode_combo.currentIndexChanged.connect(self.reception_mode_changed)
         self.tabs.addTab(tab, "HeatMap")
         self._update_reception_range_enabled()
         self._update_reception_normalization_enabled()
@@ -779,6 +806,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _reception_selection_token(self) -> tuple[object, ...]:
+        if self.reception_mode_combo.currentData() == "history":
+            return ("history", self._history_site_signature)
         root = str(self.library_root.resolve(strict=False)) if self.library_root is not None else None
         raw_site_id = self.reception_site_combo.currentData()
         site_id = raw_site_id if isinstance(raw_site_id, int) else None
@@ -793,7 +822,10 @@ class MainWindow(QMainWindow):
             self.reception_reference_min_spin.value(),
             self.reception_reference_max_spin.value(),
         ) if mode == "ratio" and not reference_auto else None
-        return root, site_id, start, end, channel, normalize, reference, mode, reference_range
+        return (
+            root, site_id, start, end, channel, normalize, reference, mode,
+            reference_range, self.reception_grid_combo.currentData(),
+        )
 
     def _set_reception_map_payload(self, payload: dict[str, object] | None, force: bool = False) -> None:
         self._reception_map_payload = dict(payload) if payload is not None else None
@@ -869,7 +901,24 @@ class MainWindow(QMainWindow):
                 self.reception_date_to.blockSignals(False)
         self.reception_site_changed(preserve_dates=selection_preserved)
 
+    def reception_mode_changed(self, *_args) -> None:
+        history = self.reception_mode_combo.currentData() == "history"
+        self.reception_static_controls.setVisible(not history)
+        combo = self.reception_basemap_combo
+        combo.blockSignals(True)
+        if history:
+            combo.addItem("Offline grid", "offline")
+        else:
+            combo.removeItem(combo.findData("offline"))
+            combo.setCurrentIndex(combo.findData(self._shared_reception_basemap))
+        combo.blockSignals(False)
+        self._update_reception_basemap_controls()
+        self.reception_site_changed()
+
     def reception_site_changed(self, *_args, preserve_dates: bool = False) -> None:
+        if self.reception_mode_combo.currentData() == "history":
+            self._load_reception_history()
+            return
         self._invalidate_reception_heatmap("Site changed; generate the heatmap to refresh the map.")
         site = self._selected_reception_site()
         enabled = site is not None
@@ -901,6 +950,36 @@ class MainWindow(QMainWindow):
         self._set_reception_map_payload(None)
         self.reception_result_status.setText("Choose a telemetry item and generate the heatmap.")
 
+    def _load_reception_history(self) -> None:
+        site = self._selected_reception_site()
+        if site is None:
+            self._invalidate_reception_heatmap("No indexed flying sites are available.")
+            return
+        records = site["records"]
+        site_center = (site["center_latitude"], site["center_longitude"])
+        grid_origin = (site["grid_latitude"], site["grid_longitude"])
+        # A completed index refresh also fires site_changed when nothing changed.
+        # Leave the live timeline, camera and pinned cell in place in that case.
+        signature = (
+            self.library_root, site["id"], site_center, grid_origin,
+            tuple((r["file_path"], r["file_size"], r["mtime_ns"], r["content_hash"]) for r in records),
+        )
+        if signature == self._history_site_signature:
+            return
+        self.cancel_reception_heatmap(silent=True)
+        self._history_site_signature = signature
+        self._set_reception_map_payload({"status": "empty", "message": "Preparing reception history…"})
+
+        def work(progress, is_cancelled):
+            from .history_sources import build_site_history
+
+            result = build_site_history(
+                records, site_center, grid_origin=grid_origin, progress=progress, is_cancelled=is_cancelled,
+            )
+            return {**result, "kind": "history", "center": grid_origin}
+
+        self._start_reception_build(work, len(records), "Preparing reception history")
+
     def reception_filters_changed(self, *_args) -> None:
         self._invalidate_reception_heatmap("Filters changed; generate the heatmap to refresh the map.")
         self.populate_reception_channels()
@@ -926,6 +1005,8 @@ class MainWindow(QMainWindow):
         basemap = str(
             self.reception_basemap_combo.currentData() or BASEMAP_OPENSTREETMAP
         )
+        if basemap != "offline":
+            self._shared_reception_basemap = basemap
         if self._reception_map_payload is not None:
             self._reception_map_payload["basemap"] = basemap
         self.reception_view.set_basemap(basemap)
@@ -949,6 +1030,8 @@ class MainWindow(QMainWindow):
         if payload is None:
             return
         auto_range = self.reception_auto_range_check.isChecked()
+        if auto_range:
+            self._show_reception_auto_range(payload)
         minimum = self.reception_min_spin.value()
         maximum = self.reception_max_spin.value()
         reverse = self.reception_reverse_check.isChecked()
@@ -962,6 +1045,15 @@ class MainWindow(QMainWindow):
             payload["range_max"] = maximum
         if self._reception_view_loaded:
             self.reception_view.set_color_scale(auto_range, minimum, maximum, reverse)
+
+    def _show_reception_auto_range(self, payload: dict[str, Any]) -> None:
+        bounds = payload.get("auto_color_range")
+        if bounds is None:
+            return
+        for spin, value in zip((self.reception_min_spin, self.reception_max_spin), bounds):
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
 
     def _invalidate_reception_heatmap(self, message: str) -> None:
         self.cancel_reception_heatmap(silent=True)
@@ -1152,7 +1244,7 @@ class MainWindow(QMainWindow):
                 return 0
         return 0
 
-    def start_reception_scan(self, *_args) -> None:
+    def start_reception_scan(self, *, retry_io_errors: bool = False) -> None:
         if self.library_root is None:
             return
         self.cancel_reception_scan(silent=True)
@@ -1170,6 +1262,7 @@ class MainWindow(QMainWindow):
                 cached_records,
                 root,
                 sample_stride=20,
+                retry_io_errors=retry_io_errors,
                 progress=progress,
                 is_cancelled=is_cancelled,
             )
@@ -1200,7 +1293,7 @@ class MainWindow(QMainWindow):
         self.library_logs = scan_library(self.library_root)
         self.populate_library_tree()
         self.flight_logs_tab.set_library(self.library_root, self.library_logs)
-        self.start_reception_scan()
+        self.start_reception_scan(retry_io_errors=True)
 
     def cancel_reception_scan(self, *_args, silent: bool = False) -> None:
         # Reject progress/results that may already be queued when cancellation
@@ -1230,18 +1323,30 @@ class MainWindow(QMainWindow):
         if not isinstance(records, (list, tuple)) or not isinstance(clusters, (list, tuple)):
             raise TypeError("Reception scan returned an invalid result")
         self.store.upsert_reception_records(root, records)
-        self.store.remove_missing_reception_records(root, [log.path for log in self.library_logs])
+        self.store.remove_missing_reception_records(
+            root, [self._reception_result_value(record, "file_path") for record in records]
+        )
         self.store.apply_reception_clusters(root, clusters)
         self._load_cached_reception_sites(preserve_selection=True)
 
         scanned = self._reception_result_int(result, "scanned_count")
         cached = self._reception_result_int(result, "cached_count")
         errors = self._reception_result_int(result, "error_count")
-        gps_count = sum(1 for record in records if getattr(record, "status", None) == "ok" or (isinstance(record, dict) and record.get("status") == "ok"))
+        statuses = Counter(str(self._reception_result_value(record, "status")) for record in records)
+        skipped = ", ".join(
+            f"{count} {label}" for count, label in (
+                (statuses["duplicate"], "duplicate" if statuses["duplicate"] == 1 else "duplicates"),
+                (statuses["no_gps"], "without GPS"),
+                (statuses["no_reception"], "without paired reception"),
+                (statuses["multiple_models"], "with conflicting model names"),
+                (errors, "read errors"),
+            ) if count
+        )
         self.reception_scan_progress.setValue(self.reception_scan_progress.maximum())
         self.reception_scan_status.setText(
-            f"Indexed {len(records)} logs: {gps_count} with GPS, {scanned} read, "
-            f"{cached} cached, {errors} errors; {len(self.reception_sites)} flying sites."
+            f"Indexed {len(records)} entries across {len(self.reception_sites)} flying sites. "
+            f"{statuses['ok']} with GPS. {scanned} read, {cached} cached."
+            + (f" Skipped {skipped}." if skipped else "")
         )
 
     def _reception_scan_failed(self, generation: int, details: str) -> None:
@@ -1264,15 +1369,13 @@ class MainWindow(QMainWindow):
             return
 
         self.cancel_reception_heatmap(silent=True)
-        self._reception_heatmap_generation += 1
-        generation = self._reception_heatmap_generation
-        selection_token = self._reception_selection_token()
         raw_latitude = site.get("center_latitude")
         raw_longitude = site.get("center_longitude")
         if not isinstance(raw_latitude, (int, float)) or not isinstance(raw_longitude, (int, float)):
             self.reception_result_status.setText("The selected flying site has no valid center coordinate.")
             return
         center = (float(raw_latitude), float(raw_longitude))
+        cell_size = self.reception_grid_combo.currentData()
         telemetry_column = str(channel)
         normalize = self.reception_normalize_check.isChecked()
         reference_column = (
@@ -1302,7 +1405,7 @@ class MainWindow(QMainWindow):
                 records,
                 telemetry_column,
                 center,
-                cell_size_m=5.0,
+                cell_size_m=cell_size,
                 progress=progress,
                 is_cancelled=is_cancelled,
                 reference_column=reference_column,
@@ -1310,12 +1413,17 @@ class MainWindow(QMainWindow):
                 reference_range=reference_range,
             )
 
+        self._start_reception_build(work, len(records), f"Generating {cell_size} m heatmap")
+
+    def _start_reception_build(self, work: TaskFunction, count: int, description: str) -> None:
+        generation = self._reception_heatmap_generation
+        selection_token = self._reception_selection_token()
         task = ReceptionTask(work)
         self._reception_heatmap_task = task
         self._reception_tasks.add(task)
         task.signals.progress.connect(
             lambda completed, total, message: self._reception_heatmap_progress(
-                generation, completed, total, message
+                generation, completed, total, message, description
             )
         )
         task.signals.result.connect(
@@ -1323,7 +1431,7 @@ class MainWindow(QMainWindow):
         )
         task.signals.failed.connect(lambda details: self._reception_heatmap_failed(generation, details))
         task.signals.finished.connect(lambda: self._reception_task_finished("heatmap", task, generation))
-        self.reception_result_status.setText(f"Generating 5 m heatmap from {len(records)} matching logs…")
+        self.reception_result_status.setText(f"{description} from {count} recordings…")
         self.reception_generate_button.setText("Generating…")
         self.reception_generate_button.setEnabled(False)
         self._reception_pool.start(task)
@@ -1334,6 +1442,7 @@ class MainWindow(QMainWindow):
         # active here; advancing the token prevents that stale payload from
         # being applied after a site, date, channel, or library change.
         self._reception_heatmap_generation += 1
+        self._history_site_signature = None
         task = self._reception_heatmap_task
         if task is None:
             return
@@ -1341,11 +1450,13 @@ class MainWindow(QMainWindow):
         if not silent:
             self.reception_result_status.setText("Canceling reception heatmap generation…")
 
-    def _reception_heatmap_progress(self, generation: int, completed: int, total: int, message: str) -> None:
+    def _reception_heatmap_progress(
+        self, generation: int, completed: int, total: int, message: str, description: str
+    ) -> None:
         if generation != self._reception_heatmap_generation:
             return
         detail = f" — {message}" if message else ""
-        self.reception_result_status.setText(f"Generating 5 m heatmap: {completed}/{total} logs{detail}")
+        self.reception_result_status.setText(f"{description} · {completed}/{total} recordings{detail}")
 
     def _reception_heatmap_completed(
         self,
@@ -1360,20 +1471,32 @@ class MainWindow(QMainWindow):
         ):
             return
         payload = dict(result)
+        if payload.get("kind") == "history":
+            logs = payload["logs"]
+            counts = payload["counts"]
+            if counts.get("read_error") or counts.get("changed_since_index"):
+                # A cloud-backed file can become readable without changing its fingerprint.
+                self._history_site_signature = None
+            inferred = sum(bool(log.get("inferred")) for log in logs)
+            skipped = [
+                f"{count} {reason.replace('_', ' ')}"
+                for reason, count in counts.items() if reason != "included" and count
+            ]
+            recordings_label = "recording" if len(logs) == 1 else "recordings"
+            dates_label = "date" if inferred == 1 else "dates"
+            summary = f"{len(logs)} {recordings_label} with paired reception. {inferred} inferred {dates_label}."
+            if skipped:
+                summary += " Skipped " + ", ".join(skipped) + "."
+            self.reception_result_status.setText(summary)
+            if not logs:
+                payload = {"status": "empty", "message": "No paired reception readings at this site."}
+            self._set_reception_map_payload(payload)
+            return
         auto_range = self.reception_auto_range_check.isChecked()
         payload["auto_range"] = auto_range
         payload["reverse"] = self.reception_reverse_check.isChecked()
         if auto_range:
-            minimum = payload.get("value_min")
-            maximum = payload.get("value_max")
-            self.reception_min_spin.blockSignals(True)
-            self.reception_max_spin.blockSignals(True)
-            if isinstance(minimum, (int, float)) and math.isfinite(float(minimum)):
-                self.reception_min_spin.setValue(float(minimum))
-            if isinstance(maximum, (int, float)) and math.isfinite(float(maximum)):
-                self.reception_max_spin.setValue(float(maximum))
-            self.reception_min_spin.blockSignals(False)
-            self.reception_max_spin.blockSignals(False)
+            self._show_reception_auto_range(payload)
         else:
             payload["range_min"] = self.reception_min_spin.value()
             payload["range_max"] = self.reception_max_spin.value()
@@ -1397,6 +1520,7 @@ class MainWindow(QMainWindow):
         status = str(payload.get("status") or "empty")
         if status == "ok":
             cells = len(payload.get("cells") or []) if isinstance(payload.get("cells"), list) else 0
+            cell_size = payload.get("cell_size_m", self.reception_grid_combo.currentData())
             used = int(payload.get("logs_used") or 0)
             considered = int(payload.get("logs_considered") or 0)
             missing = int(payload.get("missing_channel_count") or 0)
@@ -1407,7 +1531,7 @@ class MainWindow(QMainWindow):
             inferred = int(payload.get("date_inferred_count") or 0)
             off_site = int(payload.get("off_site_sample_count") or 0)
             self.reception_result_status.setText(
-                f"Rendered {cells} observed 5 m cells from {used}/{considered} logs "
+                f"Rendered {cells} observed {cell_size:g} m cells from {used}/{considered} logs "
                 f"({missing} missing channel, {missing_reference} missing reference, "
                 f"{invalid_reference} invalid reference samples, {clamped_reference} clamped, "
                 f"{errors} read errors, {inferred} inferred dates, "
@@ -1420,7 +1544,9 @@ class MainWindow(QMainWindow):
         if generation != self._reception_heatmap_generation:
             return
         message = details.strip().splitlines()[-1] if details.strip() else "Unknown error"
-        self.reception_result_status.setText(f"Reception heatmap generation failed. {message}")
+        self._history_site_signature = None
+        self.reception_result_status.setText(f"Reception map generation failed. {message}")
+        self._set_reception_map_payload({"status": "error", "message": message})
 
     def _reception_task_finished(self, kind: str, task: ReceptionTask, generation: int) -> None:
         self._reception_tasks.discard(task)
@@ -3211,6 +3337,7 @@ class MainWindow(QMainWindow):
         self.cancel_reception_heatmap()
         self._reception_pool.clear()
         self._reception_pool.waitForDone(2000)
+        self.reception_view.close()
         self.flight_logs_tab.shutdown()
         self.store.close()
         super().closeEvent(a0)

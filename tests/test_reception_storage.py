@@ -43,6 +43,28 @@ def cluster(paths: list[Path], latitude: float, longitude: float) -> dict[str, o
     }
 
 
+def test_existing_site_keeps_its_original_history_grid_after_refresh(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    root = tmp_path / "library"
+    first, later = root / "first.csv", root / "later.csv"
+    store = AppStore(database)
+    store.upsert_reception_records(root, [reception_record(first)])
+    site = store.apply_reception_clusters(root, [cluster([first], 40.0, -75.0)])[0]
+    # Simulate the pre-history schema and reopen the user's existing index.
+    store.conn.execute("alter table flying_sites drop column grid_latitude")
+    store.conn.execute("alter table flying_sites drop column grid_longitude")
+    store.conn.commit()
+    store.close()
+
+    store = AppStore(database)
+    store.upsert_reception_records(root, [reception_record(later)])
+    updated = store.apply_reception_clusters(root, [cluster([first, later], 40.0002, -75.0002)])[0]
+    assert updated["id"] == site["id"]
+    assert (updated["center_latitude"], updated["center_longitude"]) == (40.0002, -75.0002)
+    assert (updated["grid_latitude"], updated["grid_longitude"]) == (40.0, -75.0)
+    store.close()
+
+
 def test_reception_schema_migrates_idempotently_from_existing_database(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     connection = sqlite3.connect(database)

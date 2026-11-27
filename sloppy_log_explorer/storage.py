@@ -153,6 +153,8 @@ class AppStore:
                 active integer not null default 1,
                 center_latitude real not null,
                 center_longitude real not null,
+                grid_latitude real,
+                grid_longitude real,
                 created_at text not null default current_timestamp,
                 updated_at text not null default current_timestamp
             );
@@ -163,6 +165,7 @@ class AppStore:
                 file_path text not null,
                 file_size integer not null,
                 mtime_ns integer not null,
+                content_hash text not null default '',
                 status text not null,
                 flight_date text,
                 date_inferred integer not null default 0,
@@ -185,6 +188,14 @@ class AppStore:
         self._ensure_column("flights", "notes", "text default ''")
         self._ensure_column("flights", "video_path", "text default ''")
         self._ensure_column("flights", "updated_at", "text")
+        # Keep history cells anchored when new flights move the site centroid.
+        self._ensure_column("flying_sites", "grid_latitude", "real")
+        self._ensure_column("flying_sites", "grid_longitude", "real")
+        self.conn.execute(
+            "update flying_sites set grid_latitude = center_latitude, "
+            "grid_longitude = center_longitude where grid_latitude is null"
+        )
+        self._ensure_column("reception_logs", "content_hash", "text not null default ''")
         reception_columns = {
             row["name"]
             for row in self.conn.execute("pragma table_info(reception_logs)").fetchall()
@@ -411,6 +422,7 @@ class AppStore:
                     json.dumps(channels, ensure_ascii=False),
                     error,
                     index_version,
+                    _item_value(record, "content_hash", default=""),
                 )
             )
 
@@ -420,9 +432,9 @@ class AppStore:
                 insert into reception_logs(
                     library_root, file_path, file_size, mtime_ns, status,
                     flight_date, date_inferred, center_latitude,
-                    center_longitude, channels_json, error, index_version
+                    center_longitude, channels_json, error, index_version, content_hash
                 )
-                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict(library_root, file_path) do update set
                     file_size = excluded.file_size,
                     mtime_ns = excluded.mtime_ns,
@@ -434,6 +446,7 @@ class AppStore:
                     channels_json = excluded.channels_json,
                     error = excluded.error,
                     index_version = excluded.index_version,
+                    content_hash = excluded.content_hash,
                     updated_at = current_timestamp
                 """,
                 values,
@@ -610,8 +623,8 @@ class AppStore:
                 cursor = self.conn.execute(
                     """
                     insert into flying_sites(
-                        library_root, center_latitude, center_longitude
-                    ) values(?, ?, ?)
+                        library_root, center_latitude, center_longitude, grid_latitude, grid_longitude
+                    ) values(?1, ?2, ?3, ?2, ?3)
                     """,
                     (
                         root,
