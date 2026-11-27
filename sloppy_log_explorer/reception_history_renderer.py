@@ -13,9 +13,16 @@ from .reception_map_renderer import _asset_uri, _json_for_script, _message_html
 
 def build_reception_history_html(payload: dict[str, object] | None, dark: bool = True) -> str:
     """Build the history viewer for a local file URL (datasets may exceed Qt's setHtml limit)."""
-    if not payload or not payload.get("logs"):
+    logs = (payload or {}).get("logs")
+    if not payload or not isinstance(logs, list) or not logs:
         message = (payload or {}).get("message") or "No paired GPS and reception readings at this site."
         return _message_html(str(message), dark, "empty")
+    if "siteBounds" not in payload:
+        # Standalone callers can supply the recording grids directly. In the
+        # desktop app the history worker has already computed the footprint.
+        from .history_cells import history_site_bounds
+
+        payload = {**payload, "siteBounds": history_site_bounds(logs)}
     assets = Path(__file__).resolve().parent / "assets"
     template = (assets / "history-viewer.html").read_text(encoding="utf-8")
     replacements = {

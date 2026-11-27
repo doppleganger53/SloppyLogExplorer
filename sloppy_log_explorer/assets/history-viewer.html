@@ -79,7 +79,8 @@ let selection, prepared, series, pin = null, hover = null, drag = null, playback
 let position = 0, opacity = dataset.opacity ?? .72;
 let scale = 1, centerX = 0, centerY = 0, viewportChanged = true;
 let chartBase = null, chartXs = [], frameXs = [], xTimes = [];
-let siteBounds = null, syncTiles = () => {}, setTiles = () => {}, applyImageryOpacity = () => {};
+let followingSite = true;
+let syncTiles = () => {}, setTiles = () => {}, applyImageryOpacity = () => {};
 let requestedImageryOpacity = dataset.imagery_opacity ?? 1;
 let tileState = () => null;
 
@@ -295,23 +296,16 @@ function drawMap() {
     }
 }
 function fitSite() {
-    if (!siteBounds) {
-        let xmin = Infinity, xmax = -Infinity, ymin = Infinity, ymax = -Infinity;
-        for (const log of dataset.logs) for (const rows of Object.values(log.grids["5"])) {
-            for (const [x,y] of rows) {
-                xmin = Math.min(xmin,x*5); xmax = Math.max(xmax,x*5);
-                ymin = Math.min(ymin,y*5); ymax = Math.max(ymax,y*5);
-            }
-        }
-        siteBounds = Number.isFinite(xmin) ? [xmin,xmax,ymin,ymax] : [0,0,0,0];
-    }
-    const [xmin,xmax,ymin,ymax] = siteBounds;
+    followingSite = true;
+    if (!mapCanvas.clientWidth || !mapCanvas.clientHeight) return;
+    const [xmin,xmax,ymin,ymax] = dataset.siteBounds ?? [0,0,0,0];
     centerX = (xmin+xmax)/2; centerY = (ymin+ymax)/2;
     scale = Math.min(mapCanvas.clientWidth / Math.max(60,(xmax-xmin+5)*1.16),
         mapCanvas.clientHeight / Math.max(60,(ymax-ymin+5)*1.16));
     viewportChanged = true; drawMap();
 }
 function zoom(factor, x = mapCanvas.clientWidth/2, y = mapCanvas.clientHeight/2) {
+    followingSite = false;
     const next = Math.min(16,Math.max(.005,scale*factor));
     centerX += (x-mapCanvas.clientWidth/2) * (1/scale-1/next);
     centerY -= (y-mapCanvas.clientHeight/2) * (1/scale-1/next);
@@ -466,6 +460,7 @@ function bindControls() {
             const dx = event.clientX-drag.x, dy = event.clientY-drag.y;
             drag.moved ||= Math.hypot(dx,dy) > 3;
             if (drag.moved) {
+                followingSite = false;
                 centerX = drag.cx-dx/scale; centerY = drag.cy+dy/scale;
                 viewportChanged = true; drawMap();
             }
@@ -496,7 +491,12 @@ function bindControls() {
         tip($("charttip"),event,[prepared.chartPeriods[i],...lines].join("\n"));
     };
     chartCanvas.onpointerleave = () => { $("charttip").hidden = true; };
-    new ResizeObserver(() => { viewportChanged=true; drawMap(); drawChart(); }).observe($("mapbox"));
+    new ResizeObserver(refreshViewport).observe($("mapbox"));
+}
+function refreshViewport() {
+    if (followingSite) fitSite();
+    else { viewportChanged = true; drawMap(); }
+    drawChart();
 }
 function getState() {
     return {state:"ready",ready:true,position,periods:prepared.periods,range:colorRange,
@@ -505,15 +505,9 @@ function getState() {
         basemap:basemapChoice,tiles:tileState()};
 }
 let basemapChoice = dataset.basemap || "osm";
-let fitted = false;
 window.sloppyReceptionMap = {
     getState, fit: fitSite,
-    refresh(options) {
-        // Qt also requests fit on resize. Preserve a user's camera after the initial fit.
-        if (options?.fit && !fitted) { fitSite(); fitted=true; }
-        else { viewportChanged=true; drawMap(); drawChart(); }
-        return true;
-    },
+    refresh() { refreshViewport(); return true; },
     setOpacity(value) { opacity=Math.min(1,Math.max(0,value)); drawMap(); return true; },
     setBasemap(value) { basemapChoice=value; setTiles(value); return true; },
     setImageryOpacity(value) {

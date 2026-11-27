@@ -213,19 +213,48 @@ def check_fit_site(view, tmp_path: Path) -> None:
             QTest.qWait(20)
         raise AssertionError(f"Camera did not reach the expected position: {camera}")
 
+    def change_height(delta):
+        before = js("mapCanvas.height")
+        view.resize(view.width(), view.height() + delta)
+        for _ in range(60):
+            if js("mapCanvas.height") != before:
+                return
+            QTest.qWait(20)
+        raise AssertionError("History map did not resize")
+
     cameras = []
     for name, rows in (("local", local), ("with-strays", sorted(local + strays))):
-        path = tmp_path / f"{name}.csv"
-        path.write_text("Date,Time,GPS Lat,GPS Lon,VFR(%)\n" +
+        library = tmp_path / name
+        library.mkdir(exist_ok=True)
+        path = library / "Glider-2025-01-01.csv"
+        header = "Date,Time,GPS Lat,GPS Lon,VFR(%)\n"
+        path.write_text(header +
                         "".join(f"2025-01-01,{row}\n" for row in rows), encoding="utf-8")
-        payload = build_site_history([index_log(path, tmp_path)], center, grid_origin=origin)
+        # A prior flight also reported plausible fixes about 6 km away. Keep
+        # those observations available while framing the field on opening.
+        older = library / "Glider-2024-12-31.csv"
+        earlier = list(local)
+        if name == "with-strays":
+            earlier.extend(["12:04:00,40.055,-75,82", "12:04:01,40.0552,-75,84"])
+        older.write_text(header + "".join(f"2024-12-31,{row}\n" for row in earlier), encoding="utf-8")
+        records = [index_log(p, library) for p in (older, path)]
+        payload = build_site_history(records, center, grid_origin=origin)
         html = build_reception_history_html({**payload, "center": origin, "basemap": "offline"})
         open_document(view, tmp_path / f"{name}.html", html)
         state = js("sloppyReceptionMap.getState()")
+        assert js("prepared.frameAt(0).size") == len(earlier)
         assert state["cellCount"] == len(local)
         opening = state["camera"]
         assert 0 < js("mapCanvas.clientHeight") / opening["scale"] < 200
+        assert js("""[...prepared.frameAt(Math.round(position)).values()].every(cell =>
+            Math.abs(cell.x * selection.cellSize - centerX) * scale < mapCanvas.clientWidth / 2 &&
+            Math.abs(cell.y * selection.cellSize - centerY) * scale < mapCanvas.clientHeight / 2)""")
         cameras.append(opening)
+
+        change_height(80)
+        wait_for_camera(lambda p: p["scale"] > opening["scale"])
+        change_height(-80)
+        wait_for_camera(lambda p: p == opening)
 
         start = midpoint("map")
         end = start + QPoint(65, 35)
@@ -236,9 +265,14 @@ def check_fit_site(view, tmp_path: Path) -> None:
         wait_for_camera(lambda p: p["x"] != opening["x"] and p["y"] != opening["y"])
         QTest.mouseClick(surface, Qt.MouseButton.LeftButton, pos=midpoint("zoom-out"))
         wait_for_camera(lambda p: p["scale"] < opening["scale"])
+        manual = js("sloppyReceptionMap.getState().camera")
+        change_height(80)
+        js("sloppyReceptionMap.refresh({fit:true})")
+        assert js("sloppyReceptionMap.getState().camera") == manual
+        change_height(-80)
         QTest.mouseClick(surface, Qt.MouseButton.LeftButton, pos=midpoint("fit"))
         wait_for_camera(lambda p: p == opening)
-    assert cameras[0] == cameras[1]
+    assert cameras[0] == cameras[1], cameras
 
 
 def check_basemaps(js, run_event_loop, native: bool) -> None:

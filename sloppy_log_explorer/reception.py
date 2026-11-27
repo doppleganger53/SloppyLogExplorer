@@ -12,9 +12,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime
-from itertools import chain
+from itertools import chain, groupby
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from zipfile import BadZipFile
 
 import numpy as np
@@ -447,6 +447,190 @@ def _haversine_km(left_lat: float, left_lon: float, right_lat: float, right_lon:
     return (2.0 * EARTH_RADIUS_METERS * math.asin(min(1.0, math.sqrt(value)))) / 1000.0
 
 
+def _remove_unreachable_holds(
+    groups: list[list[GpsRow]], accepted: set[int], seconds: np.ndarray, tick_seconds: np.ndarray,
+) -> set[int]:
+    """Reject a held position when only the time spent repeating it made it reachable."""
+    rejected: set[int] = set()
+    for i, group in enumerate(groups):
+        if len(group) < 2:
+            continue
+        kept = [row[0] for row in group if row[0] in accepted]
+        if not kept or len(kept) == len(group):
+            continue
+
+        # A logger can repeat the previous GPS update while awaiting the next.
+        # Give each neighboring position its entire reporting interval. If even
+        # one side supports the movement, the held position remains ambiguous.
+        before_group = groups[i - 1] if i else []
+        after_group = groups[i + 1] if i + 1 < len(groups) else []
+        if any(side and not any(row[0] in accepted for row in side) for side in (before_group, after_group)):
+            continue
+        legs = []
+        if before_group:
+            legs.append((before_group[0], group[0]))
+        if after_group:
+            legs.append((group[-1], after_group[-1]))
+        # Silence between reports may indicate a genuine GPS reacquisition.
+        # Treat such a gap as available travel time, unlike uninterrupted
+        # repeats of an already rejected fix.
+        longest_gap = max(seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]]
+                          for left, right in zip(group, group[1:]))
+        detour = 0.0
+        for left, right in legs:
+            travel_time = max(longest_gap, seconds[right[0]] - seconds[left[0]] + tick_seconds[right[0]])
+            distance = _haversine_km(*left[1:], *right[1:])
+            if distance <= travel_time * _MAX_GROUND_SPEED_KM_S + _DISTANCE_ROUNDOFF_KM:
+                break
+            detour += distance
+        else:
+            if len(legs) == 2:
+                # Even if both transitions jumped too quickly, the plane
+                # might have visited the held position during the interval.
+                # Exclude it only when the neighbors support a continuous
+                # flight and the shortest route via this fix cannot fit.
+                before, after = legs[0][0], legs[1][1]
+                elapsed = seconds[after[0]] - seconds[before[0]] + tick_seconds[after[0]]
+                available = elapsed * _MAX_GROUND_SPEED_KM_S
+                direct = _haversine_km(*before[1:], *after[1:])
+                if direct > available + _DISTANCE_ROUNDOFF_KM or detour <= available + _DISTANCE_ROUNDOFF_KM:
+                    continue
+            rejected.update(kept)
+    return rejected
+
+
+def _check_gps_updates(
+    rows: list[GpsRow], retained: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray,
+) -> list[GpsRow]:
+    """Distinguish a fresh receiver position from the telemetry rows repeating it."""
+    groups = [list(group) for _, group in groupby(rows, key=lambda row: row[1:])]
+    accepted = {row[0] for row in retained}
+    rejected_holds = _remove_unreachable_holds(groups, accepted, seconds, tick_seconds)
+    accepted -= rejected_holds
+
+    # Each run uses the time when the receiver actually supplied a different
+    # position. Intermediate telemetry rows may simply repeat the last fix.
+    firsts = [group[0] for group in groups]
+    anchored = [any(row[0] in accepted for row in group) for group in groups]
+
+    def travel_margin(left: GpsRow, right: GpsRow) -> float:
+        elapsed = seconds[right[0]] - seconds[left[0]]
+        distance = _haversine_km(*left[1:], *right[1:])
+        return elapsed * _MAX_GROUND_SPEED_KM_S - distance
+
+    # A tied timestamp can spend part of the following clock tick. Keep the
+    # row-level result there until the later movement leaves that time free.
+    starts = [0]
+    clock_debt = 0.0
+    fresh_moves = []
+    protected = {i for i, group in enumerate(groups) if any(row[0] in rejected_holds for row in group)}
+    for i, (left, right) in enumerate(zip(firsts, firsts[1:]), 1):
+        margin = travel_margin(left, right)
+        fresh_moves.append(margin >= -_DISTANCE_ROUNDOFF_KM and seconds[left[0]] < seconds[right[0]])
+        if margin >= 0 and len(groups[i - 1]) > 1:
+            # A held position is not proof the aircraft moved throughout a
+            # prolonged pause in GPS updates. Credit the gap in observations
+            # or the neighboring update periods, whichever is longer.
+            prior_period = seconds[left[0]] - seconds[firsts[i - 2][0]] if i > 1 else 0.0
+            next_period = seconds[firsts[i + 1][0]] - seconds[right[0]] if i + 1 < len(groups) else 0.0
+            gap = seconds[right[0]] - seconds[groups[i - 1][-1][0]]
+            excess = seconds[right[0]] - seconds[left[0]] - max(gap, prior_period + next_period)
+            margin -= max(0.0, excess) * _MAX_GROUND_SPEED_KM_S
+        if seconds[left[0]] == seconds[right[0]]:
+            clock_debt = max(tick_seconds[left[0]], tick_seconds[right[0]]) * _MAX_GROUND_SPEED_KM_S
+            protected.update((i - 1, i))
+            starts.append(i)
+        elif margin + _DISTANCE_ROUNDOFF_KM < clock_debt:
+            if clock_debt > 0:
+                protected.add(i)
+            clock_debt = max(0.0, clock_debt - max(0.0, margin))
+            starts.append(i)
+        else:
+            clock_debt = 0.0
+
+    anchors = iter(i for i, present in enumerate(anchored) if present)
+    following = next(anchors, None)
+    previous = None
+    restore = set()
+    for start, stop in zip(starts, [*starts[1:], len(groups)]):
+        prior = previous
+        while following is not None and following < stop:
+            previous = following
+            following = next(anchors, None)
+        if stop - start < 3:
+            continue
+        # Require evidence beyond the two movements around a suspect fix:
+        # the run contains an already trusted movement, or it reconnects at
+        # one end to a trusted fix outside the run. Either direction matters
+        # when a bad preceding observation would otherwise hide real flight.
+        # A long outage can make even a receiver drifting kilometres away
+        # appear reachable. A bridge cannot corroborate a new track when it
+        # covers more time than the observed track itself.
+        duration = seconds[firsts[stop - 1][0]] - seconds[firsts[start][0]]
+        joins_before = (prior is not None
+                        and seconds[firsts[start][0]] - seconds[firsts[prior][0]] <= duration
+                        and travel_margin(firsts[prior], firsts[start]) >= -_DISTANCE_ROUNDOFF_KM)
+        joins_after = (following is not None
+                       and seconds[firsts[following][0]] - seconds[firsts[stop - 1][0]] <= duration
+                       and travel_margin(firsts[stop - 1], firsts[following]) >= -_DISTANCE_ROUNDOFF_KM)
+        supported = [i for i in range(start, stop) if anchored[i]]
+        if joins_before or joins_after:
+            restore.update(range(start, stop))
+        elif len(supported) >= 3 and any(b == a + 1 for a, b in zip(supported, supported[1:])):
+            # A handful of trusted fixes at the beginning of acquisition
+            # confirms the portion between them, not an extrapolated tail.
+            if len(supported) > (stop - start) / 2:
+                restore.update(range(start, stop))
+            else:
+                restore.update(range(supported[0], supported[-1] + 1))
+
+    # A disputed endpoint should not veto an interior update with two
+    # physically plausible fresh movements on either side. Include it as a
+    # candidate when there is a retained anchor on both sides.
+    def splice(*, allow_endpoints: bool) -> None:
+        mandatory = [next((row for row in group if row[0] in accepted), None) for group in groups]
+        anchors = iter(i for i, row in enumerate(mandatory) if row is not None)
+        following = next(anchors, None)
+        previous = None
+        clock_debt = 0.0
+        for i, group in enumerate(groups):
+            known = mandatory[i]
+            right = mandatory[following] if following is not None else None
+            bracketed = (previous is not None and right is not None and 2 <= i < len(groups) - 2
+                         and all(fresh_moves[i - 2:i + 2]))
+            arrival = known
+            # Splice into one feasible trajectory. The previous fix may itself
+            # have been restored. Keep enough time to reach the next mandatory
+            # fix at its original first accepted report, even when nearby runs
+            # disagree. Earlier duplicate reports must satisfy the same bounds.
+            two_sided = 0 < i < len(groups) - 1 and fresh_moves[i - 1] and fresh_moves[i]
+            if ((two_sided or allow_endpoints) and (i in restore or bracketed)
+                    and i not in protected and clock_debt <= _DISTANCE_ROUNDOFF_KM):
+                for j, candidate in enumerate(group):
+                    if known is None and j:
+                        break  # Repeats alone cannot make a rejected arrival real.
+                    if previous is not None and travel_margin(previous, candidate) < -_DISTANCE_ROUNDOFF_KM:
+                        continue
+                    if right is not None and travel_margin(candidate, right) < -_DISTANCE_ROUNDOFF_KM:
+                        continue
+                    arrival = candidate
+                    accepted.update(row[0] for row in group[j:])
+                    break
+            if arrival is not None:
+                if previous is not None:
+                    clock_debt = max(0.0, clock_debt - travel_margin(previous, arrival))
+                previous = arrival
+            if known is not None:
+                following = next(anchors, None)
+
+    # An endpoint followed by an impossible jump is weaker evidence than an
+    # interior position supported on both sides. Only insert those endpoints
+    # after the better-supported path is fixed, under the same travel budget.
+    splice(allow_endpoints=False)
+    splice(allow_endpoints=True)
+    return [row for row in rows if row[0] in accepted]
+
+
 def _speed_checked_rows(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
     """Follow a plausible track within one uninterrupted recording clock."""
     if len(rows) < 2:
@@ -498,7 +682,7 @@ def _speed_checked_rows(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: n
         if used is not None:
             retained.append(candidate)
             used_km = used
-    return retained
+    return _check_gps_updates(rows, retained, seconds, tick_seconds)
 
 
 def _filter_clock_segment(rows: list[GpsRow], seconds: np.ndarray, tick_seconds: np.ndarray) -> list[GpsRow]:
@@ -578,9 +762,7 @@ def heatmap_gps_rows(log: LoadedLog, site_center: tuple[float, float]) -> tuple[
             return local, off_site_count
 
     seconds = (log.time - timestamps.iloc[0]).dt.total_seconds().to_numpy()
-    tick_seconds = np.zeros(len(seconds))
-    if timestamps.duplicated().any() or len(timestamps) < len(local):
-        tick_seconds = _clock_tick_seconds(log)
+    tick_seconds = _clock_tick_seconds(log)
     start = 0
     previous_time = -math.inf
     retained: list[GpsRow] = []
@@ -1189,12 +1371,20 @@ def _normalized_unit(source: str, reference: str | None, mode: str | None) -> st
     return ""
 
 
-def _reception_viewport_focus(
-    cell_points: Sequence[tuple[float, float, int, int]],
-    site_center: tuple[float, float],
+_ViewportPoint = tuple[float, float, int, int]  # east, north, paired samples, recordings
+
+
+class ViewportNeighborhood(NamedTuple):
+    center: tuple[float, float]
+    radius_m: float
+    cells: list[_ViewportPoint]
+
+
+def reception_viewport_neighborhood(
+    cell_points: Sequence[_ViewportPoint],
     radius_m: float = VIEWPORT_MAX_RADIUS_METERS,
-) -> dict[str, object] | None:
-    """Locate the densest observed sample neighborhood for the map camera."""
+) -> ViewportNeighborhood | None:
+    """Find the densest observed neighborhood for the map camera, in grid-local metres."""
     requested_radius = float(radius_m)
     if not math.isfinite(requested_radius) or requested_radius <= 0.0:
         raise ValueError("radius_m must be a positive finite number")
@@ -1292,7 +1482,7 @@ def _reception_viewport_focus(
     # count is the primary observation weight; flight count is retained for
     # diagnostics and deterministic secondary scoring above.
     focus_x, focus_y = best_center
-    members: list[tuple[float, float, int, int]] = []
+    members: list[_ViewportPoint] = []
     for _ in range(8):
         members = [
             point
@@ -1314,6 +1504,18 @@ def _reception_viewport_focus(
         for point in points
         if math.hypot(point[0] - focus_x, point[1] - focus_y) <= radius + 1e-9
     ] or members
+    return ViewportNeighborhood((focus_x, focus_y), radius, members)
+
+
+def _reception_viewport_focus(
+    cell_points: Sequence[_ViewportPoint],
+    site_center: tuple[float, float],
+    radius_m: float = VIEWPORT_MAX_RADIUS_METERS,
+) -> dict[str, object] | None:
+    neighborhood = reception_viewport_neighborhood(cell_points, radius_m)
+    if neighborhood is None:
+        return None
+    (focus_x, focus_y), radius, members = neighborhood
     focus_longitude, focus_latitude = _local_lon_lat(focus_x, focus_y, site_center)
     focus_longitude = ((focus_longitude + 180.0) % 360.0) - 180.0
     member_samples = sum(point[2] for point in members)

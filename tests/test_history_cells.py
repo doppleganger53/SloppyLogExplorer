@@ -8,7 +8,7 @@ import pytest
 from PyQt6.QtQml import QJSEngine
 from PyQt6.QtWidgets import QApplication
 
-from sloppy_log_explorer.history_cells import bin_history_recording
+from sloppy_log_explorer.history_cells import bin_history_recording, history_site_bounds
 from sloppy_log_explorer.history_sources import build_site_history
 from sloppy_log_explorer.parser import load_log
 from sloppy_log_explorer.reception import (
@@ -60,6 +60,34 @@ def test_history_filters_the_ten_kilometer_boundary_before_binning(tmp_path: Pat
         key = reception_cell_key(edge, -75, origin, size)
         assert key == reception_cell_key(outside, -75, origin, size)
         assert grids[str(size)]["VFR(%)"] == [[*key, 20, 1]]
+
+
+def test_history_camera_uses_field_footprint_across_recordings_and_radio_channels() -> None:
+    # Each visit to the field supplies 81 paired fixes, concentrated in a 40 m
+    # square offset from the fixed grid origin.
+    field = [[x, y, 80, 1] for x in range(196, 205) for y in range(-44, -35)]
+    nearby = [400, -40, 40, 1]  # Within the 2 km neighborhood, outside the field.
+    remote = [1550, -40, 60, 100]
+    recordings = [
+        {"grids": {"5": {"RSSI": [*field, nearby]}}},
+        {"grids": {"5": {"RSSI": field}}},
+        {"grids": {"5": {name: [remote] for name in ("RX RSSI", "TX RSSI", "RX VFR")}}},
+    ]
+    # Counting channel rows independently would make the remote cell look
+    # busier than the two field recordings combined.
+    assert history_site_bounds(recordings) == [980, 1020, -220, -180]
+    assert history_site_bounds(reversed(recordings)) == [980, 1020, -220, -180]
+    assert recordings[0]["grids"]["5"]["RSSI"][-1] == nearby
+    assert recordings[2]["grids"]["5"]["TX RSSI"] == [remote]
+
+
+@pytest.mark.parametrize(("cells", "expected"), [
+    ([], None),
+    ([[35, -10, 42, 7]], [175, 175, -50, -50]),
+    ([[0, 0, 42, 1], [600, 4, 42, 1]], [0, 3000, 0, 20]),
+])
+def test_history_camera_frames_sparse_coverage(cells, expected) -> None:
+    assert history_site_bounds([{"grids": {"5": {"RSSI": cells}}}]) == expected
 
 
 def test_untimed_fixes_require_conclusive_speed_evidence_to_exclude(tmp_path: Path) -> None:

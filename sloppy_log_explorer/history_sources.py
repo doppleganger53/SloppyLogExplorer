@@ -198,7 +198,7 @@ def build_site_history(
     is_cancelled: Callable[[], bool] | None = None,
     *, grid_origin: tuple[float, float] | None = None,
 ) -> dict:
-    from .history_cells import bin_history_recording
+    from .history_cells import bin_history_recording, history_site_bounds
     from .reception import _coerce_record
 
     selected = sorted((_coerce_record(record) for record in records), key=lambda r: r.file_path)
@@ -234,4 +234,7 @@ def build_site_history(
                 if progress:
                     progress(index, len(selected), name)
     logs.sort(key=lambda log: (log["date"], log["model"]))
-    return {"logs": logs, "counts": dict(counts)}
+    return {
+        "logs": logs, "counts": dict(counts),
+        "siteBounds": history_site_bounds(logs),
+    }

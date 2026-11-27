@@ -114,7 +114,9 @@ Both views default to **Auto range** for the color gradient. The 5th and 95th pe
 
 Both **5 m** and **2 m** grids use the original GPS-paired readings. Each recording contributes one median per visited cell. The selected period shows the median of those recording values. **Keep historical cells** retains earlier coverage and weights each recording by its age in days. Choose a 7-, 30-, 90- or 365-day half-life (default 90). Dim cells show older coverage, and their last measurement dates distinguish revisits from carried readings.
 
-Both HeatMap views exclude GPS fixes more than 10 km from the selected flying site's current center. When the recording provides timestamps, they also reject jumps that would require a ground speed above 300 mph. Only retained readings contribute to cells, trends and automatic color limits. Reception history keeps its grid aligned across index refreshes, and **Fit site** returns to the retained coverage shown when the view opened.
+Both HeatMap views exclude GPS fixes more than 10 km from the selected flying site's current center. When the recording provides timestamps, they also reject jumps that would require a ground speed above 300 mph. The speed check accounts for transmitters that repeat the last GPS coordinate between receiver updates. Reception readings at a valid repeated coordinate still count. Only retained readings contribute to cells, trends and automatic color limits. Reception history keeps its grid aligned across index refreshes.
+
+Reception history opens on the part of the site where flights recorded most of their coverage. **Fit site** returns to that field view at any date or grid size. You can pan or zoom out to inspect more distant cells.
 
 The site index includes supported loose and zipped CSV, LOG and Spektrum TLM recordings. Byte-identical copies count once. **Refresh Index** picks up library changes. The viewer reports coverage, skipped recordings and inferred dates. Its temporary map document contains dated, aggregated locations and aircraft names and stays on this computer.
 
